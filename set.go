@@ -6,7 +6,7 @@ import (
 	"errors"
 	"strings"
 
-	pb "github.com/hsanjuan/go-ds-crdt/pb"
+	pb "github.com/ipfs/go-ds-crdt/pb"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"

@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"sync"
 
-	pb "github.com/hsanjuan/go-ds-crdt/pb"
+	pb "github.com/ipfs/go-ds-crdt/pb"
 
 	blockfmt "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"

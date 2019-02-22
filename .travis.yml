@@ -6,11 +6,14 @@ cache:
   directories:
     - $GOPATH/src/gx
 
-before_install:
-  - go get -t -v ./...
+install:
+  - go get github.com/whyrusleeping/gx
+  - go get github.com/whyrusleeping/gx-go
+  - gx --verbose install --global
+  - gx-go rewrite
 
 script:
-  - go test -v
+  - go test -v -race -covermode=atomic -coverprofile=coverage.txt .
 
 after_success:
   - bash <(curl -s https://codecov.io/bash)
