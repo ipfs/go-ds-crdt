@@ -13,7 +13,7 @@ install:
   - gx-go rewrite
 
 script:
-  - go test -v -race -covermode=atomic -coverprofile=coverage.txt .
+  - go test -v -covermode=atomic -coverprofile=coverage.txt .
 
 after_success:
   - bash <(curl -s https://codecov.io/bash)
