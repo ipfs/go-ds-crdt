@@ -82,7 +82,7 @@ type Datastore struct {
 // all the necessary data under the given namespace. It needs a DAG-Syncer
 // component for IPLD nodes and a Broadcaster component to distribute and
 // receive information to and from the rest of replicas.  Actual
-// implementation of these falls within the user's responsability.
+// implementation of these must be provided by the user.
 func New(
 	store ds.Datastore,
 	namespace ds.Key,
