@@ -194,7 +194,7 @@ func (store *Datastore) handleBlock(ctx context.Context, data []byte) error {
 
 // walkBranch walks down a branch and applies its deltas until it arrives to a
 // known head or the bottom.  The given CID is assumed to not be a known
-// block.  and will be fetched.
+// block and will be fetched.
 func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 	//store.logger.Debugf("walking on %s, from %s, depth %d", current, top, depth)
 
