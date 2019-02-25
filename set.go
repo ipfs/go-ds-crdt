@@ -331,7 +331,7 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 		key := e.GetKey()
 		// /namespace/<key>/elems/<id>
 		k := s.elemsPrefix(key).ChildString(id)
-		err := s.store.Put(k, nil)
+		err := store.Put(k, nil)
 		if err != nil {
 			return err
 		}
