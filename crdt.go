@@ -2,7 +2,7 @@
 // Merkle-CRDTs built with IPLD nodes. This Datastore is agnostic to how new
 // MerkleDAG roots are broadcasted to the rest of replicas (Broadcaster
 // component) and to how the IPLD nodes are made discoverable and retrievable
-// to by other replicas (DAG-Sync component).
+// to by other replicas (DAG-Syncer component).
 package crdt
 
 import (
