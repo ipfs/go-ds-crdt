@@ -156,7 +156,7 @@ func (store *Datastore) handleNext() {
 	}
 }
 
-// handleBlock takes care of applying vetting, retrieving and applying
+// handleBlock takes care of vetting, retrieving and applying
 // CRDT blocks to the Datastore.
 func (store *Datastore) handleBlock(ctx context.Context, data []byte) error {
 	c, err := cid.Cast(data)
