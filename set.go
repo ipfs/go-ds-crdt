@@ -13,19 +13,19 @@ import (
 )
 
 var (
-	elemsNs        = "s" // elems
-	tombsNs        = "t" // tombs
-	valueSuffix    = "v" // value
-	prioritySuffix = "p" // priority
+	elemsNs        = "s" // elements namespace
+	tombsNs        = "t" // tombstones namespace
+	valueSuffix    = "v"
+	prioritySuffix = "p"
 )
 
 var ErrStateModify = "the CRDT state cannot be modified directly"
 
-// set implements an Add-Wins Observed-Removed Set using delta-CRDTs.
+// set implements an Add-Wins Observed-Remove Set using delta-CRDTs.
 // and backing all the data in a go-datastore. It is fully agnostic to
 // MerkleCRDTs or the delta distribution layer.  It chooses the Value with
 // most priority for a Key as the current Value. When two values have the
-// priority, it chooses by alphabetically sorting their unique IDs
+// same priority, it chooses by alphabetically sorting their unique IDs
 // alphabetically.
 type set struct {
 	store     ds.Datastore
@@ -91,7 +91,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 	return delta, nil
 }
 
-// element retrieves the value of an element from the CRDT set.
+// Element retrieves the value of an element from the CRDT set.
 func (s *set) Element(key string) ([]byte, error) {
 	// We can only GET an element if it's part of the Set (in
 	// "elems" and not in "tombstones").
@@ -141,8 +141,8 @@ func (f *filterIsKey) Filter(e query.Entry) bool {
 	return f.ns.IsAncestorOf(dsk) && ds.NewKey(valueSuffix).IsAncestorOf(dsk.Reverse())
 }
 
-// elements throws all the elements in the set.
-// it comes handy to use query.Result to wrap key, value and error.
+// Elements returns all the elements in the set.
+// It comes handy to use query.Result to wrap key, value and error.
 func (s *set) Elements() <-chan query.Result {
 	q := query.Query{
 		Prefix:   s.namespace.String(),
@@ -255,7 +255,7 @@ func (s *set) priorityKey(key string) ds.Key {
 	return s.keyPrefix(key).ChildString(prioritySuffix)
 }
 
-func (s *set) getPrio(key string) (uint64, error) {
+func (s *set) getPriority(key string) (uint64, error) {
 	prioK := s.priorityKey(key)
 	data, err := s.store.Get(prioK)
 	if err != nil {
@@ -272,7 +272,7 @@ func (s *set) getPrio(key string) (uint64, error) {
 	return prio - 1, nil
 }
 
-func (s *set) setPrio(key string, prio uint64) error {
+func (s *set) setPriority(key string, prio uint64) error {
 	prioK := s.priorityKey(key)
 	buf := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutUvarint(buf, prio+1)
@@ -284,7 +284,7 @@ func (s *set) setPrio(key string, prio uint64) error {
 }
 
 // sets a value if priority is higher. When equal, it sets if the
-// value is lexicographically higher than current.
+// value is lexicographically higher than the current value.
 func (s *set) setValue(key string, value []byte, prio uint64) error {
 	curPrio, err := s.getPrio(key)
 	if err != nil {
@@ -366,7 +366,7 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 	for _, e := range tombs {
 		// /namespace/<key>/tombs/<id>
 		k := s.tombsPrefix(e.GetKey()).ChildString(e.GetId())
-		err := s.store.Put(k, nil)
+		err := store.Put(k, nil)
 		if err != nil {
 			return err
 		}

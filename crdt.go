@@ -75,7 +75,7 @@ type Datastore struct {
 	broadcaster Broadcaster
 
 	curDeltaMux sync.Mutex
-	curDelta    *pb.Delta
+	curDelta    *pb.Delta // current, unpublished delta
 }
 
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
