@@ -79,7 +79,7 @@ type Datastore struct {
 }
 
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
-// all the necessary data under the given namespace. It needs a DAG-Sync
+// all the necessary data under the given namespace. It needs a DAG-Syncer
 // component for IPLD nodes and a Broadcaster component to distribute and
 // receive information to and from the rest of replicas.  Actual
 // implementation of these falls within the user's responsability.
