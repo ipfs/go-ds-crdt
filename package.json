@@ -9,9 +9,9 @@
   "gxDependencies": [
     {
       "author": "why",
-      "hash": "Qmccmovpo9isKeaaDzcxvT7mVJN1uKwn2xzSs1y8hb6PEs",
+      "hash": "QmP9i4G9nRcfKBnpk1A7CwU7ppLkSn2j6vJeWn2AJ8rfcN",
       "name": "go-merkledag",
-      "version": "1.1.32"
+      "version": "1.1.36"
     },
     {
       "author": "hsanjuan",
