@@ -286,7 +286,7 @@ func (s *set) setPriority(key string, prio uint64) error {
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
 func (s *set) setValue(key string, value []byte, prio uint64) error {
-	curPrio, err := s.getPrio(key)
+	curPrio, err := s.getPriority(key)
 	if err != nil {
 		return err
 	}
