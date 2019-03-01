@@ -311,7 +311,7 @@ func (s *set) setValue(key string, value []byte, prio uint64) error {
 	}
 
 	// store priority
-	return s.setPrio(key, prio)
+	return s.setPriority(key, prio)
 }
 
 // putElems adds items to the "elems" set.
