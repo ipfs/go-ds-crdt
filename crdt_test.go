@@ -20,7 +20,7 @@ import (
 	mdutils "github.com/ipfs/go-merkledag/test"
 )
 
-var numReplicas = 2
+var numReplicas = 50
 var debug = false
 
 func init() {
@@ -243,7 +243,7 @@ func TestDatastoreSuite(t *testing.T) {
 }
 
 func TestSync(t *testing.T) {
-	nItems := 100
+	nItems := 20
 
 	replicas := makeReplicas(t)
 	defer closeReplicas(t, replicas)
@@ -353,7 +353,7 @@ func TestPriority(t *testing.T) {
 			}
 		}
 	}
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	var v, lastv []byte
 	var err error
 	for i, r := range replicas {
@@ -373,7 +373,7 @@ func TestPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	for i, r := range replicas {
 		v, err := r.Get(k)
 		if err != nil {

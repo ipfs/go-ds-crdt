@@ -30,12 +30,17 @@ const (
 	setNs   = "s" // set
 )
 
+// Common errors.
 var (
-	ErrNoMoreBroadcast = errors.New("Receiving blocks aborted since no new blocks will be broadcasted.")
+	ErrNoMoreBroadcast = errors.New("receiving blocks aborted since no new blocks will be broadcasted")
 )
 
+// A Broadcaster provides a way to send (notify) an opaque payload to
+// all replicas and to retrieve payloads broadcasted.
 type Broadcaster interface {
+	// Send payload to other replicas.
 	Broadcast([]byte) error
+	// Obtain the next payload received from the network.
 	Next() ([]byte, error)
 }
 
@@ -49,10 +54,12 @@ type DAGSyncer interface {
 	IsKnownBlock(c cid.Cid) (bool, error)
 }
 
+// Options holds configurable values for Datastore.
 type Options struct {
 	Logger logging.StandardLogger
 }
 
+// DefaultOptions initializes an Options object with sensible defaults.
 func DefaultOptions() *Options {
 	return &Options{
 		Logger: logging.Logger("crdt"),
@@ -176,13 +183,6 @@ func (store *Datastore) handleBlock(ctx context.Context, data []byte) error {
 		return nil
 	}
 
-	// if store.heads.Len() == 0 { // no heads? We must be syncing from scratch
-	// 	err := store.dags.FetchRefs(ctx, -1)
-	// 	if err != nil {
-	// 		logger.Warning(errors.Wrap(err, "fetching refs"))
-	// 	}
-	// }
-
 	// Walk down from this block.
 	err = store.walkBranch(c, c, 1)
 	if err != nil {
@@ -191,9 +191,9 @@ func (store *Datastore) handleBlock(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// walkBranch walks down a branch and applies its deltas until it arrives to a
-// known head or the bottom.  The given CID is assumed to not be a known
-// block and will be fetched.
+// walkBranch walks down a branch and applies each node's delta until it
+// arrives to a known head or the bottom.  The given CID is assumed to not be
+// a known block and will be fetched.
 func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 	//store.logger.Debugf("walking on %s, from %s, depth %d", current, top, depth)
 
@@ -325,6 +325,7 @@ func (store *Datastore) Delete(key ds.Key) error {
 	return store.publish(delta)
 }
 
+// Close shuts down the CRDT datastore. It should not be used afterwards.
 func (store *Datastore) Close() error {
 	store.cancel()
 	return nil

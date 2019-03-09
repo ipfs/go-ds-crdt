@@ -19,24 +19,18 @@ var (
 	prioritySuffix = "p"
 )
 
-var ErrStateModify = "the CRDT state cannot be modified directly"
-
-// set implements an Add-Wins Observed-Remove Set using delta-CRDTs.
-// and backing all the data in a go-datastore. It is fully agnostic to
-// MerkleCRDTs or the delta distribution layer.  It chooses the Value with
-// most priority for a Key as the current Value. When two values have the
-// same priority, it chooses by alphabetically sorting their unique IDs
-// alphabetically.
+// set implements an Add-Wins Observed-Remove Set using delta-CRDTs
+// (https://arxiv.org/abs/1410.2803) and backing all the data in a
+// go-datastore. It is fully agnostic to MerkleCRDTs or the delta distribution
+// layer.  It chooses the Value with most priority for a Key as the current
+// Value. When two values have the same priority, it chooses by alphabetically
+// sorting their unique IDs alphabetically.
 type set struct {
 	store     ds.Datastore
 	namespace ds.Key
 }
 
-func newCRDTSet(
-	d ds.Datastore,
-	namespace ds.Key,
-) *set {
-
+func newCRDTSet(d ds.Datastore, namespace ds.Key) *set {
 	s := &set{
 		namespace: namespace,
 		store:     d,
@@ -59,10 +53,7 @@ func (s *set) Add(key string, value []byte) *pb.Delta {
 
 // Rmv returns a new delta-set removing the given elements.
 func (s *set) Rmv(key string) (*pb.Delta, error) {
-	delta := &pb.Delta{
-		Elements:   nil,
-		Tombstones: nil,
-	}
+	delta := &pb.Delta{}
 
 	// /namespace/<key>/elems
 	prefix := s.elemsPrefix(key)
@@ -96,13 +87,14 @@ func (s *set) Element(key string) ([]byte, error) {
 	// We can only GET an element if it's part of the Set (in
 	// "elems" and not in "tombstones").
 
-	// As an optimization, an element without a value in the store
-	// implies it is not in the Set (never added or tombstoned).
-	// But not the other way around: a tombtstoned element may still
-	// have a value in the store.
-
-	// An element having a value in the store implies that it is in
-	// "elems".
+	// As an optimization:
+	// * If the element has a value in the store it means:
+	//   -> It occurs at least once in "elems"
+	//   -> It may or not be tombstoned
+	// * If the element does not have a value in the store:
+	//   -> It was either never added
+	//   -> Or it was tombstoned
+	//   -> In both cases the element "does not exist".
 
 	valueK := s.valueKey(key)
 	value, err := s.store.Get(valueK)
@@ -128,13 +120,6 @@ func (s *set) Element(key string) ([]byte, error) {
 type filterIsKey struct {
 	ns ds.Key
 }
-
-// func (f *filterIsKey) Filter(e query.Entry) bool {
-// 	k := ds.NewKey(e.Key)
-// 	res := f.Filter2(e)
-// 	fmt.Printf("\n\n%s %s: %t", f.ns, k, res)
-// 	return res
-// }
 
 func (f *filterIsKey) Filter(e query.Entry) bool {
 	dsk := ds.NewKey(e.Key)
@@ -195,8 +180,8 @@ func (s *set) Elements() <-chan query.Result {
 	return retChan
 }
 
-// InSet returns if we have a Cid. For it we must have at least one element
-// for that CID which is not tombstoned.
+// InSet returns true if the key belongs to one of the elements in the "elems"
+// set, and this element is not tombstoned.
 func (s *set) InSet(key string) (bool, error) {
 	// /namespace/<key>/elems/
 	prefix := s.elemsPrefix(key)
@@ -291,10 +276,10 @@ func (s *set) setValue(key string, value []byte, prio uint64) error {
 		return err
 	}
 
-	valueK := s.valueKey(key)
 	if prio < curPrio {
 		return nil
 	}
+	valueK := s.valueKey(key)
 
 	if prio == curPrio {
 		curValue, _ := s.store.Get(valueK)
@@ -316,6 +301,10 @@ func (s *set) setValue(key string, value []byte, prio uint64) error {
 
 // putElems adds items to the "elems" set.
 func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
+	if len(elems) == 0 {
+		return nil
+	}
+
 	var store ds.Write = s.store
 	var err error
 	batchingDs, batching := store.(ds.Batching)
@@ -343,7 +332,7 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 		}
 	}
 
-	if batching && len(elems) > 0 {
+	if batching {
 		err := store.(ds.Batch).Commit()
 		if err != nil {
 			return err
@@ -353,6 +342,10 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 }
 
 func (s *set) putTombs(tombs []*pb.Element) error {
+	if len(tombs) == 0 {
+		return nil
+	}
+
 	var store ds.Write = s.store
 	var err error
 	batchingDs, batching := store.(ds.Batching)
@@ -372,7 +365,7 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 		}
 	}
 
-	if batching && len(tombs) > 0 {
+	if batching {
 		err := store.(ds.Batch).Commit()
 		if err != nil {
 			return err

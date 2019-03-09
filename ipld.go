@@ -17,8 +17,6 @@ var _ ipld.DAGService = (*crdtDAGService)(nil)
 
 var defaultWorkers = 20
 
-var errNoDAGSyncer = errors.New("no DAGSyncer configured. This replica is offline.")
-
 func init() {
 	ipld.Register(cid.DagProtobuf, dag.DecodeProtobufBlock)
 }
@@ -45,17 +43,6 @@ func (ng *crdtDAGService) GetPriority(ctx context.Context, c cid.Cid) (uint64, e
 	}
 	return delta.Priority, nil
 }
-
-// func (ng *crdtDAGService) FetchRefs(ctx context.Context, depth int) error {
-// 	return ng.rpcClient.CallContext(
-// 		ctx,
-// 		"",
-// 		"Cluster",
-// 		"IPFSConnectorFetchRefs",
-// 		depth,
-// 		&struct{}{},
-// 	)
-// }
 
 func extractDelta(nd ipld.Node) (*pb.Delta, error) {
 	protonode, ok := nd.(*dag.ProtoNode)
