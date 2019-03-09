@@ -8,23 +8,24 @@ import (
 	"testing"
 	"time"
 
-	blockfmt "github.com/ipfs/go-block-format"
-	bsrv "github.com/ipfs/go-blockservice"
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 	dssync "github.com/ipfs/go-datastore/sync"
 	dstest "github.com/ipfs/go-datastore/test"
+	blockstore "github.com/ipfs/go-ipfs-blockstore"
+	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log"
+	"github.com/ipfs/go-merkledag"
 	mdutils "github.com/ipfs/go-merkledag/test"
 )
 
-var numReplicas = 50
+var numReplicas = 2
 var debug = false
 
 func init() {
 	_ = log.SetDebugLogging
-	//log.SetLogLevel("crdt", "debug")
+	log.SetLogLevel("crdt", "debug")
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -137,23 +138,34 @@ func (mb *mockBroadcaster) Next() ([]byte, error) {
 }
 
 type mockDAGSync struct {
-	bs bsrv.BlockService
+	ipld.DAGService
+	bs          blockstore.Blockstore
+	knownBlocks map[cid.Cid]struct{}
 }
 
-func (mds *mockDAGSync) Get(ctx context.Context, c cid.Cid) (blockfmt.Block, error) {
-	return mds.bs.GetBlock(ctx, c)
+func (mds *mockDAGSync) IsKnownBlock(c cid.Cid) (bool, error) {
+	_, ok := mds.knownBlocks[c]
+	return ok, nil
 }
 
-func (mds *mockDAGSync) Put(ctx context.Context, b blockfmt.Block) error {
-	return mds.bs.AddBlock(b)
+func (mds *mockDAGSync) Add(ctx context.Context, n ipld.Node) error {
+	mds.knownBlocks[n.Cid()] = struct{}{}
+	return mds.DAGService.Add(ctx, n)
 }
 
 func makeReplicas(t *testing.T) []*Datastore {
 	bcasts := newBroadcasters(t, numReplicas)
-	dagsync := &mockDAGSync{mdutils.Bserv()}
+	bs := mdutils.Bserv()
+	dagserv := merkledag.NewDAGService(bs)
 
 	replicas := make([]*Datastore, numReplicas, numReplicas)
 	for i := range replicas {
+		dagsync := &mockDAGSync{
+			DAGService:  dagserv,
+			bs:          bs.Blockstore(),
+			knownBlocks: make(map[cid.Cid]struct{}),
+		}
+
 		replicas[i] = New(
 			dssync.MutexWrap(ds.NewMapDatastore()),
 			// ds.NewLogDatastore(

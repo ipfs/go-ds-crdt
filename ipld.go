@@ -5,7 +5,6 @@ import (
 	"errors"
 
 	"github.com/gogo/protobuf/proto"
-	blockfmt "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
@@ -18,8 +17,6 @@ var _ ipld.DAGService = (*crdtDAGService)(nil)
 
 var defaultWorkers = 20
 
-var errNotImplemented = errors.New("not implemented")
-
 var errNoDAGSyncer = errors.New("no DAGSyncer configured. This replica is offline.")
 
 func init() {
@@ -28,81 +25,7 @@ func init() {
 
 // crdtDAGService wraps an ipld.DAGService with some additional methods.
 type crdtDAGService struct {
-	ds      DAGSyncer
-	workers int
-}
-
-func (ng *crdtDAGService) Get(ctx context.Context, c cid.Cid) (ipld.Node, error) {
-	if ng.ds == nil {
-		return nil, errNoDAGSyncer
-	}
-
-	blk, err := ng.ds.Get(ctx, c)
-	if err != nil {
-		return nil, err
-	}
-
-	return ipld.Decode(blk)
-}
-
-func (ng *crdtDAGService) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipld.NodeOption {
-	results := make(chan *ipld.NodeOption, len(cids))
-	jobs := make(chan cid.Cid, len(cids))
-
-	if ng.workers <= 0 {
-		ng.workers = defaultWorkers
-	}
-
-	// launch maximum ng.workers. Do not launch more workers than cids
-	// though.
-	for w := 0; w < ng.workers && w < len(cids); w++ {
-		go func() {
-			for c := range jobs {
-				nd, err := ng.Get(ctx, c)
-				results <- &ipld.NodeOption{
-					Node: nd,
-					Err:  err,
-				}
-			}
-		}()
-	}
-
-	for _, c := range cids {
-		jobs <- c
-	}
-	close(jobs)
-	return nil
-}
-
-func (ng *crdtDAGService) Add(ctx context.Context, nd ipld.Node) error {
-	if ng.ds == nil {
-		return errNoDAGSyncer
-	}
-
-	block, err := blockfmt.NewBlockWithCid(nd.RawData(), nd.Cid())
-	if err != nil {
-		return err
-	}
-
-	return ng.ds.Put(ctx, block)
-}
-
-func (ng *crdtDAGService) AddMany(ctx context.Context, nds []ipld.Node) error {
-	for _, n := range nds {
-		err := ng.Add(ctx, n)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (ng *crdtDAGService) Remove(ctx context.Context, c cid.Cid) error {
-	return errNotImplemented
-}
-
-func (ng *crdtDAGService) RemoveMany(ctx context.Context, cids []cid.Cid) error {
-	return errNotImplemented
+	DAGSyncer
 }
 
 func (ng *crdtDAGService) GetDelta(ctx context.Context, c cid.Cid) (ipld.Node, *pb.Delta, error) {

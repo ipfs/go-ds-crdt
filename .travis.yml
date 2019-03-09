@@ -4,13 +4,13 @@ go:
 
 cache:
   directories:
-    - $GOPATH/src/gx
+    - $GOPATH/pkg/mod
+    - $HOME/.cache/go-build
 
-install:
-  - go get github.com/whyrusleeping/gx
-  - go get github.com/whyrusleeping/gx-go
-  - gx --verbose install --global
-  - gx-go rewrite
+env:
+  - GO111MODULE=on
+
+install: true
 
 script:
   - go test -v -covermode=atomic -coverprofile=coverage.txt .

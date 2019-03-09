@@ -12,11 +12,11 @@ import (
 
 	pb "github.com/ipfs/go-ds-crdt/pb"
 
-	blockfmt "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 	dshelp "github.com/ipfs/go-ipfs-ds-help"
+	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log"
 	"github.com/pkg/errors"
 )
@@ -26,9 +26,8 @@ var _ ds.Batching = (*Datastore)(nil)
 
 // datastore namespace keys. Short keys save space and memory.
 const (
-	blocksNs = "b" // blocks
-	headsNs  = "h" // heads
-	setNs    = "s" // set
+	headsNs = "h" // heads
+	setNs   = "s" // set
 )
 
 var (
@@ -40,9 +39,14 @@ type Broadcaster interface {
 	Next() ([]byte, error)
 }
 
+// A DAGSyncer is an abstraction to an IPLD-based p2p storage layer.  A
+// DAGSyncer is a DAGService with the ability to publish new ipld nodes to the
+// network, and retrieving others from it.
 type DAGSyncer interface {
-	Get(ctx context.Context, c cid.Cid) (blockfmt.Block, error)
-	Put(ctx context.Context, b blockfmt.Block) error
+	ipld.DAGService
+	// Returns true if the block is locally available (therefore, it
+	// is considered processed).
+	IsKnownBlock(c cid.Cid) (bool, error)
 }
 
 type Options struct {
@@ -69,7 +73,6 @@ type Datastore struct {
 	namespace ds.Key
 	set       *set
 	heads     *heads
-	blocks    *blocks
 
 	dags        *crdtDAGService
 	broadcaster Broadcaster
@@ -81,8 +84,8 @@ type Datastore struct {
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
 // all the necessary data under the given namespace. It needs a DAG-Syncer
 // component for IPLD nodes and a Broadcaster component to distribute and
-// receive information to and from the rest of replicas.  Actual
-// implementation of these must be provided by the user.
+// receive information to and from the rest of replicas. Actual implementation
+// of these must be provided by the user.
 func New(
 	store ds.Datastore,
 	namespace ds.Key,
@@ -98,15 +101,12 @@ func New(
 	fullSetNs := namespace.ChildString(setNs)
 	// <namespace>/heads
 	fullHeadsNs := namespace.ChildString(headsNs)
-	// <namespace>/blocks
-	fullBlocksNs := namespace.ChildString(blocksNs)
 
 	set := newCRDTSet(store, fullSetNs)
 	heads := newHeads(store, fullHeadsNs)
-	blocks := newBlocks(store, fullBlocksNs)
 
 	crdtdags := &crdtDAGService{
-		ds: dagSyncer,
+		DAGSyncer: dagSyncer,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -120,7 +120,6 @@ func New(
 		namespace:   namespace,
 		set:         set,
 		heads:       heads,
-		blocks:      blocks,
 		dags:        crdtdags,
 		broadcaster: bcast,
 	}
@@ -168,7 +167,7 @@ func (store *Datastore) handleBlock(ctx context.Context, data []byte) error {
 	// Ignore already known blocks.
 	// This includes the case when the block is a current
 	// head.
-	known, err := store.blocks.IsKnown(c)
+	known, err := store.dags.IsKnownBlock(c)
 	if err != nil {
 		return errors.Wrap(err, "error checking for known block")
 	}
@@ -204,14 +203,13 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 		return errors.Wrapf(err, "error fetching block %s", current)
 	}
 
+	// Once the DAGService has fetched the block, it should be in the
+	// blockstore.
+
 	// merge the delta
 	err = store.set.Merge(delta, dshelp.CidToDsKey(current).String())
 	if err != nil {
 		return errors.Wrapf(err, "error merging delta from %s", current)
-	}
-
-	if err := store.blocks.Add(current); err != nil {
-		return errors.Wrapf(err, "error adding %s to known blocks", current)
 	}
 
 	links := nd.Links()
@@ -244,7 +242,7 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 			continue
 		}
 
-		known, err := store.blocks.IsKnown(child)
+		known, err := store.dags.IsKnownBlock(child)
 		if err != nil {
 			return errors.Wrapf(err, "error checking for known block %s", child)
 		}
