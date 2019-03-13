@@ -38,7 +38,7 @@ func newCRDTSet(d ds.Datastore, namespace ds.Key) *set {
 	return s
 }
 
-// Add returns a new delta-set adding the given elements.
+// Add returns a new delta-set adding the given key/value.
 func (s *set) Add(key string, value []byte) *pb.Delta {
 	return &pb.Delta{
 		Elements: []*pb.Element{
@@ -51,11 +51,11 @@ func (s *set) Add(key string, value []byte) *pb.Delta {
 	}
 }
 
-// Rmv returns a new delta-set removing the given elements.
+// Rmv returns a new delta-set removing the given key.
 func (s *set) Rmv(key string) (*pb.Delta, error) {
 	delta := &pb.Delta{}
 
-	// /namespace/<key>/elems
+	// /namespace/<key>/elements
 	prefix := s.elemsPrefix(key)
 	q := query.Query{
 		Prefix:   prefix.String(),
@@ -85,13 +85,13 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 // Element retrieves the value of an element from the CRDT set.
 func (s *set) Element(key string) ([]byte, error) {
 	// We can only GET an element if it's part of the Set (in
-	// "elems" and not in "tombstones").
+	// "elemements" and not in "tombstones").
 
 	// As an optimization:
-	// * If the element has a value in the store it means:
+	// * If the key has a value in the store it means:
 	//   -> It occurs at least once in "elems"
 	//   -> It may or not be tombstoned
-	// * If the element does not have a value in the store:
+	// * If the key does not have a value in the store:
 	//   -> It was either never added
 	//   -> Or it was tombstoned
 	//   -> In both cases the element "does not exist".

@@ -353,7 +353,7 @@ func TestPriority(t *testing.T) {
 			}
 		}
 	}
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	var v, lastv []byte
 	var err error
 	for i, r := range replicas {
