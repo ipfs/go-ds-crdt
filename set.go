@@ -31,11 +31,10 @@ type set struct {
 }
 
 func newCRDTSet(d ds.Datastore, namespace ds.Key) *set {
-	s := &set{
+	return &set{
 		namespace: namespace,
 		store:     d,
 	}
-	return s
 }
 
 // Add returns a new delta-set adding the given key/value.

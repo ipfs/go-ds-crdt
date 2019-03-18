@@ -439,5 +439,8 @@ func TestPrintDAG(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	replicas[0].PrintDAG()
+	err := replicas[0].PrintDAG()
+	if err != nil {
+		t.Fatal(err)
+	}
 }
