@@ -94,7 +94,7 @@ func newBroadcasters(t *testing.T, n int) []*mockBroadcaster {
 	broadcasters := make([]*mockBroadcaster, n, n)
 	chans := make([]chan []byte, n, n)
 	for i := range chans {
-		chans[i] = make(chan []byte, 200)
+		chans[i] = make(chan []byte, 300)
 		broadcasters[i] = &mockBroadcaster{
 			chans:    chans,
 			myChan:   chans[i],
@@ -352,6 +352,7 @@ func TestPriority(t *testing.T) {
 				t.Error(err)
 			}
 		}
+		time.Sleep(40 * time.Millisecond)
 	}
 	time.Sleep(500 * time.Millisecond)
 	var v, lastv []byte
