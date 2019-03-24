@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	pb "github.com/ipfs/go-ds-crdt/pb"
 
@@ -56,13 +57,15 @@ type DAGSyncer interface {
 
 // Options holds configurable values for Datastore.
 type Options struct {
-	Logger logging.StandardLogger
+	Logger              logging.StandardLogger
+	RebroadcastInterval time.Duration
 }
 
 // DefaultOptions initializes an Options object with sensible defaults.
 func DefaultOptions() *Options {
 	return &Options{
-		Logger: logging.Logger("crdt"),
+		Logger:              logging.Logger("crdt"),
+		RebroadcastInterval: time.Minute,
 	}
 }
 
@@ -83,6 +86,10 @@ type Datastore struct {
 
 	dags        *crdtDAGService
 	broadcaster Broadcaster
+
+	lastHeadTSMux    sync.RWMutex
+	lastHeadTS       time.Time
+	rebroadcastTimer *time.Timer
 
 	curDeltaMux sync.Mutex
 	curDelta    *pb.Delta // current, unpublished delta
@@ -119,19 +126,21 @@ func New(
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dstore := &Datastore{
-		ctx:         ctx,
-		cancel:      cancel,
-		opts:        opts,
-		logger:      opts.Logger,
-		store:       store,
-		namespace:   namespace,
-		set:         set,
-		heads:       heads,
-		dags:        crdtdags,
-		broadcaster: bcast,
+		ctx:              ctx,
+		cancel:           cancel,
+		opts:             opts,
+		logger:           opts.Logger,
+		store:            store,
+		namespace:        namespace,
+		set:              set,
+		heads:            heads,
+		dags:             crdtdags,
+		broadcaster:      bcast,
+		rebroadcastTimer: time.NewTimer(opts.RebroadcastInterval),
 	}
 
 	go dstore.handleNext()
+	go dstore.rebroadcast()
 
 	return dstore
 }
@@ -159,6 +168,42 @@ func (store *Datastore) handleNext() {
 		if err != nil {
 			store.logger.Error(err)
 		}
+		store.lastHeadTSMux.Lock()
+		store.lastHeadTS = time.Now()
+		// Stop will trigger draining and reset in rebroadcast()
+		store.rebroadcastTimer.Stop()
+		store.lastHeadTSMux.Unlock()
+	}
+}
+
+func (store *Datastore) rebroadcast() {
+	timer := store.rebroadcastTimer
+	for {
+		select {
+		case <-store.ctx.Done():
+			return
+		case <-timer.C:
+			store.lastHeadTSMux.RLock()
+			if time.Since(store.lastHeadTS) > store.opts.RebroadcastInterval {
+				// the timer fired because the interval
+				// expired rather than because it was reset in
+				// handleBlock: rebroadcast heads
+				store.rebroadcastHeads()
+			}
+			timer.Reset(store.opts.RebroadcastInterval)
+			store.lastHeadTSMux.RUnlock()
+		}
+	}
+}
+
+func (store *Datastore) rebroadcastHeads() {
+	heads, _, err := store.heads.List()
+	if err != nil {
+		store.logger.Error(err)
+	}
+
+	for _, h := range heads {
+		store.broadcast(h)
 	}
 }
 
@@ -460,10 +505,10 @@ func (store *Datastore) broadcast(c cid.Cid) error {
 	if store.broadcaster == nil { // offline
 		return nil
 	}
-	store.logger.Debugf("broadcasting new block %s", c)
+	store.logger.Debugf("broadcasting %s", c)
 	err := store.broadcaster.Broadcast(c.Bytes())
 	if err != nil {
-		return errors.Wrapf(err, "error broadcasting new block %s", c)
+		return errors.Wrapf(err, "error broadcasting %s", c)
 	}
 	return nil
 }
