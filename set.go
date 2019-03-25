@@ -13,9 +13,10 @@ import (
 )
 
 var (
-	elemsNs        = "s" // elements namespace
-	tombsNs        = "t" // tombstones namespace
-	valueSuffix    = "v"
+	elemsNs        = "s" // /elements namespace /set/s/<key>/<block>
+	tombsNs        = "t" // /tombstones namespace /set/t/<key>/<block>
+	keysNs         = "k" // /keys namespace /set/k/<key>/{v,p}
+	valueSuffix    = "v" // for /keys namespace
 	prioritySuffix = "p"
 )
 
@@ -117,22 +118,22 @@ func (s *set) Element(key string) ([]byte, error) {
 }
 
 type filterIsKey struct {
-	ns ds.Key
 }
 
 func (f *filterIsKey) Filter(e query.Entry) bool {
 	dsk := ds.NewKey(e.Key)
-	return f.ns.IsAncestorOf(dsk) && ds.NewKey(valueSuffix).IsAncestorOf(dsk.Reverse())
+	return ds.NewKey(valueSuffix).IsAncestorOf(dsk.Reverse())
 }
 
 // Elements returns all the elements in the set.
 // It comes handy to use query.Result to wrap key, value and error.
 func (s *set) Elements() <-chan query.Result {
+	prefix := s.keyPrefix(keysNs).String()
 	q := query.Query{
-		Prefix:   s.namespace.String(),
+		Prefix:   prefix,
 		KeysOnly: true,
 		Filters: []query.Filter{
-			&filterIsKey{ns: s.namespace},
+			&filterIsKey{},
 		},
 	}
 
@@ -152,11 +153,11 @@ func (s *set) Elements() <-chan query.Result {
 				return
 			}
 
-			// /namespace/<key>/v -> <key>
+			// /namespace/keys/<key>/v -> <key>
 			// If our filter worked well we should have only
 			// got good keys like that.
 			key := strings.TrimSuffix(
-				strings.TrimPrefix(r.Key, s.namespace.String()),
+				strings.TrimPrefix(r.Key, prefix),
 				"/"+valueSuffix,
 			)
 
@@ -182,7 +183,7 @@ func (s *set) Elements() <-chan query.Result {
 // InSet returns true if the key belongs to one of the elements in the "elems"
 // set, and this element is not tombstoned.
 func (s *set) InSet(key string) (bool, error) {
-	// /namespace/<key>/elems/
+	// /namespace/elems/<key>
 	prefix := s.elemsPrefix(key)
 	q := query.Query{
 		Prefix:   prefix.String(),
@@ -195,7 +196,7 @@ func (s *set) InSet(key string) (bool, error) {
 	}
 	defer results.Close()
 
-	// range for all the <cid> in the elems set.
+	// range all the /namespace/elems/<key>/<block_cid>.
 	for r := range results.Next() {
 		if r.Error != nil {
 			return false, err
@@ -219,24 +220,24 @@ func (s *set) keyPrefix(key string) ds.Key {
 	return s.namespace.ChildString(key)
 }
 
-// /namespace/<key>/elems
+// /namespace/elems/<key>
 func (s *set) elemsPrefix(key string) ds.Key {
-	return s.keyPrefix(key).ChildString(elemsNs)
+	return s.keyPrefix(elemsNs).ChildString(key)
 }
 
-// /namespace/<key>/tombs
+// /namespace/tombs/<key>
 func (s *set) tombsPrefix(key string) ds.Key {
-	return s.keyPrefix(key).ChildString(tombsNs)
+	return s.keyPrefix(tombsNs).ChildString(key)
 }
 
-// /namespace/<key>/value
+// /namespace/keys/<key>/value
 func (s *set) valueKey(key string) ds.Key {
-	return s.keyPrefix(key).ChildString(valueSuffix)
+	return s.keyPrefix(keysNs).ChildString(key).ChildString(valueSuffix)
 }
 
-// /namespace/<key>/priority
+// /namespace/keys/<key>/priority
 func (s *set) priorityKey(key string) ds.Key {
-	return s.keyPrefix(key).ChildString(prioritySuffix)
+	return s.keyPrefix(keysNs).ChildString(key).ChildString(prioritySuffix)
 }
 
 func (s *set) getPriority(key string) (uint64, error) {
