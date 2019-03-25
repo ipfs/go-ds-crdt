@@ -87,9 +87,10 @@ type Datastore struct {
 	dags        *crdtDAGService
 	broadcaster Broadcaster
 
-	lastHeadTSMux    sync.RWMutex
-	lastHeadTS       time.Time
-	rebroadcastTimer *time.Timer
+	lastHeadTSMux sync.RWMutex
+	lastHeadTS    time.Time
+
+	rebroadcastTicker *time.Ticker
 
 	curDeltaMux sync.Mutex
 	curDelta    *pb.Delta // current, unpublished delta
@@ -126,17 +127,17 @@ func New(
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dstore := &Datastore{
-		ctx:              ctx,
-		cancel:           cancel,
-		opts:             opts,
-		logger:           opts.Logger,
-		store:            store,
-		namespace:        namespace,
-		set:              set,
-		heads:            heads,
-		dags:             crdtdags,
-		broadcaster:      bcast,
-		rebroadcastTimer: time.NewTimer(opts.RebroadcastInterval),
+		ctx:               ctx,
+		cancel:            cancel,
+		opts:              opts,
+		logger:            opts.Logger,
+		store:             store,
+		namespace:         namespace,
+		set:               set,
+		heads:             heads,
+		dags:              crdtdags,
+		broadcaster:       bcast,
+		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
 	}
 
 	go dstore.handleNext()
@@ -162,6 +163,7 @@ func (store *Datastore) handleNext() {
 				return
 			}
 			store.logger.Error(err)
+
 			continue
 		}
 		err = store.handleBlock(context.Background(), data)
@@ -170,28 +172,23 @@ func (store *Datastore) handleNext() {
 		}
 		store.lastHeadTSMux.Lock()
 		store.lastHeadTS = time.Now()
-		// Stop will trigger draining and reset in rebroadcast()
-		store.rebroadcastTimer.Stop()
 		store.lastHeadTSMux.Unlock()
 	}
 }
 
 func (store *Datastore) rebroadcast() {
-	timer := store.rebroadcastTimer
+	ticker := store.rebroadcastTicker
 	for {
 		select {
 		case <-store.ctx.Done():
 			return
-		case <-timer.C:
+		case <-ticker.C:
 			store.lastHeadTSMux.RLock()
-			if time.Since(store.lastHeadTS) > store.opts.RebroadcastInterval {
-				// the timer fired because the interval
-				// expired rather than because it was reset in
-				// handleBlock: rebroadcast heads
+			timeSinceHead := time.Since(store.lastHeadTS)
+			store.lastHeadTSMux.RUnlock()
+			if timeSinceHead > store.opts.RebroadcastInterval {
 				store.rebroadcastHeads()
 			}
-			timer.Reset(store.opts.RebroadcastInterval)
-			store.lastHeadTSMux.RUnlock()
 		}
 	}
 }
