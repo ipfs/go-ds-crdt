@@ -139,17 +139,22 @@ func (mb *mockBroadcaster) Next() ([]byte, error) {
 
 type mockDAGSync struct {
 	ipld.DAGService
-	bs          blockstore.Blockstore
-	knownBlocks map[cid.Cid]struct{}
+	bs             blockstore.Blockstore
+	knownBlocksMux sync.RWMutex
+	knownBlocks    map[cid.Cid]struct{}
 }
 
 func (mds *mockDAGSync) IsKnownBlock(c cid.Cid) (bool, error) {
+	mds.knownBlocksMux.RLock()
 	_, ok := mds.knownBlocks[c]
+	mds.knownBlocksMux.RUnlock()
 	return ok, nil
 }
 
 func (mds *mockDAGSync) Add(ctx context.Context, n ipld.Node) error {
+	mds.knownBlocksMux.Lock()
 	mds.knownBlocks[n.Cid()] = struct{}{}
+	mds.knownBlocksMux.Unlock()
 	return mds.DAGService.Add(ctx, n)
 }
 
