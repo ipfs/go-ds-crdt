@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -158,7 +159,7 @@ func (mds *mockDAGSync) Add(ctx context.Context, n ipld.Node) error {
 	return mds.DAGService.Add(ctx, n)
 }
 
-func makeReplicas(t *testing.T) []*Datastore {
+func makeReplicas(t *testing.T, opts *Options) []*Datastore {
 	bcasts := newBroadcasters(t, numReplicas)
 	bs := mdutils.Bserv()
 	dagserv := merkledag.NewDAGService(bs)
@@ -171,7 +172,18 @@ func makeReplicas(t *testing.T) []*Datastore {
 			knownBlocks: make(map[cid.Cid]struct{}),
 		}
 
-		replicas[i] = New(
+		if opts == nil {
+			opts = &Options{}
+		}
+
+		opts.Logger = &testLogger{
+			name: fmt.Sprintf("r#%d: ", i),
+			l:    DefaultOptions().Logger,
+		}
+		opts.RebroadcastInterval = time.Second * 10
+
+		var err error
+		replicas[i], err = New(
 			dssync.MutexWrap(ds.NewMapDatastore()),
 			// ds.NewLogDatastore(
 			// 	dssync.MutexWrap(ds.NewMapDatastore()),
@@ -180,13 +192,11 @@ func makeReplicas(t *testing.T) []*Datastore {
 			ds.NewKey("crdttest"),
 			dagsync,
 			bcasts[i],
-			&Options{
-				Logger: &testLogger{
-					name: fmt.Sprintf("r#%d: ", i),
-					l:    DefaultOptions().Logger,
-				},
-			},
+			opts,
 		)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if debug {
 		log.SetLogLevel("crdt", "debug")
@@ -204,7 +214,7 @@ func closeReplicas(t *testing.T, rs []*Datastore) {
 }
 
 func TestCRDT(t *testing.T) {
-	replicas := makeReplicas(t)
+	replicas := makeReplicas(t, nil)
 	k := ds.NewKey("hi")
 	err := replicas[0].Put(k, []byte("hola"))
 	if err != nil {
@@ -225,7 +235,7 @@ func TestCRDT(t *testing.T) {
 }
 
 func TestDatastoreSuite(t *testing.T) {
-	replicas := makeReplicas(t)
+	replicas := makeReplicas(t, nil)
 	dstest.SubtestAll(t, replicas[0])
 
 	time.Sleep(time.Second)
@@ -250,7 +260,7 @@ func TestDatastoreSuite(t *testing.T) {
 func TestSync(t *testing.T) {
 	nItems := 20
 
-	replicas := makeReplicas(t)
+	replicas := makeReplicas(t, nil)
 	defer closeReplicas(t, replicas)
 
 	// Add nItems choosing the replica randomly
@@ -347,7 +357,7 @@ func TestSync(t *testing.T) {
 func TestPriority(t *testing.T) {
 	nItems := 5
 
-	replicas := makeReplicas(t)
+	replicas := makeReplicas(t, nil)
 	k := ds.NewKey("k")
 
 	for i, r := range replicas {
@@ -394,7 +404,7 @@ func TestPriority(t *testing.T) {
 
 func TestCatchUp(t *testing.T) {
 	nItems := 50
-	replicas := makeReplicas(t)
+	replicas := makeReplicas(t, nil)
 	r := replicas[len(replicas)-1]
 	br := r.broadcaster.(*mockBroadcaster)
 	br.dropProb = 101
@@ -435,7 +445,7 @@ func TestCatchUp(t *testing.T) {
 
 func TestPrintDAG(t *testing.T) {
 	nItems := 3
-	replicas := makeReplicas(t)
+	replicas := makeReplicas(t, nil)
 
 	// this items will not get to anyone
 	for i := 0; i < nItems; i++ {
@@ -448,5 +458,38 @@ func TestPrintDAG(t *testing.T) {
 	err := replicas[0].PrintDAG()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHooks(t *testing.T) {
+	var put int64
+	var deleted int64
+
+	opts := &Options{
+		PutHook: func(k ds.Key, v []byte) {
+			atomic.AddInt64(&put, 1)
+		},
+		DeleteHook: func(k ds.Key) {
+			atomic.AddInt64(&deleted, 1)
+		},
+	}
+
+	replicas := makeReplicas(t, opts)
+	k := ds.RandomKey()
+	err := replicas[0].Put(k, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Delete(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if atomic.LoadInt64(&put) != int64(len(replicas)) {
+		t.Error("all replicas should have notified Put", put)
+	}
+	if atomic.LoadInt64(&deleted) != int64(len(replicas)) {
+		t.Error("all replicas should have notified Remove", deleted)
 	}
 }

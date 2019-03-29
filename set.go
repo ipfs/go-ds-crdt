@@ -27,14 +27,23 @@ var (
 // Value. When two values have the same priority, it chooses by alphabetically
 // sorting their unique IDs alphabetically.
 type set struct {
-	store     ds.Datastore
-	namespace ds.Key
+	store      ds.Datastore
+	namespace  ds.Key
+	putHook    func(key string, v []byte)
+	deleteHook func(key string)
 }
 
-func newCRDTSet(d ds.Datastore, namespace ds.Key) *set {
+func newCRDTSet(
+	d ds.Datastore,
+	namespace ds.Key,
+	putHook func(key string, v []byte),
+	deleteHook func(key string),
+) *set {
 	return &set{
-		namespace: namespace,
-		store:     d,
+		namespace:  namespace,
+		store:      d,
+		putHook:    putHook,
+		deleteHook: deleteHook,
 	}
 }
 
@@ -296,7 +305,14 @@ func (s *set) setValue(key string, value []byte, prio uint64) error {
 	}
 
 	// store priority
-	return s.setPriority(key, prio)
+	err = s.setPriority(key, prio)
+	if err != nil {
+		return err
+	}
+
+	// trigger add hook
+	s.putHook(key, value)
+	return nil
 }
 
 // putElems adds items to the "elems" set.
@@ -356,12 +372,21 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 		}
 	}
 
+	deletedElems := make(map[string]struct{})
 	for _, e := range tombs {
 		// /namespace/<key>/tombs/<id>
-		k := s.tombsPrefix(e.GetKey()).ChildString(e.GetId())
+		elemKey := e.GetKey()
+		k := s.tombsPrefix(elemKey).ChildString(e.GetId())
 		err := store.Put(k, nil)
 		if err != nil {
 			return err
+		}
+		// run delete hook only once for all
+		// versions of the same element tombstoned
+		// in this delta
+		if _, ok := deletedElems[elemKey]; !ok {
+			deletedElems[elemKey] = struct{}{}
+			s.deleteHook(elemKey)
 		}
 	}
 
