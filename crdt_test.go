@@ -21,7 +21,7 @@ import (
 	mdutils "github.com/ipfs/go-merkledag/test"
 )
 
-var numReplicas = 50
+var numReplicas = 25
 var debug = false
 
 func init() {
