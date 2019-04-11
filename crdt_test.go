@@ -259,7 +259,7 @@ func TestDatastoreSuite(t *testing.T) {
 }
 
 func TestSync(t *testing.T) {
-	nItems := 20
+	nItems := 10
 
 	replicas := makeReplicas(t, nil)
 	defer closeReplicas(t, replicas)
