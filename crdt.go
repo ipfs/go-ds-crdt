@@ -59,6 +59,34 @@ type DAGSyncer interface {
 type Options struct {
 	Logger              logging.StandardLogger
 	RebroadcastInterval time.Duration
+	// The PutHook function is triggered whenever an element
+	// is successfully added to the datastore (either by a local
+	// or remote update), and only when that addition is considered the
+	// prevalent value.
+	PutHook func(k ds.Key, v []byte)
+	// The DeleteHook function is triggered whenever a version of an
+	// element is successfully removed from the datastore (either by a
+	// local or remote update). Unordered and concurrent updates may
+	// result in the DeleteHook being triggered even though the element is
+	// still present in the datastore because it was re-added. If that is
+	// relevant, use Has() to check if the removed element is still part
+	// of the datastore.
+	DeleteHook func(k ds.Key)
+}
+
+func (opts *Options) verify() error {
+	if opts == nil {
+		return errors.New("options cannot be nil")
+	}
+
+	if opts.RebroadcastInterval <= 0 {
+		return errors.New("invalid RebroadcastInterval")
+	}
+
+	if opts.Logger == nil {
+		return errors.New("logger should not be undefined")
+	}
+	return nil
 }
 
 // DefaultOptions initializes an Options object with sensible defaults.
@@ -66,6 +94,8 @@ func DefaultOptions() *Options {
 	return &Options{
 		Logger:              logging.Logger("crdt"),
 		RebroadcastInterval: time.Minute,
+		PutHook:             nil,
+		DeleteHook:          nil,
 	}
 }
 
@@ -107,9 +137,13 @@ func New(
 	dagSyncer DAGSyncer,
 	bcast Broadcaster,
 	opts *Options,
-) *Datastore {
+) (*Datastore, error) {
 	if opts == nil {
 		opts = DefaultOptions()
+	}
+
+	if err := opts.verify(); err != nil {
+		return nil, err
 	}
 
 	// <namespace>/set
@@ -117,7 +151,23 @@ func New(
 	// <namespace>/heads
 	fullHeadsNs := namespace.ChildString(headsNs)
 
-	set := newCRDTSet(store, fullSetNs)
+	setPutHook := func(k string, v []byte) {
+		if opts.PutHook == nil {
+			return
+		}
+		dsk := ds.NewKey(k)
+		opts.PutHook(dsk, v)
+	}
+
+	setDeleteHook := func(k string) {
+		if opts.DeleteHook == nil {
+			return
+		}
+		dsk := ds.NewKey(k)
+		opts.DeleteHook(dsk)
+	}
+
+	set := newCRDTSet(store, fullSetNs, setPutHook, setDeleteHook)
 	heads := newHeads(store, fullHeadsNs)
 
 	crdtdags := &crdtDAGService{
@@ -143,7 +193,7 @@ func New(
 	go dstore.handleNext()
 	go dstore.rebroadcast()
 
-	return dstore
+	return dstore, nil
 }
 
 func (store *Datastore) handleNext() {
@@ -509,9 +559,6 @@ func (store *Datastore) broadcast(c cid.Cid) error {
 	}
 	return nil
 }
-
-// IsThreadSafe declares that this datastore implementation is thread-safe.
-func (store *Datastore) IsThreadSafe() {}
 
 type batch struct {
 	store *Datastore
