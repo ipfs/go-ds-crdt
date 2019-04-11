@@ -560,9 +560,6 @@ func (store *Datastore) broadcast(c cid.Cid) error {
 	return nil
 }
 
-// IsThreadSafe declares that this datastore implementation is thread-safe.
-func (store *Datastore) IsThreadSafe() {}
-
 type batch struct {
 	store *Datastore
 }

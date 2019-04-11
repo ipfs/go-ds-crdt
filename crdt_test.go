@@ -100,6 +100,7 @@ func newBroadcasters(t *testing.T, n int) []*mockBroadcaster {
 			chans:    chans,
 			myChan:   chans[i],
 			dropProb: 0,
+			t:        t,
 		}
 	}
 	return broadcasters
