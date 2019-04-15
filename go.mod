@@ -10,5 +10,6 @@ require (
 	github.com/ipfs/go-ipld-format v0.0.1
 	github.com/ipfs/go-log v0.0.1
 	github.com/ipfs/go-merkledag v0.0.1
+	github.com/libp2p/go-libp2p-pubsub v0.0.1
 	github.com/pkg/errors v0.8.1
 )
