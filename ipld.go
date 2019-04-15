@@ -15,8 +15,6 @@ import (
 
 var _ ipld.DAGService = (*crdtDAGService)(nil)
 
-var defaultWorkers = 20
-
 func init() {
 	ipld.Register(cid.DagProtobuf, dag.DecodeProtobufBlock)
 }
