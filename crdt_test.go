@@ -146,7 +146,7 @@ type mockDAGSync struct {
 	knownBlocks    map[cid.Cid]struct{}
 }
 
-func (mds *mockDAGSync) IsKnownBlock(c cid.Cid) (bool, error) {
+func (mds *mockDAGSync) HasBlock(c cid.Cid) (bool, error) {
 	mds.knownBlocksMux.RLock()
 	_, ok := mds.knownBlocks[c]
 	mds.knownBlocksMux.RUnlock()

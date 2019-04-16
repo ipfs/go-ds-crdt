@@ -52,7 +52,7 @@ type DAGSyncer interface {
 	ipld.DAGService
 	// Returns true if the block is locally available (therefore, it
 	// is considered processed).
-	IsKnownBlock(c cid.Cid) (bool, error)
+	HasBlock(c cid.Cid) (bool, error)
 }
 
 // Options holds configurable values for Datastore.
@@ -266,7 +266,7 @@ func (store *Datastore) handleBlock(ctx context.Context, data []byte) error {
 	// Ignore already known blocks.
 	// This includes the case when the block is a current
 	// head.
-	known, err := store.dags.IsKnownBlock(c)
+	known, err := store.dags.HasBlock(c)
 	if err != nil {
 		return errors.Wrap(err, "error checking for known block")
 	}
@@ -334,7 +334,7 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 			continue
 		}
 
-		known, err := store.dags.IsKnownBlock(child)
+		known, err := store.dags.HasBlock(child)
 		if err != nil {
 			return errors.Wrapf(err, "error checking for known block %s", child)
 		}
