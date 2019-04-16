@@ -216,7 +216,7 @@ func (store *Datastore) handleNext() {
 
 			continue
 		}
-		err = store.handleBlock(context.Background(), data)
+		err = store.handleBlock(store.ctx, data)
 		if err != nil {
 			store.logger.Error(err)
 		}
@@ -514,6 +514,14 @@ func (store *Datastore) publish(delta *pb.Delta) error {
 	if err != nil {
 		return err
 	}
+
+	// Make sure that when a write-call returns (Put),
+	// the changes are already reflected in the datastore
+	err = store.handleBlock(store.ctx, c.Bytes())
+	if err != nil {
+		return err
+	}
+
 	return store.broadcast(c)
 }
 
