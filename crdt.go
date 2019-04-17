@@ -1,8 +1,20 @@
-// Package crdt provides a replicated go-datastore implementation using
-// Merkle-CRDTs built with IPLD nodes. This Datastore is agnostic to how new
-// MerkleDAG roots are broadcasted to the rest of replicas (Broadcaster
-// component) and to how the IPLD nodes are made discoverable and retrievable
-// to by other replicas (DAG-Syncer component).
+// Package crdt provides a replicated go-datastore (key-value store)
+// implementation using Merkle-CRDTs built with IPLD nodes.
+//
+// This Datastore is agnostic to how new MerkleDAG roots are broadcasted to
+// the rest of replicas (`Broadcaster` component) and to how the IPLD nodes
+// are made discoverable and retrievable to by other replicas (`DAGSyncer`
+// component).
+//
+// The implementation is based on the "Merkle-CRDTs: Merkle-DAGs meet CRDTs"
+// paper by Héctor Sanjuán, Samuli Pöyhtäri and Pedro Teixeira.
+//
+// Note that, in the absence of compaction (which must be performed manually),
+// a crdt.Datastore will only grow in size even when keys are deleted.
+//
+// The time to be fully synced for new Datastore replicas will depend on how
+// fast they can retrieve the DAGs announced by the other replicas, but newer
+// values will be available before older ones.
 package crdt
 
 import (
@@ -133,6 +145,8 @@ type Datastore struct {
 // component for IPLD nodes and a Broadcaster component to distribute and
 // receive information to and from the rest of replicas. Actual implementation
 // of these must be provided by the user.
+//
+// The CRDT-Datastore should call Close() before the given store is closed.
 func New(
 	store ds.Datastore,
 	namespace ds.Key,
@@ -170,7 +184,7 @@ func New(
 	}
 
 	set := newCRDTSet(store, fullSetNs, setPutHook, setDeleteHook)
-	heads := newHeads(store, fullHeadsNs)
+	heads := newHeads(store, fullHeadsNs, opts.Logger)
 
 	crdtdags := &crdtDAGService{
 		DAGSyncer: dagSyncer,
@@ -191,6 +205,16 @@ func New(
 		broadcaster:       bcast,
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
 	}
+
+	headList, maxHeight, err := dstore.heads.List()
+	if err != nil {
+		return nil, err
+	}
+	dstore.logger.Infof(
+		"crdt Datastore created. Number of heads: %d. Current max-height: %d",
+		len(headList),
+		maxHeight,
+	)
 
 	dstore.wg.Add(2)
 	go dstore.handleNext()
@@ -313,13 +337,18 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 		return errors.Wrapf(err, "error merging delta from %s", current)
 	}
 
+	if depth%10 == 0 {
+		store.logger.Infof("merged delta from %s (depth from root: %d)", current, depth)
+	} else {
+		store.logger.Debugf("merged delta from %s (depth from root: %d)", current, depth)
+	}
+
 	links := nd.Links()
 	if len(links) == 0 { // we reached the bottom, we are a leaf.
 		err := store.heads.Add(top, depth)
 		if err != nil {
 			return errors.Wrapf(err, "error adding head %s", top)
 		}
-		store.logger.Debugf("new head %s@%d", top, depth)
 		return nil
 	}
 
@@ -339,7 +368,6 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 				return errors.Wrapf(err, "error replacing head: %s->%s", child, top)
 			}
 
-			store.logger.Debugf("replaced head %s with %s@%d", child, top, height+depth)
 			continue
 		}
 
@@ -355,7 +383,6 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 				return errors.Wrapf(err, "error getting height for block %s", child)
 			}
 			store.heads.Add(top, height+depth)
-			store.logger.Debugf("new head %s@%d", top, height+depth)
 			continue
 		}
 

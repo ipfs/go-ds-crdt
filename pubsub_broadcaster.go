@@ -7,17 +7,21 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
-// PubsubBroadcaster implements a Broadcaster using libp2p PubSub.
+// PubSubBroadcaster implements a Broadcaster using libp2p PubSub.
 type PubSubBroadcaster struct {
 	ctx  context.Context
 	psub *pubsub.PubSub
 	subs *pubsub.Subscription
 }
 
-// NewPubsubBroadcaster returns a new broadcaster using the given PubSub and
+// NewPubSubBroadcaster returns a new broadcaster using the given PubSub and
 // a topic to subscribe/broadcast to. The given context can be used to cancel
 // the broadcaster.
 // Please register any topic validators before creating the Broadcaster.
+//
+// The broadcaster can be shut down by cancelling the given context.
+// This must be done before Closing the crdt.Datastore, otherwise things
+// may hang.
 func NewPubSubBroadcaster(ctx context.Context, psub *pubsub.PubSub, topic string) (*PubSubBroadcaster, error) {
 	subs, err := psub.Subscribe(topic)
 	if err != nil {

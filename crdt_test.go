@@ -25,8 +25,6 @@ var numReplicas = 2
 var debug = false
 
 func init() {
-	_ = log.SetDebugLogging
-	log.SetLogLevel("crdt", "debug")
 	rand.Seed(time.Now().UnixNano())
 }
 
