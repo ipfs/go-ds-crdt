@@ -124,6 +124,8 @@ type Datastore struct {
 
 	curDeltaMux sync.Mutex
 	curDelta    *pb.Delta // current, unpublished delta
+
+	wg sync.WaitGroup
 }
 
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
@@ -190,6 +192,7 @@ func New(
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
 	}
 
+	dstore.wg.Add(2)
 	go dstore.handleNext()
 	go dstore.rebroadcast()
 
@@ -197,6 +200,8 @@ func New(
 }
 
 func (store *Datastore) handleNext() {
+	defer store.wg.Done()
+
 	if store.broadcaster == nil { // offline
 		return
 	}
@@ -227,7 +232,10 @@ func (store *Datastore) handleNext() {
 }
 
 func (store *Datastore) rebroadcast() {
+	defer store.wg.Done()
+
 	ticker := store.rebroadcastTicker
+	defer ticker.Stop()
 	for {
 		select {
 		case <-store.ctx.Done():
@@ -247,6 +255,7 @@ func (store *Datastore) rebroadcastHeads() {
 	heads, _, err := store.heads.List()
 	if err != nil {
 		store.logger.Error(err)
+		return
 	}
 
 	for _, h := range heads {
@@ -420,6 +429,7 @@ func (store *Datastore) Delete(key ds.Key) error {
 // Close shuts down the CRDT datastore. It should not be used afterwards.
 func (store *Datastore) Close() error {
 	store.cancel()
+	store.wg.Wait()
 	return nil
 }
 

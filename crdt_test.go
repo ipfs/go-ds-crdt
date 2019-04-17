@@ -21,7 +21,7 @@ import (
 	mdutils "github.com/ipfs/go-merkledag/test"
 )
 
-var numReplicas = 25
+var numReplicas = 2
 var debug = false
 
 func init() {
@@ -85,25 +85,28 @@ func (tl *testLogger) Warningf(format string, args ...interface{}) {
 }
 
 type mockBroadcaster struct {
+	ctx      context.Context
 	chans    []chan []byte
 	myChan   chan []byte
 	dropProb int // probability of dropping a message instead of receiving it
 	t        *testing.T
 }
 
-func newBroadcasters(t *testing.T, n int) []*mockBroadcaster {
+func newBroadcasters(t *testing.T, n int) ([]*mockBroadcaster, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
 	broadcasters := make([]*mockBroadcaster, n, n)
 	chans := make([]chan []byte, n, n)
 	for i := range chans {
 		chans[i] = make(chan []byte, 300)
 		broadcasters[i] = &mockBroadcaster{
+			ctx:      ctx,
 			chans:    chans,
 			myChan:   chans[i],
 			dropProb: 0,
 			t:        t,
 		}
 	}
-	return broadcasters
+	return broadcasters, cancel
 }
 
 func (mb *mockBroadcaster) Broadcast(data []byte) error {
@@ -135,8 +138,13 @@ func (mb *mockBroadcaster) Broadcast(data []byte) error {
 }
 
 func (mb *mockBroadcaster) Next() ([]byte, error) {
-	data := <-mb.myChan
-	return data, nil
+	select {
+	case data := <-mb.myChan:
+		return data, nil
+	case <-mb.ctx.Done():
+		return nil, ErrNoMoreBroadcast
+	}
+	return nil, nil
 }
 
 type mockDAGSync struct {
@@ -160,8 +168,8 @@ func (mds *mockDAGSync) Add(ctx context.Context, n ipld.Node) error {
 	return mds.DAGService.Add(ctx, n)
 }
 
-func makeReplicas(t *testing.T, opts *Options) []*Datastore {
-	bcasts := newBroadcasters(t, numReplicas)
+func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
+	bcasts, bcastCancel := newBroadcasters(t, numReplicas)
 	bs := mdutils.Bserv()
 	dagserv := merkledag.NewDAGService(bs)
 
@@ -202,20 +210,23 @@ func makeReplicas(t *testing.T, opts *Options) []*Datastore {
 	if debug {
 		log.SetLogLevel("crdt", "debug")
 	}
-	return replicas
-}
 
-func closeReplicas(t *testing.T, rs []*Datastore) {
-	for _, r := range rs {
-		err := r.Close()
-		if err != nil {
-			t.Error(err)
+	closeReplicas := func() {
+		bcastCancel()
+		for _, r := range replicas {
+			err := r.Close()
+			if err != nil {
+				t.Error(err)
+			}
 		}
 	}
+
+	return replicas, closeReplicas
 }
 
 func TestCRDT(t *testing.T) {
-	replicas := makeReplicas(t, nil)
+	replicas, closeReplicas := makeReplicas(t, nil)
+	defer closeReplicas()
 	k := ds.NewKey("hi")
 	err := replicas[0].Put(k, []byte("hola"))
 	if err != nil {
@@ -236,7 +247,8 @@ func TestCRDT(t *testing.T) {
 }
 
 func TestDatastoreSuite(t *testing.T) {
-	replicas := makeReplicas(t, nil)
+	replicas, closeReplicas := makeReplicas(t, nil)
+	defer closeReplicas()
 	dstest.SubtestAll(t, replicas[0])
 
 	time.Sleep(time.Second)
@@ -261,8 +273,8 @@ func TestDatastoreSuite(t *testing.T) {
 func TestSync(t *testing.T) {
 	nItems := 10
 
-	replicas := makeReplicas(t, nil)
-	defer closeReplicas(t, replicas)
+	replicas, closeReplicas := makeReplicas(t, nil)
+	defer closeReplicas()
 
 	// Add nItems choosing the replica randomly
 	for i := 0; i < nItems; i++ {
@@ -358,7 +370,9 @@ func TestSync(t *testing.T) {
 func TestPriority(t *testing.T) {
 	nItems := 5
 
-	replicas := makeReplicas(t, nil)
+	replicas, closeReplicas := makeReplicas(t, nil)
+	defer closeReplicas()
+
 	k := ds.NewKey("k")
 
 	for i, r := range replicas {
@@ -405,7 +419,9 @@ func TestPriority(t *testing.T) {
 
 func TestCatchUp(t *testing.T) {
 	nItems := 50
-	replicas := makeReplicas(t, nil)
+	replicas, closeReplicas := makeReplicas(t, nil)
+	defer closeReplicas()
+
 	r := replicas[len(replicas)-1]
 	br := r.broadcaster.(*mockBroadcaster)
 	br.dropProb = 101
@@ -446,7 +462,8 @@ func TestCatchUp(t *testing.T) {
 
 func TestPrintDAG(t *testing.T) {
 	nItems := 3
-	replicas := makeReplicas(t, nil)
+	replicas, closeReplicas := makeReplicas(t, nil)
+	defer closeReplicas()
 
 	// this items will not get to anyone
 	for i := 0; i < nItems; i++ {
@@ -475,7 +492,9 @@ func TestHooks(t *testing.T) {
 		},
 	}
 
-	replicas := makeReplicas(t, opts)
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
 	k := ds.RandomKey()
 	err := replicas[0].Put(k, nil)
 	if err != nil {
