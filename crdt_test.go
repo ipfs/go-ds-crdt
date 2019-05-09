@@ -21,7 +21,7 @@ import (
 	mdutils "github.com/ipfs/go-merkledag/test"
 )
 
-var numReplicas = 2
+var numReplicas = 10
 var debug = false
 
 func init() {
@@ -171,6 +171,23 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 	bs := mdutils.Bserv()
 	dagserv := merkledag.NewDAGService(bs)
 
+	replicaOpts := make([]*Options, numReplicas)
+	for i := range replicaOpts {
+		if opts == nil {
+			replicaOpts[i] = &Options{}
+		} else {
+			replicaOpts[i] = opts
+		}
+
+		replicaOpts[i].Logger = &testLogger{
+			name: fmt.Sprintf("r#%d: ", i),
+			l:    DefaultOptions().Logger,
+		}
+		replicaOpts[i].RebroadcastInterval = time.Second * 10
+		replicaOpts[i].NumWorkers = 5
+		replicaOpts[i].DAGSyncerTimeout = time.Second
+	}
+
 	replicas := make([]*Datastore, numReplicas, numReplicas)
 	for i := range replicas {
 		dagsync := &mockDAGSync{
@@ -178,16 +195,6 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 			bs:          bs.Blockstore(),
 			knownBlocks: make(map[cid.Cid]struct{}),
 		}
-
-		if opts == nil {
-			opts = &Options{}
-		}
-
-		opts.Logger = &testLogger{
-			name: fmt.Sprintf("r#%d: ", i),
-			l:    DefaultOptions().Logger,
-		}
-		opts.RebroadcastInterval = time.Second * 10
 
 		var err error
 		replicas[i], err = New(
@@ -199,7 +206,7 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 			ds.NewKey("crdttest"),
 			dagsync,
 			bcasts[i],
-			opts,
+			replicaOpts[i],
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -269,7 +276,7 @@ func TestDatastoreSuite(t *testing.T) {
 }
 
 func TestSync(t *testing.T) {
-	nItems := 10
+	nItems := 15
 
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -277,7 +284,7 @@ func TestSync(t *testing.T) {
 	// Add nItems choosing the replica randomly
 	for i := 0; i < nItems; i++ {
 		k := ds.RandomKey()
-		v := []byte{byte(i)}
+		v := []byte(fmt.Sprintf("%d", i))
 		n := rand.Intn(len(replicas))
 		err := replicas[n].Put(k, v)
 		if err != nil {
@@ -326,7 +333,7 @@ func TestSync(t *testing.T) {
 		}
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// query everything again
 	results, err = replicas[0].Query(q)
@@ -363,10 +370,13 @@ func TestSync(t *testing.T) {
 		}
 		t.Log(list)
 	}
+	//replicas[0].PrintDAG()
+	//fmt.Println("==========================================================")
+	//replicas[1].PrintDAG()
 }
 
 func TestPriority(t *testing.T) {
-	nItems := 5
+	nItems := 10
 
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -380,6 +390,7 @@ func TestPriority(t *testing.T) {
 				t.Error(err)
 			}
 		}
+		// Reduces contingency and combinatorial explosion
 		time.Sleep(40 * time.Millisecond)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -403,6 +414,7 @@ func TestPriority(t *testing.T) {
 	}
 
 	time.Sleep(500 * time.Millisecond)
+
 	for i, r := range replicas {
 		v, err := r.Get(k)
 		if err != nil {
@@ -412,6 +424,9 @@ func TestPriority(t *testing.T) {
 			t.Errorf("replica %d has wrong final value: %s", i, string(v))
 		}
 	}
+
+	//replicas[14].PrintDAG()
+	//fmt.Println("=======================================================")
 	//replicas[1].PrintDAG()
 }
 
@@ -482,6 +497,10 @@ func TestHooks(t *testing.T) {
 	var deleted int64
 
 	opts := &Options{
+		Logger:              DefaultOptions().Logger,
+		RebroadcastInterval: time.Second * 10,
+		NumWorkers:          5,
+		DAGSyncerTimeout:    time.Second,
 		PutHook: func(k ds.Key, v []byte) {
 			atomic.AddInt64(&put, 1)
 		},
