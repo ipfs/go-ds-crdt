@@ -96,8 +96,9 @@ func (opts *Options) verify() error {
 	}
 
 	if opts.Logger == nil {
-		return errors.New("logger should not be undefined")
+		return errors.New("the Logger is undefined")
 	}
+
 	return nil
 }
 
@@ -322,10 +323,30 @@ func (store *Datastore) handleBlock(ctx context.Context, data []byte) error {
 func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 	//store.logger.Debugf("walking on %s, from %s, depth %d", current, top, depth)
 
+	firstElem := &fifoElem{
+		current: current,
+		top:     top,
+		depth:   depth,
+	}
+
+	queue := newFifo()
+
+	// TODO: parallelize processing queue elements
+	for elem := firstElem; elem != nil; elem = queue.Pop() {
+		newElems, err := store.processNode(elem.current, elem.top, elem.depth)
+		if err != nil {
+			return err
+		}
+		queue.PushN(newElems...)
+	}
+	return nil
+}
+
+func (store *Datastore) processNode(current, top cid.Cid, depth uint64) ([]*fifoElem, error) {
 	// TODO: Pre-fetching of children?
 	nd, delta, err := store.dags.GetDelta(store.ctx, current)
 	if err != nil {
-		return errors.Wrapf(err, "error fetching block %s", current)
+		return nil, errors.Wrapf(err, "error fetching block %s", current)
 	}
 
 	// Once the DAGService has fetched the block, it should be in the
@@ -334,7 +355,7 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 	// merge the delta
 	err = store.set.Merge(delta, dshelp.CidToDsKey(current).String())
 	if err != nil {
-		return errors.Wrapf(err, "error merging delta from %s", current)
+		return nil, errors.Wrapf(err, "error merging delta from %s", current)
 	}
 
 	if depth%10 == 0 {
@@ -347,17 +368,19 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 	if len(links) == 0 { // we reached the bottom, we are a leaf.
 		err := store.heads.Add(top, depth)
 		if err != nil {
-			return errors.Wrapf(err, "error adding head %s", top)
+			return nil, errors.Wrapf(err, "error adding head %s", top)
 		}
-		return nil
+		return nil, nil
 	}
+
+	newElems := []*fifoElem{}
 
 	// walkToChildren
 	for _, l := range links {
 		child := l.Cid
 		isHead, height, err := store.heads.IsHead(child)
 		if err != nil {
-			return errors.Wrapf(err, "error checking if %s is head", child)
+			return nil, errors.Wrapf(err, "error checking if %s is head", child)
 		}
 
 		if isHead {
@@ -365,7 +388,7 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 			// the tip of this branch
 			err := store.heads.Replace(child, top, height+depth)
 			if err != nil {
-				return errors.Wrapf(err, "error replacing head: %s->%s", child, top)
+				return nil, errors.Wrapf(err, "error replacing head: %s->%s", child, top)
 			}
 
 			continue
@@ -373,27 +396,26 @@ func (store *Datastore) walkBranch(current, top cid.Cid, depth uint64) error {
 
 		known, err := store.dags.HasBlock(child)
 		if err != nil {
-			return errors.Wrapf(err, "error checking for known block %s", child)
+			return nil, errors.Wrapf(err, "error checking for known block %s", child)
 		}
 		if known {
 			// we reached a non-head node in the known tree.
 			// This means our top block is a new head.
 			height, err := store.dags.GetPriority(store.ctx, child)
 			if err != nil {
-				return errors.Wrapf(err, "error getting height for block %s", child)
+				return nil, errors.Wrapf(err, "error getting height for block %s", child)
 			}
 			store.heads.Add(top, height+depth)
 			continue
 		}
 
-		// TODO: parallelize
-		err = store.walkBranch(child, top, depth+1)
-		if err != nil {
-			return err
-		}
+		newElems = append(
+			newElems,
+			&fifoElem{current: child, top: top, depth: depth + 1},
+		)
 	}
 
-	return nil
+	return newElems, nil
 }
 
 // Get retrieves the object `value` named by `key`.
