@@ -21,7 +21,7 @@ import (
 	mdutils "github.com/ipfs/go-merkledag/test"
 )
 
-var numReplicas = 7
+var numReplicas = 15
 var debug = false
 
 func init() {
@@ -166,6 +166,35 @@ func (mds *mockDAGSync) Add(ctx context.Context, n ipld.Node) error {
 	return mds.DAGService.Add(ctx, n)
 }
 
+func (mds *mockDAGSync) Get(ctx context.Context, c cid.Cid) (ipld.Node, error) {
+	nd, err := mds.DAGService.Get(ctx, c)
+	if err != nil {
+		return nd, err
+	}
+	mds.knownBlocksMux.Lock()
+	mds.knownBlocks[c] = struct{}{}
+	mds.knownBlocksMux.Unlock()
+	return nd, nil
+}
+
+func (mds *mockDAGSync) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipld.NodeOption {
+	ch := make(chan *ipld.NodeOption)
+	go func() {
+		defer close(ch)
+		resp := mds.DAGService.GetMany(ctx, cids)
+		for no := range resp {
+			if no.Err == nil {
+				mds.knownBlocksMux.Lock()
+				mds.knownBlocks[no.Node.Cid()] = struct{}{}
+				mds.knownBlocksMux.Unlock()
+			}
+			ch <- no
+		}
+	}()
+
+	return ch
+}
+
 func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 	bcasts, bcastCancel := newBroadcasters(t, numReplicas)
 	bs := mdutils.Bserv()
@@ -276,7 +305,7 @@ func TestDatastoreSuite(t *testing.T) {
 }
 
 func TestSync(t *testing.T) {
-	nItems := 10
+	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -376,7 +405,7 @@ func TestSync(t *testing.T) {
 }
 
 func TestPriority(t *testing.T) {
-	nItems := 10
+	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -390,8 +419,6 @@ func TestPriority(t *testing.T) {
 				t.Error(err)
 			}
 		}
-		// Reduces contingency and combinatorial explosion
-		time.Sleep(40 * time.Millisecond)
 	}
 	time.Sleep(500 * time.Millisecond)
 	var v, lastv []byte
@@ -431,7 +458,7 @@ func TestPriority(t *testing.T) {
 }
 
 func TestCatchUp(t *testing.T) {
-	nItems := 25
+	nItems := 50
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
 
@@ -457,7 +484,7 @@ func TestCatchUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	q := query.Query{KeysOnly: true}
 	results, err := replicas[0].Query(q)
 	if err != nil {
@@ -474,7 +501,7 @@ func TestCatchUp(t *testing.T) {
 }
 
 func TestPrintDAG(t *testing.T) {
-	nItems := 3
+	nItems := 5
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
 
