@@ -21,7 +21,7 @@ import (
 	mdutils "github.com/ipfs/go-merkledag/test"
 )
 
-var numReplicas = 10
+var numReplicas = 7
 var debug = false
 
 func init() {
@@ -276,7 +276,7 @@ func TestDatastoreSuite(t *testing.T) {
 }
 
 func TestSync(t *testing.T) {
-	nItems := 15
+	nItems := 10
 
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -431,7 +431,7 @@ func TestPriority(t *testing.T) {
 }
 
 func TestCatchUp(t *testing.T) {
-	nItems := 50
+	nItems := 25
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
 
