@@ -19,7 +19,7 @@ func init() {
 	ipld.Register(cid.DagProtobuf, dag.DecodeProtobufBlock)
 }
 
-// crdtDAGService wraps an ipld.NodeGetter with some additional utility methods
+// crdtNodeGetter wraps an ipld.NodeGetter with some additional utility methods
 type crdtNodeGetter struct {
 	ipld.NodeGetter
 }
@@ -48,7 +48,7 @@ type deltaOption struct {
 	err   error
 }
 
-// GetDeltas usees GetMany to obtain many deltas.
+// GetDeltas uses GetMany to obtain many deltas.
 func (ng *crdtNodeGetter) GetDeltas(ctx context.Context, cids []cid.Cid) <-chan *deltaOption {
 	deltaOpts := make(chan *deltaOption, 1)
 	go func() {

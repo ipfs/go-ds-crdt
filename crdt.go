@@ -131,7 +131,7 @@ func DefaultOptions() *Options {
 		RebroadcastInterval: time.Minute,
 		PutHook:             nil,
 		DeleteHook:          nil,
-		NumWorkers:          1,
+		NumWorkers:          5,
 		DAGSyncerTimeout:    5 * time.Minute,
 	}
 }
@@ -165,7 +165,7 @@ type Datastore struct {
 	wg sync.WaitGroup
 
 	jobQueue chan *dagJob
-	newJobs  chan *dagJob
+	sendJobs chan *dagJob
 }
 
 type dagJob struct {
@@ -239,7 +239,7 @@ func New(
 		broadcaster:       bcast,
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
 		jobQueue:          make(chan *dagJob),
-		newJobs:           make(chan *dagJob),
+		sendJobs:          make(chan *dagJob),
 	}
 
 	headList, maxHeight, err := dstore.heads.List()
@@ -371,7 +371,8 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 	return nil
 }
 
-// This runs in gorountine
+// dagWorker shouold run in its own gorountine. Workers are launched during
+// initialization in New().
 func (store *Datastore) dagWorker() {
 	for job := range store.jobQueue {
 		children, err := store.processNode(
@@ -396,7 +397,7 @@ func (store *Datastore) dagWorker() {
 
 // sendNewJobs calls getDeltas (GetMany) on the crdtDAGService with the given
 // children and sends each response to the workers. It will block until all
-// jobs have been processed.
+// jobs have been queued.
 func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, children []cid.Cid) {
 	if len(children) == 0 {
 		return
@@ -430,7 +431,7 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 			rootPrio:   rootPrio,
 		}
 		select {
-		case store.newJobs <- job:
+		case store.sendJobs <- job:
 		case <-store.ctx.Done():
 			return
 		}
@@ -448,7 +449,7 @@ func (store *Datastore) sendJobWorker() {
 		case <-store.ctx.Done():
 			close(store.jobQueue)
 			return
-		case j := <-store.newJobs:
+		case j := <-store.sendJobs:
 			store.jobQueue <- j
 		}
 	}
