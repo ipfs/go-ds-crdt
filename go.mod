@@ -16,11 +16,9 @@ require (
 	github.com/ipfs/go-ipld-format v0.0.2
 	github.com/ipfs/go-log v0.0.1
 	github.com/ipfs/go-merkledag v0.0.3
-	github.com/libp2p/go-libp2p v0.0.24 // indirect
-	github.com/libp2p/go-libp2p-peerstore v0.0.6 // indirect
+	github.com/libp2p/go-libp2p v0.0.25 // indirect
 	github.com/libp2p/go-libp2p-pubsub v0.0.3
 	github.com/libp2p/go-maddr-filter v0.0.4 // indirect
-	github.com/libp2p/go-mplex v0.0.2 // indirect
 	github.com/mattn/go-isatty v0.0.7 // indirect
 	github.com/multiformats/go-multiaddr v0.0.4 // indirect
 	github.com/multiformats/go-multistream v0.0.4 // indirect
