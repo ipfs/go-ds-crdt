@@ -87,10 +87,10 @@ type mockBroadcaster struct {
 	chans    []chan []byte
 	myChan   chan []byte
 	dropProb int // probability of dropping a message instead of receiving it
-	t        *testing.T
+	t        testing.TB
 }
 
-func newBroadcasters(t *testing.T, n int) ([]*mockBroadcaster, context.CancelFunc) {
+func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	broadcasters := make([]*mockBroadcaster, n, n)
 	chans := make([]chan []byte, n, n)
@@ -195,7 +195,7 @@ func (mds *mockDAGSync) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipl
 	return ch
 }
 
-func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
+func makeReplicas(t testing.TB, opts *Options) ([]*Datastore, func()) {
 	bcasts, bcastCancel := newBroadcasters(t, numReplicas)
 	bs := mdutils.Bserv()
 	dagserv := merkledag.NewDAGService(bs)
@@ -555,5 +555,81 @@ func TestHooks(t *testing.T) {
 	}
 	if atomic.LoadInt64(&deleted) != int64(len(replicas)) {
 		t.Error("all replicas should have notified Remove", deleted)
+	}
+}
+
+func BenchmarkSync(b *testing.B) {
+	testcases := []struct {
+		numWorkers int
+	}{
+		{1},
+		{2},
+		{3},
+		{4},
+		{5},
+		{10},
+		{15},
+		{30},
+		{50},
+	}
+
+	for _, tt := range testcases {
+		b.Run(fmt.Sprintf("%d", tt.numWorkers), func(b *testing.B) {
+
+			nItems := 500
+			opts := &Options{NumWorkers: tt.numWorkers}
+
+			for i := 0; i < b.N; i++ {
+				replicas, closeReplicas := makeReplicas(b, opts)
+				defer closeReplicas()
+
+				b.StartTimer()
+
+				// Add nItems choosing the replica randomly
+				for i := 0; i < nItems; i++ {
+					k := ds.RandomKey()
+					v := []byte(fmt.Sprintf("%d", i))
+					n := rand.Intn(len(replicas))
+					err := replicas[n].Put(k, v)
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+
+				time.Sleep(500 * time.Millisecond)
+
+				// Query all items
+				q := query.Query{
+					KeysOnly: true,
+				}
+				results, err := replicas[0].Query(q)
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer results.Close()
+				rest, err := results.Rest()
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(rest) != nItems {
+					b.Fatalf("expected %d elements", nItems)
+				}
+
+				// make sure each item has arrived to every replica
+				for _, res := range rest {
+					for _, r := range replicas {
+						ok, err := r.Has(ds.NewKey(res.Key))
+						if err != nil {
+							b.Error(err)
+						}
+						if !ok {
+							b.Error("replica should have key")
+						}
+					}
+				}
+
+				b.StopTimer()
+			}
+		})
 	}
 }
