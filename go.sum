@@ -227,8 +227,8 @@ github.com/libp2p/go-libp2p-protocol v0.0.1 h1:+zkEmZ2yFDi5adpVE3t9dqh/N9TbpFWyw
 github.com/libp2p/go-libp2p-protocol v0.0.1/go.mod h1:Af9n4PiruirSDjHycM1QuiMi/1VZNHYcK8cLgFJLZ4s=
 github.com/libp2p/go-libp2p-protocol v0.1.0 h1:HdqhEyhg0ToCaxgMhnOmUO8snQtt/kQlcjVk3UoJU3c=
 github.com/libp2p/go-libp2p-protocol v0.1.0/go.mod h1:KQPHpAabB57XQxGrXCNvbL6UEXfQqUgC/1adR2Xtflk=
-github.com/libp2p/go-libp2p-pubsub v0.0.5 h1:7pfyGq9jnVR2CHT/Shoytj/EK6uibAnQ0SmSWDH5teY=
-github.com/libp2p/go-libp2p-pubsub v0.0.5/go.mod h1:6xs8BjWAtb1Lsi+naJcLvzO3fnvouo14xjQe6Va7h/E=
+github.com/libp2p/go-libp2p-pubsub v0.0.6 h1:nr54YJwRJf8QfpekLVW+XmmAOUG3UnHRm4f/VRNNrLg=
+github.com/libp2p/go-libp2p-pubsub v0.0.6/go.mod h1:rB9nqkoA/Coxh68OynvQE9UZbhl1aOt3xuBEfCzPW1E=
 github.com/libp2p/go-libp2p-record v0.0.1 h1:zN7AS3X46qmwsw5JLxdDuI43cH5UYwovKxHPjKBYQxw=
 github.com/libp2p/go-libp2p-record v0.0.1/go.mod h1:grzqg263Rug/sRex85QrDOLntdFAymLDLm7lxMgU79Q=
 github.com/libp2p/go-libp2p-routing v0.0.1 h1:hPMAWktf9rYi3ME4MG48qE7dq1ofJxiQbfdvpNntjhc=
