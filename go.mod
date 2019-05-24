@@ -8,10 +8,9 @@ require (
 	github.com/ipfs/go-datastore v0.0.5
 	github.com/ipfs/go-ipfs-blockstore v0.0.1
 	github.com/ipfs/go-ipfs-ds-help v0.0.1
-	github.com/ipfs/go-ipld-cbor v0.0.2 // indirect
 	github.com/ipfs/go-ipld-format v0.0.2
 	github.com/ipfs/go-log v0.0.1
-	github.com/ipfs/go-merkledag v0.0.4
+	github.com/ipfs/go-merkledag v0.0.5
 	github.com/libp2p/go-libp2p-pubsub v0.0.6
 	github.com/pkg/errors v0.8.1
 	github.com/polydawn/refmt v0.0.0-20190408063855-01bf1e26dd14 // indirect

@@ -98,8 +98,6 @@ github.com/ipfs/go-ipfs-routing v0.0.1 h1:394mZeTLcbM/LDO12PneBYvkZAUA+nRnmC0lAz
 github.com/ipfs/go-ipfs-routing v0.0.1/go.mod h1:k76lf20iKFxQTjcJokbPM9iBXVXVZhcOwc360N4nuKs=
 github.com/ipfs/go-ipfs-util v0.0.1 h1:Wz9bL2wB2YBJqggkA4dD7oSmqB4cAnpNbGrlHJulv50=
 github.com/ipfs/go-ipfs-util v0.0.1/go.mod h1:spsl5z8KUnrve+73pOhSVZND1SIxPW5RyBCNzQxlJBc=
-github.com/ipfs/go-ipld-cbor v0.0.1 h1:g7yh27SznWP4CUbkFgjR+WQRjEeyxCpTR4iKVmXx1wA=
-github.com/ipfs/go-ipld-cbor v0.0.1/go.mod h1:RXHr8s4k0NE0TKhnrxqZC9M888QfsBN9rhS5NjfKzY8=
 github.com/ipfs/go-ipld-cbor v0.0.2 h1:amzFztBQQQ69UA5+f7JRfoXF/z2l//MGfEDHVkS20+s=
 github.com/ipfs/go-ipld-cbor v0.0.2/go.mod h1:wTBtrQZA3SoFKMVkp6cn6HMRteIB1VsmHA0AQFOn7Nc=
 github.com/ipfs/go-ipld-format v0.0.1 h1:HCu4eB/Gh+KD/Q0M8u888RFkorTWNIL3da4oc5dwc80=
@@ -108,8 +106,8 @@ github.com/ipfs/go-ipld-format v0.0.2 h1:OVAGlyYT6JPZ0pEfGntFPS40lfrDmaDbQwNHEY2
 github.com/ipfs/go-ipld-format v0.0.2/go.mod h1:4B6+FM2u9OJ9zCV+kSbgFAZlOrv1Hqbf0INGQgiKf9k=
 github.com/ipfs/go-log v0.0.1 h1:9XTUN/rW64BCG1YhPK9Hoy3q8nr4gOmHHBpgFdfw6Lc=
 github.com/ipfs/go-log v0.0.1/go.mod h1:kL1d2/hzSpI0thNYjiKfjanbVNU+IIGA/WnNESY9leM=
-github.com/ipfs/go-merkledag v0.0.4 h1:FJN9+ICW7d0r0gHo91c2qTjq+CaSJg/BNWP4xpqMWB0=
-github.com/ipfs/go-merkledag v0.0.4/go.mod h1:SinKPFG1ugPVE7l6klIeZMjMfv1TPYE+tf7NKiDyJZE=
+github.com/ipfs/go-merkledag v0.0.5 h1:RyrPP/Vovz91wTetEnEyxNhe4vkQSt2/Pgs5fM/RmEM=
+github.com/ipfs/go-merkledag v0.0.5/go.mod h1:zYJwwoAJL0wqK4b9fUqh3UtLqN2aSEmiDW3/ZmLo38s=
 github.com/ipfs/go-metrics-interface v0.0.1 h1:j+cpbjYvu4R8zbleSs36gvB7jR+wsL2fGD6n0jO4kdg=
 github.com/ipfs/go-metrics-interface v0.0.1/go.mod h1:6s6euYU4zowdslK0GKHmqaIZ3j/b/tL7HTWtJ4VPgWY=
 github.com/ipfs/go-peertaskqueue v0.0.4 h1:i0JprfjjILYcWM1xguO/1MCS8XKVxLSl+ECEVr6i8nw=
