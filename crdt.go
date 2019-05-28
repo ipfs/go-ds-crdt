@@ -410,7 +410,7 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 	if rootPrio == 0 {
 		prio, err := ng.GetPriority(ctx, children[0])
 		if err != nil {
-			store.logger.Error("error getting root delta priority: %s", err)
+			store.logger.Errorf("error getting root delta priority: %s", err)
 		}
 		rootPrio = prio
 	}
