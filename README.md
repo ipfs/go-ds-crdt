@@ -5,10 +5,9 @@
 
 `go-ds-crdt` is a key-value store implementation using Merkle CRDTs, as
 described in
-[the paper by Héctor Sanjuán, Samuli Pöyhtäri and Pedro Teixeira](https://github.com/ipfs/research-CRDT/issues/45).
+[the paper by Héctor Sanjuán, Samuli Pöyhtäri and Pedro Teixeira](https://hector.link/presentations/merkle-crdts/merkle-crdts.pdf).
 It satisfies the
-[`Datastore`](https://godoc.org/github.com/ipfs/go-datastore#Datastore),
-[`ThreadSafeDatastore`](https://godoc.org/github.com/ipfs/go-datastore#ThreadSafeDatastore)
+[`Datastore`](https://godoc.org/github.com/ipfs/go-datastore#Datastore)
 and [`Batching`](https://godoc.org/github.com/ipfs/go-datastore#Batching)
 interfaces from `go-datastore`.
 
