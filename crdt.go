@@ -296,12 +296,12 @@ func (store *Datastore) handleNext() {
 			continue
 		}
 
-		go func(c cid.Cid) {
-			err = store.handleBlock(c)
-			if err != nil {
-				store.logger.Error(err)
-			}
-		}(c)
+		//go func(c cid.Cid) {
+		err = store.handleBlock(c)
+		if err != nil {
+			store.logger.Error(err)
+		}
+		//}(c)
 
 		store.lastHeadTSMux.Lock()
 		store.lastHeadTS = time.Now()
