@@ -22,7 +22,7 @@ import (
 )
 
 var numReplicas = 15
-var debug = false
+var debug = true
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
@@ -203,9 +203,10 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 	replicaOpts := make([]*Options, numReplicas)
 	for i := range replicaOpts {
 		if opts == nil {
-			replicaOpts[i] = &Options{}
+			replicaOpts[i] = DefaultOptions()
 		} else {
-			replicaOpts[i] = opts
+			copy := *opts
+			replicaOpts[i] = &copy
 		}
 
 		replicaOpts[i].Logger = &testLogger{
@@ -523,17 +524,12 @@ func TestHooks(t *testing.T) {
 	var put int64
 	var deleted int64
 
-	opts := &Options{
-		Logger:              DefaultOptions().Logger,
-		RebroadcastInterval: time.Second * 10,
-		NumWorkers:          5,
-		DAGSyncerTimeout:    time.Second,
-		PutHook: func(k ds.Key, v []byte) {
-			atomic.AddInt64(&put, 1)
-		},
-		DeleteHook: func(k ds.Key) {
-			atomic.AddInt64(&deleted, 1)
-		},
+	opts := DefaultOptions()
+	opts.PutHook = func(k ds.Key, v []byte) {
+		atomic.AddInt64(&put, 1)
+	}
+	opts.DeleteHook = func(k ds.Key) {
+		atomic.AddInt64(&deleted, 1)
 	}
 
 	replicas, closeReplicas := makeReplicas(t, opts)
@@ -555,5 +551,63 @@ func TestHooks(t *testing.T) {
 	}
 	if atomic.LoadInt64(&deleted) != int64(len(replicas)) {
 		t.Error("all replicas should have notified Remove", deleted)
+	}
+}
+
+func TestBatch(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxBatchDeltaSize = 500 // bytes
+
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
+	btch, err := replicas[0].Batch()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This should be batched
+	k := ds.RandomKey()
+	err = btch.Put(k, make([]byte, 200))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := replicas[0].Get(k); err != ds.ErrNotFound {
+		t.Fatal("should not have commited the batch")
+	}
+
+	k2 := ds.RandomKey()
+	err = btch.Put(k2, make([]byte, 400))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := replicas[0].Get(k2); err != nil {
+		t.Fatal("should have commited the batch: delta size was over threshold")
+	}
+
+	err = btch.Delete(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := replicas[0].Get(k); err != nil {
+		t.Fatal("should not have committed the batch")
+	}
+
+	err = btch.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	for _, r := range replicas {
+		if _, err := r.Get(k); err != ds.ErrNotFound {
+			t.Error("k should have been deleted everywhere")
+		}
+		if _, err := r.Get(k2); err != nil {
+			t.Error("k2 should be everywhere")
+		}
 	}
 }

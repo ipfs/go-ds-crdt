@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 
 	cid "github.com/ipfs/go-cid"
@@ -98,6 +99,10 @@ type Options struct {
 	// DAGSyncerTimeout specifies how long to wait for a DAGSyncer.
 	// Set to 0 to disable.
 	DAGSyncerTimeout time.Duration
+	// MaxBatchDeltaSize will automatically commit any batches whose
+	// delta size gets too big. This helps keep DAG nodes small
+	// enough that they will be transferred by the network.
+	MaxBatchDeltaSize int
 }
 
 func (opts *Options) verify() error {
@@ -121,6 +126,10 @@ func (opts *Options) verify() error {
 		return errors.New("invalid DAGSyncerTimeout")
 	}
 
+	if opts.MaxBatchDeltaSize <= 0 {
+		return errors.New("invalid MaxBatchDeltaSize")
+	}
+
 	return nil
 }
 
@@ -133,6 +142,10 @@ func DefaultOptions() *Options {
 		DeleteHook:          nil,
 		NumWorkers:          5,
 		DAGSyncerTimeout:    5 * time.Minute,
+		// always keeping
+		// https://github.com/libp2p/go-libp2p-core/blob/master/network/network.go#L23
+		// in sight
+		MaxBatchDeltaSize: 1 * 1024 * 1024, // 1MB,
 	}
 }
 
@@ -599,25 +612,25 @@ func deltaMerge(d1, d2 *pb.Delta) *pb.Delta {
 	return result
 }
 
-func (store *Datastore) addToDelta(key string, value []byte) error {
-	store.updateDelta(store.set.Add(key, value))
-	return nil
+// returns delta size and error
+func (store *Datastore) addToDelta(key string, value []byte) (int, error) {
+	return store.updateDelta(store.set.Add(key, value)), nil
 
 }
 
-func (store *Datastore) rmvToDelta(key string) error {
+// returns delta size and error
+func (store *Datastore) rmvToDelta(key string) (int, error) {
 	delta, err := store.set.Rmv(key)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	store.updateDeltaWithRemove(key, delta)
-	return nil
+	return store.updateDeltaWithRemove(key, delta), nil
 }
 
 // to satisfy datastore semantics, we need to remove elements from the current
 // batch if they were added.
-func (store *Datastore) updateDeltaWithRemove(key string, newDelta *pb.Delta) {
+func (store *Datastore) updateDeltaWithRemove(key string, newDelta *pb.Delta) int {
 	store.curDeltaMux.Lock()
 	defer store.curDeltaMux.Unlock()
 	elems := make([]*pb.Element, 0)
@@ -632,12 +645,14 @@ func (store *Datastore) updateDeltaWithRemove(key string, newDelta *pb.Delta) {
 		Priority:   store.curDelta.GetPriority(),
 	}
 	store.curDelta = deltaMerge(store.curDelta, newDelta)
+	return proto.Size(store.curDelta)
 }
 
-func (store *Datastore) updateDelta(newDelta *pb.Delta) {
+func (store *Datastore) updateDelta(newDelta *pb.Delta) int {
 	store.curDeltaMux.Lock()
 	defer store.curDeltaMux.Unlock()
 	store.curDelta = deltaMerge(store.curDelta, newDelta)
+	return proto.Size(store.curDelta)
 }
 
 func (store *Datastore) publishDelta() error {
@@ -735,11 +750,27 @@ type batch struct {
 }
 
 func (b *batch) Put(key ds.Key, value []byte) error {
-	return b.store.addToDelta(key.String(), value)
+	size, err := b.store.addToDelta(key.String(), value)
+	if err != nil {
+		return err
+	}
+	if size > b.store.opts.MaxBatchDeltaSize {
+		b.store.logger.Warning("delta size over MaxBatchDeltaSize. Commiting.")
+		return b.Commit()
+	}
+	return nil
 }
 
 func (b *batch) Delete(key ds.Key) error {
-	return b.store.rmvToDelta(key.String())
+	size, err := b.store.rmvToDelta(key.String())
+	if err != nil {
+		return err
+	}
+	if size > b.store.opts.MaxBatchDeltaSize {
+		b.store.logger.Warning("delta size over MaxBatchDeltaSize. Commiting.")
+		return b.Commit()
+	}
+	return nil
 }
 
 func (b *batch) Commit() error {
