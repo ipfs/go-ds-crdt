@@ -22,7 +22,7 @@ import (
 )
 
 var numReplicas = 15
-var debug = true
+var debug = false
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
@@ -282,7 +282,9 @@ func TestCRDT(t *testing.T) {
 }
 
 func TestDatastoreSuite(t *testing.T) {
-	replicas, closeReplicas := makeReplicas(t, nil)
+	opts := DefaultOptions()
+	opts.MaxBatchDeltaSize = 200 * 1024 * 1024 // 200 MB
+	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 	dstest.SubtestAll(t, replicas[0])
 
