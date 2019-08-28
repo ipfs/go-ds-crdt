@@ -266,7 +266,7 @@ func (s *set) getPriority(key string) (uint64, error) {
 	return prio - 1, nil
 }
 
-func (s *set) setPriority(key string, prio uint64) error {
+func (s *set) setPriority(writeStore ds.Write, key string, prio uint64) error {
 	prioK := s.priorityKey(key)
 	buf := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutUvarint(buf, prio+1)
@@ -274,12 +274,12 @@ func (s *set) setPriority(key string, prio uint64) error {
 		return errors.New("error encoding priority")
 	}
 
-	return s.store.Put(prioK, buf[0:n])
+	return writeStore.Put(prioK, buf[0:n])
 }
 
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
-func (s *set) setValue(key string, value []byte, prio uint64) error {
+func (s *set) setValue(writeStore ds.Write, key string, value []byte, prio uint64) error {
 	curPrio, err := s.getPriority(key)
 	if err != nil {
 		return err
@@ -299,13 +299,13 @@ func (s *set) setValue(key string, value []byte, prio uint64) error {
 	}
 
 	// store value
-	err = s.store.Put(valueK, value)
+	err = writeStore.Put(valueK, value)
 	if err != nil {
 		return err
 	}
 
 	// store priority
-	err = s.setPriority(key, prio)
+	err = s.setPriority(writeStore, key, prio)
 	if err != nil {
 		return err
 	}
@@ -334,7 +334,7 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 	for _, e := range elems {
 		e.Id = id // overwrite the identifier as it would come unset
 		key := e.GetKey()
-		// /namespace/<key>/elems/<id>
+		// /namespace/elems/<key>/<id>
 		k := s.elemsPrefix(key).ChildString(id)
 		err := store.Put(k, nil)
 		if err != nil {
@@ -342,7 +342,7 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 		}
 
 		// update the value if higher priority than we currently have.
-		err = s.setValue(key, e.GetValue(), prio)
+		err = s.setValue(store, key, e.GetValue(), prio)
 		if err != nil {
 			return err
 		}
@@ -374,7 +374,7 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 
 	deletedElems := make(map[string]struct{})
 	for _, e := range tombs {
-		// /namespace/<key>/tombs/<id>
+		// /namespace/tombs/<key>/<id>
 		elemKey := e.GetKey()
 		k := s.tombsPrefix(elemKey).ChildString(e.GetId())
 		err := store.Put(k, nil)
