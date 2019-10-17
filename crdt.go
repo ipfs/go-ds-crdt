@@ -266,25 +266,32 @@ func New(
 		maxHeight,
 	)
 
-	dstore.wg.Add(1)
-	go dstore.sendJobWorker()
+	// sendJobWorker + NumWorkers
+	dstore.wg.Add(1 + dstore.opts.NumWorkers)
+	go func() {
+		defer dstore.wg.Done()
+		dstore.sendJobWorker()
+	}()
 	for i := 0; i < dstore.opts.NumWorkers; i++ {
-		dstore.wg.Add(1)
 		go func() {
 			defer dstore.wg.Done()
 			dstore.dagWorker()
 		}()
 	}
 	dstore.wg.Add(2)
-	go dstore.handleNext()
-	go dstore.rebroadcast()
+	go func() {
+		defer dstore.wg.Done()
+		dstore.handleNext()
+	}()
+	go func() {
+		defer dstore.wg.Done()
+		dstore.rebroadcast()
+	}()
 
 	return dstore, nil
 }
 
 func (store *Datastore) handleNext() {
-	defer store.wg.Done()
-
 	if store.broadcaster == nil { // offline
 		return
 	}
@@ -326,8 +333,6 @@ func (store *Datastore) handleNext() {
 }
 
 func (store *Datastore) rebroadcast() {
-	defer store.wg.Done()
-
 	ticker := store.rebroadcastTicker
 	defer ticker.Stop()
 	for {
@@ -469,7 +474,6 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 // workers without races by becoming the only sender for the store.jobQueue
 // channel.
 func (store *Datastore) sendJobWorker() {
-	defer store.wg.Done()
 	for {
 		select {
 		case <-store.ctx.Done():
