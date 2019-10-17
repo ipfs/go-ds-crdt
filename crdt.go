@@ -167,8 +167,8 @@ type Datastore struct {
 	dagSyncer   DAGSyncer
 	broadcaster Broadcaster
 
-	lastHeadTSMux sync.RWMutex
-	lastHeadTS    time.Time
+	seenHeadsMux sync.RWMutex
+	seenHeads    map[cid.Cid]struct{}
 
 	rebroadcastTicker *time.Ticker
 
@@ -250,6 +250,7 @@ func New(
 		heads:             heads,
 		dagSyncer:         dagSyncer,
 		broadcaster:       bcast,
+		seenHeads:         make(map[cid.Cid]struct{}),
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
 		jobQueue:          make(chan *dagJob),
 		sendJobs:          make(chan *dagJob),
@@ -316,9 +317,11 @@ func (store *Datastore) handleNext() {
 		}
 		//}(c)
 
-		store.lastHeadTSMux.Lock()
-		store.lastHeadTS = time.Now()
-		store.lastHeadTSMux.Unlock()
+		store.seenHeadsMux.Lock()
+		{
+			store.seenHeads[c] = struct{}{}
+		}
+		store.seenHeadsMux.Unlock()
 	}
 }
 
@@ -332,12 +335,7 @@ func (store *Datastore) rebroadcast() {
 		case <-store.ctx.Done():
 			return
 		case <-ticker.C:
-			store.lastHeadTSMux.RLock()
-			timeSinceHead := time.Since(store.lastHeadTS)
-			store.lastHeadTSMux.RUnlock()
-			if timeSinceHead > store.opts.RebroadcastInterval {
-				store.rebroadcastHeads()
-			}
+			store.rebroadcastHeads()
 		}
 	}
 }
@@ -349,9 +347,23 @@ func (store *Datastore) rebroadcastHeads() {
 		return
 	}
 
-	for _, h := range heads {
-		store.broadcast(h)
+	store.seenHeadsMux.RLock()
+	{
+		for _, h := range heads {
+			if _, ok := store.seenHeads[h]; !ok {
+				store.broadcast(h)
+			}
+			// reset the map
+		}
 	}
+	store.seenHeadsMux.RUnlock()
+
+	// Trash the map
+	store.seenHeadsMux.Lock()
+	{
+		store.seenHeads = make(map[cid.Cid]struct{})
+	}
+	store.seenHeadsMux.Unlock()
 }
 
 // handleBlock takes care of vetting, retrieving and applying
