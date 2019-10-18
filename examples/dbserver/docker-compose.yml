@@ -1,0 +1,23 @@
+version: '3.4'
+
+services:
+  crdt0:
+    image: hsanjuan/crdt-dbserver
+    environment:
+      KEY: "CAESQK5+ebHhDlkb7EjEzuyDs4Uj1y5M2T5719THXNKWtBKf3hUSzVLkzWDtdaCSU3PzaW1UYJ3nBLqjaFhDkf2Ac2c="
+      PORT: "5555"
+    ports:
+      - "0.0.0.0:5556:5556"
+  crdts:
+    deploy:
+      replicas: 200
+      mode: replicated
+      endpoint_mode: vip
+    image: hsanjuan/crdt-dbserver
+    depends_on:
+      - crdt0
+    environment:
+      PORT: "5555"
+      BOOTSTRAP: "/dns4/crdt0/tcp/5555/p2p/12D3KooWQmHKEW9siGm2mrPQhDSg1ZmLwRrWpj7VuccvtktRniJa"
+    ports:
+      - "0.0.0.0:8080:5556"
