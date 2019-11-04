@@ -36,6 +36,7 @@ var (
 	logger    = logging.Logger("globaldb")
 	listen, _ = multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/33123")
 	topic     = "globaldb-example"
+	netTopic  = "globaldb-example-net"
 	config    = "globaldb-example"
 )
 
@@ -112,6 +113,36 @@ func main() {
 		logger.Fatal(err)
 	}
 
+	netSubs, err := psub.Subscribe(netTopic)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	// Use a special pubsub topic to avoid disconnecting
+	// from globaldb peers.
+	go func() {
+		for {
+			msg, err := netSubs.Next(ctx)
+			if err != nil {
+				fmt.Println(err)
+				break
+			}
+			h.ConnManager().TagPeer(msg.ReceivedFrom, "keep", 100)
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				psub.Publish(netTopic, []byte("hi!"))
+				time.Sleep(20 * time.Second)
+			}
+		}
+	}()
+
 	ipfs, err := ipfslite.New(ctx, store, h, dht, nil)
 	if err != nil {
 		logger.Fatal(err)
@@ -124,7 +155,7 @@ func main() {
 
 	opts := crdt.DefaultOptions()
 	opts.Logger = logger
-	opts.RebroadcastInterval = 10 * time.Second
+	opts.RebroadcastInterval = 5 * time.Second
 	opts.PutHook = func(k ds.Key, v []byte) {
 		fmt.Printf("Added: [%s] -> %s\n", k, string(v))
 
@@ -183,7 +214,6 @@ Commands:
 			syscall.SIGHUP,
 		)
 		<-signalChan
-		cancel()
 		return
 	}
 
@@ -201,7 +231,6 @@ Commands:
 
 		switch cmd {
 		case "exit", "quit":
-			cancel()
 			return
 		case "debug":
 			if len(fields) < 2 {
