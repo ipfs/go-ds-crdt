@@ -20,9 +20,8 @@ import (
 	crdt "github.com/ipfs/go-ds-crdt"
 	logging "github.com/ipfs/go-log"
 
-	"github.com/libp2p/go-libp2p"
-	connmgr "github.com/libp2p/go-libp2p-connmgr"
 	"github.com/libp2p/go-libp2p-core/crypto"
+	corecrypto "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -41,8 +40,13 @@ var (
 )
 
 func main() {
-	logging.SetLogLevel("*", "warn")
+	// Bootstrappers are using 1024 keys. See:
+	// https://github.com/ipfs/infra/issues/378
+	corecrypto.MinRsaKeyBits = 1024
+
+	logging.SetLogLevel("*", "error")
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	dir, err := homedir.Dir()
 	if err != nil {
@@ -90,15 +94,16 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	connman := connmgr.NewConnManager(100, 400, time.Minute)
-
 	h, dht, err := ipfslite.SetupLibp2p(
 		ctx,
 		priv,
 		nil,
 		[]multiaddr.Multiaddr{listen},
-		libp2p.ConnectionManager(connman),
+		ipfslite.Libp2pOptionsExtra...,
 	)
+	if err != nil {
+		logger.Fatal(err)
+	}
 	defer h.Close()
 	defer dht.Close()
 
@@ -140,7 +145,7 @@ func main() {
 	inf, _ := peer.AddrInfoFromP2pAddr(bstr)
 	list := append(ipfslite.DefaultBootstrapPeers(), *inf)
 	ipfs.Bootstrap(list)
-	connman.TagPeer(inf.ID, "keep", 100)
+	h.ConnManager().TagPeer(inf.ID, "keep", 100)
 
 	fmt.Printf(`
 Peer ID: %s
