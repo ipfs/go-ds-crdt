@@ -97,7 +97,7 @@ func main() {
 	}
 	fmt.Println()
 
-	psub, err := pubsub.NewGossipSub(ctx, h, pubsub.WithMessageSigning(false))
+	psub, err := pubsub.NewFloodSub(ctx, h, pubsub.WithMessageSigning(false))
 	if err != nil {
 		logger.Fatal(err)
 	}
