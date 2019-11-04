@@ -325,9 +325,7 @@ func (store *Datastore) handleNext() {
 		//}(c)
 
 		store.seenHeadsMux.Lock()
-		{
-			store.seenHeads[c] = struct{}{}
-		}
+		store.seenHeads[c] = struct{}{}
 		store.seenHeadsMux.Unlock()
 	}
 }
@@ -358,16 +356,13 @@ func (store *Datastore) rebroadcastHeads() {
 			if _, ok := store.seenHeads[h]; !ok {
 				store.broadcast(h)
 			}
-			// reset the map
 		}
 	}
 	store.seenHeadsMux.RUnlock()
 
-	// Trash the map
+	// Reset the map
 	store.seenHeadsMux.Lock()
-	{
-		store.seenHeads = make(map[cid.Cid]struct{})
-	}
+	store.seenHeads = make(map[cid.Cid]struct{})
 	store.seenHeadsMux.Unlock()
 }
 
@@ -648,28 +643,36 @@ func (store *Datastore) rmvToDelta(key string) (int, error) {
 // to satisfy datastore semantics, we need to remove elements from the current
 // batch if they were added.
 func (store *Datastore) updateDeltaWithRemove(key string, newDelta *pb.Delta) int {
+	var size int
 	store.curDeltaMux.Lock()
-	defer store.curDeltaMux.Unlock()
-	elems := make([]*pb.Element, 0)
-	for _, e := range store.curDelta.GetElements() {
-		if e.GetKey() != key {
-			elems = append(elems, e)
+	{
+		elems := make([]*pb.Element, 0)
+		for _, e := range store.curDelta.GetElements() {
+			if e.GetKey() != key {
+				elems = append(elems, e)
+			}
 		}
+		store.curDelta = &pb.Delta{
+			Elements:   elems,
+			Tombstones: store.curDelta.GetTombstones(),
+			Priority:   store.curDelta.GetPriority(),
+		}
+		store.curDelta = deltaMerge(store.curDelta, newDelta)
+		size = proto.Size(store.curDelta)
 	}
-	store.curDelta = &pb.Delta{
-		Elements:   elems,
-		Tombstones: store.curDelta.GetTombstones(),
-		Priority:   store.curDelta.GetPriority(),
-	}
-	store.curDelta = deltaMerge(store.curDelta, newDelta)
-	return proto.Size(store.curDelta)
+	store.curDeltaMux.Unlock()
+	return size
 }
 
 func (store *Datastore) updateDelta(newDelta *pb.Delta) int {
+	var size int
 	store.curDeltaMux.Lock()
-	defer store.curDeltaMux.Unlock()
-	store.curDelta = deltaMerge(store.curDelta, newDelta)
-	return proto.Size(store.curDelta)
+	{
+		store.curDelta = deltaMerge(store.curDelta, newDelta)
+		size = proto.Size(store.curDelta)
+	}
+	store.curDeltaMux.Unlock()
+	return size
 }
 
 func (store *Datastore) publishDelta() error {

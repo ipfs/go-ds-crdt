@@ -142,7 +142,6 @@ func (mb *mockBroadcaster) Next() ([]byte, error) {
 	case <-mb.ctx.Done():
 		return nil, ErrNoMoreBroadcast
 	}
-	return nil, nil
 }
 
 type mockDAGSync struct {
