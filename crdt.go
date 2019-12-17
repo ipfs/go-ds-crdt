@@ -396,7 +396,7 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 	return nil
 }
 
-// dagWorker shouold run in its own gorountine. Workers are launched during
+// dagWorker should run in its own gorountine. Workers are launched during
 // initialization in New().
 func (store *Datastore) dagWorker() {
 	for job := range store.jobQueue {
@@ -598,6 +598,15 @@ func (store *Datastore) Delete(key ds.Key) error {
 	return store.publish(delta)
 }
 
+// Sync is a no-op.
+// Before broadcasting deltas we run processNode making sure that every
+// operation (including Put and Delete) applied to this store take effect
+// (delta is merged) before returning.
+func (store *Datastore) Sync(key ds.Key) error {
+	store.logger.Warning("sync is a no-op")
+	return nil
+}
+
 // Close shuts down the CRDT datastore. It should not be used afterwards.
 func (store *Datastore) Close() error {
 	store.cancel()
@@ -731,7 +740,7 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 		return cid.Undef, err
 	}
 
-	// Process new block. This makes that every operation applied
+	// Process new block. This makes sure that every operation applied
 	// to this store take effect (delta is merged) before
 	// returning. Since our block references current heads, children
 	// should be empty

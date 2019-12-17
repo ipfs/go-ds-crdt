@@ -25,7 +25,7 @@ var (
 // go-datastore. It is fully agnostic to MerkleCRDTs or the delta distribution
 // layer.  It chooses the Value with most priority for a Key as the current
 // Value. When two values have the same priority, it chooses by alphabetically
-// sorting their unique IDs alphabetically.
+// sorting their unique IDs.
 type set struct {
 	store      ds.Datastore
 	namespace  ds.Key
@@ -94,7 +94,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 // Element retrieves the value of an element from the CRDT set.
 func (s *set) Element(key string) ([]byte, error) {
 	// We can only GET an element if it's part of the Set (in
-	// "elemements" and not in "tombstones").
+	// "elements" and not in "tombstones").
 
 	// As an optimization:
 	// * If the key has a value in the store it means:
