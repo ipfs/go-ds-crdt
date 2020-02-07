@@ -2,7 +2,7 @@ module github.com/ipfs/go-ds-crdt
 
 require (
 	github.com/gogo/protobuf v1.3.0
-	github.com/golang/protobuf v1.3.2
+	github.com/golang/protobuf v1.3.3
 	github.com/ipfs/go-cid v0.0.3
 	github.com/ipfs/go-datastore v0.1.0
 	github.com/ipfs/go-ipfs-blockstore v0.1.0

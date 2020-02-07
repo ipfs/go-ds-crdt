@@ -311,22 +311,49 @@ func (store *Datastore) handleNext() {
 			continue
 		}
 
-		c, err := cid.Cast(data)
+		var bCastHeads []cid.Cid
+
+		// Make a list of heads we received
+		bcastData := pb.CRDTBroadcast{}
+		err = proto.Unmarshal(data, &bcastData)
 		if err != nil {
-			store.logger.Error(err)
-			continue
+			// Backwards compatibility
+			c, err2 := cid.Cast(data)
+			if err2 != nil {
+				store.logger.Error(err)
+				store.logger.Error(err2)
+				continue
+			}
+			bCastHeads = []cid.Cid{c}
+		} else {
+			for _, protoHead := range bcastData.Heads {
+				c, err := cid.Cast(protoHead.Cid)
+				if err != nil {
+					store.logger.Error(err)
+					continue
+				}
+				bCastHeads = append(bCastHeads, c)
+			}
 		}
 
-		//go func(c cid.Cid) {
-		err = store.handleBlock(c)
-		if err != nil {
-			store.logger.Error(err)
+		// For each head, we process it.
+		for _, head := range bCastHeads {
+			//go func(c cid.Cid) {
+			err = store.handleBlock(head)
+			if err != nil {
+				store.logger.Error(err)
+			}
+			//}(c)
+			store.seenHeadsMux.Lock()
+			store.seenHeads[head] = struct{}{}
+			store.seenHeadsMux.Unlock()
 		}
-		//}(c)
 
-		store.seenHeadsMux.Lock()
-		store.seenHeads[c] = struct{}{}
-		store.seenHeadsMux.Unlock()
+		// TODO: We should store trusted-peer signatures associated to
+		// each head in a timecache. When we broadcast, attach the
+		// signatures (along with our own) to the broadcast.
+		// Other peers can use the signatures to verify that the
+		// received CIDs have been issued by a trusted peer.
 	}
 }
 
@@ -343,22 +370,28 @@ func (store *Datastore) rebroadcast() {
 	}
 }
 
+// regularly send out a list of heads that we have not recently seen
 func (store *Datastore) rebroadcastHeads() {
+	// Get our current list of heads
 	heads, _, err := store.heads.List()
 	if err != nil {
 		store.logger.Error(err)
 		return
 	}
+	var headsToBroadcast []cid.Cid
 
 	store.seenHeadsMux.RLock()
 	{
 		for _, h := range heads {
 			if _, ok := store.seenHeads[h]; !ok {
-				store.broadcast(h)
+				headsToBroadcast = append(headsToBroadcast, h)
 			}
 		}
 	}
 	store.seenHeadsMux.RUnlock()
+
+	// Send them out
+	store.broadcast(headsToBroadcast)
 
 	// Reset the map
 	store.seenHeadsMux.Lock()
@@ -475,6 +508,9 @@ func (store *Datastore) sendJobWorker() {
 			close(store.jobQueue)
 			return
 		case j := <-store.sendJobs:
+			// If jobqueue was buffered to the number of workers
+			// this would be faster as jobs could grab data rigth
+			// away. But how do we shutdown things then.
 			store.jobQueue <- j
 		}
 	}
@@ -710,7 +746,7 @@ func (store *Datastore) publish(delta *pb.Delta) error {
 	if err != nil {
 		return err
 	}
-	return store.broadcast(c)
+	return store.broadcast([]cid.Cid{c})
 }
 
 func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
@@ -753,14 +789,25 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 	return nd.Cid(), nil
 }
 
-func (store *Datastore) broadcast(c cid.Cid) error {
+func (store *Datastore) broadcast(cids []cid.Cid) error {
 	if store.broadcaster == nil { // offline
 		return nil
 	}
-	store.logger.Debugf("broadcasting %s", c)
-	err := store.broadcaster.Broadcast(c.Bytes())
+	store.logger.Debugf("broadcasting %s", cids)
+
+	bcastData := pb.CRDTBroadcast{}
+	for _, c := range cids {
+		bcastData.Heads = append(bcastData.Heads, &pb.Head{Cid: c.Bytes()})
+	}
+
+	bcastBytes, err := proto.Marshal(&bcastData)
 	if err != nil {
-		return errors.Wrapf(err, "error broadcasting %s", c)
+		return err
+	}
+
+	err = store.broadcaster.Broadcast(bcastBytes)
+	if err != nil {
+		return errors.Wrapf(err, "error broadcasting %s", cids)
 	}
 	return nil
 }

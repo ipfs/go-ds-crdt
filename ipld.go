@@ -78,9 +78,9 @@ func extractDelta(nd ipld.Node) (*pb.Delta, error) {
 	if !ok {
 		return nil, errors.New("node is not a ProtoNode")
 	}
-	d := &pb.Delta{}
-	err := proto.Unmarshal(protonode.Data(), d)
-	return d, err
+	d := pb.Delta{}
+	err := proto.Unmarshal(protonode.Data(), &d)
+	return &d, err
 }
 
 func makeNode(delta *pb.Delta, heads []cid.Cid) (ipld.Node, error) {
