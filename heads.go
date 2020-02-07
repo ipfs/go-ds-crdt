@@ -10,8 +10,7 @@ import (
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
-	dshelp "github.com/ipfs/go-ipfs-ds-help"
-	logging "github.com/ipfs/go-log"
+	logging "github.com/ipfs/go-log/v2"
 )
 
 // heads manages the current Merkle-CRDT heads.
@@ -31,7 +30,7 @@ func newHeads(store ds.Datastore, namespace ds.Key, logger logging.StandardLogge
 
 func (hh *heads) key(c cid.Cid) ds.Key {
 	// /<namespace>/<cid>
-	return hh.namespace.Child(dshelp.CidToDsKey(c))
+	return hh.namespace.Child(cidToDsKey(c))
 }
 
 func (hh *heads) load(c cid.Cid) (uint64, error) {
@@ -107,12 +106,15 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 			return err
 		}
 	}
-	return nil
+	return hh.store.Sync(hh.namespace)
 }
 
 func (hh *heads) Add(c cid.Cid, height uint64) error {
 	hh.logger.Infof("adding new DAG head: %s (height: %d)", c, height)
-	return hh.write(hh.store, c, height)
+	if err := hh.write(hh.store, c, height); err != nil {
+		return err
+	}
+	return hh.store.Sync(hh.namespace)
 }
 
 // List returns the list of current heads plus the max height.
@@ -135,7 +137,7 @@ func (hh *heads) List() ([]cid.Cid, uint64, error) {
 			return nil, 0, r.Error
 		}
 		headKey := ds.NewKey(strings.TrimPrefix(r.Key, hh.namespace.String()))
-		headCid, err := dshelp.DsKeyToCid(headKey)
+		headCid, err := dsKeyToCid(headKey)
 		if err != nil {
 			return nil, 0, err
 		}

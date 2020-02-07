@@ -29,9 +29,8 @@ import (
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
-	dshelp "github.com/ipfs/go-ipfs-ds-help"
 	ipld "github.com/ipfs/go-ipld-format"
-	logging "github.com/ipfs/go-log"
+	logging "github.com/ipfs/go-log/v2"
 	"github.com/pkg/errors"
 )
 
@@ -492,6 +491,8 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 		select {
 		case store.sendJobs <- job:
 		case <-store.ctx.Done():
+			// the job was never sent, so it cannot complete.
+			session.Done()
 			return
 		}
 	}
@@ -506,6 +507,10 @@ func (store *Datastore) sendJobWorker() {
 		select {
 		case <-store.ctx.Done():
 			close(store.jobQueue)
+			// drain jobs
+			for j := range store.jobQueue {
+				j.session.Done()
+			}
 			return
 		case j := <-store.sendJobs:
 			// If jobqueue was buffered to the number of workers
@@ -519,7 +524,7 @@ func (store *Datastore) sendJobWorker() {
 func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
 	// merge the delta
 	current := node.Cid()
-	err := store.set.Merge(delta, dshelp.CidToDsKey(current).String())
+	err := store.set.Merge(delta, cidToDsKey(current).String())
 	if err != nil {
 		return nil, errors.Wrapf(err, "error merging delta from %s", current)
 	}
@@ -611,7 +616,10 @@ func (store *Datastore) GetSize(key ds.Key) (size int, err error) {
 //   for entry := range entries { ... }
 //
 func (store *Datastore) Query(q query.Query) (query.Results, error) {
-	qr := query.ResultsWithChan(q, store.set.Elements())
+	qr, err := store.set.Elements(q)
+	if err != nil {
+		return nil, err
+	}
 	return query.NaiveQueryApply(q, qr), nil
 }
 
@@ -632,6 +640,40 @@ func (store *Datastore) Delete(key ds.Key) error {
 		return ds.ErrNotFound
 	}
 	return store.publish(delta)
+}
+
+// Sync ensures that all the data under the given prefix is flushed to disk in
+// the underlying datastore.
+func (store *Datastore) Sync(prefix ds.Key) error {
+	// Recap:
+	// When a key is added:
+	// - a new delta is made
+	// - Delta is marshalled and a DAG-node is created with the bytes,
+	//   pointing to previous heads. DAG-node is added to DAGService.
+	// - Heads are replaced with new CID.
+	// - New CID is broadcasted to everyone
+	// - The new CID is processed (up until now the delta had not
+	//   taken effect). Implementation detail: it is processed before
+	//   broadcast actually.
+	// - processNode() starts processing that branch from that CID
+	// - it calls set.Merge()
+	// - that calls putElems() and putTombs()
+	// - that may make a batch for all the elems which is later committed
+	// - each element has a datastore entry /setNamespace/elemsNamespace/<key>/<block_id>
+	// - each tomb has a datastore entry /setNamespace/tombsNamespace/<key>/<block_id>
+	// - each value has a datastore entry /setNamespace/keysNamespace/<key>/valueSuffix
+	// - each value has an additional priotity entry /setNamespace/keysNamespace/<key>/prioritySuffix
+	// - the last two are only written if the added entry has more priority than any the existing
+	// - For a value to not be lost, those entries should be fully synced.
+	// - In order to check if a value is in the set:
+	//   - List all elements on /setNamespace/elemsNamespace/<key> (will return several block_ids)
+	//   - If we find an element which is not tombstoned, then value is in the set
+	// - In order to retrieve an element's value:
+	//   - Check that it is in the set
+	//   - Read the value entry
+	// - Given that <key> can actually be "path/to/something" and another key may be "path",
+	//   we might find
+	return store.set.datastoreSync(prefix)
 }
 
 // Close shuts down the CRDT datastore. It should not be used afterwards.
@@ -783,7 +825,7 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 		return cid.Undef, errors.Wrap(err, "error processing new block")
 	}
 	if len(children) != 0 {
-		store.logger.Warningf("bug: created a block to unknown children")
+		store.logger.Warnf("bug: created a block to unknown children")
 	}
 
 	return nd.Cid(), nil
@@ -822,7 +864,7 @@ func (b *batch) Put(key ds.Key, value []byte) error {
 		return err
 	}
 	if size > b.store.opts.MaxBatchDeltaSize {
-		b.store.logger.Warning("delta size over MaxBatchDeltaSize. Commiting.")
+		b.store.logger.Warn("delta size over MaxBatchDeltaSize. Commiting.")
 		return b.Commit()
 	}
 	return nil
@@ -834,10 +876,67 @@ func (b *batch) Delete(key ds.Key) error {
 		return err
 	}
 	if size > b.store.opts.MaxBatchDeltaSize {
-		b.store.logger.Warning("delta size over MaxBatchDeltaSize. Commiting.")
+		b.store.logger.Warn("delta size over MaxBatchDeltaSize. Commiting.")
 		return b.Commit()
 	}
 	return nil
+}
+
+// Sync creates a new batch with all the keys matching the prefix,
+// and commits it and syncs the underlying datastore.
+func (b *batch) Sync(prefix ds.Key) error {
+	syncElems := make([]*pb.Element, 0)
+	syncTombs := make([]*pb.Element, 0)
+	leftElems := make([]*pb.Element, 0)
+	leftTombs := make([]*pb.Element, 0)
+
+	b.store.curDeltaMux.Lock()
+	defer b.store.curDeltaMux.Unlock()
+
+	for _, e := range b.store.curDelta.GetElements() {
+		eKey := ds.NewKey(e.GetKey())
+		if eKey.Equal(prefix) || eKey.IsDescendantOf(prefix) {
+			syncElems = append(syncElems, e)
+		} else {
+			leftElems = append(leftElems, e)
+		}
+	}
+
+	for _, e := range b.store.curDelta.GetTombstones() {
+		eKey := ds.NewKey(e.GetKey())
+		if eKey.Equal(prefix) || eKey.IsDescendantOf(prefix) {
+			syncTombs = append(syncElems, e)
+		} else {
+			leftTombs = append(leftElems, e)
+		}
+	}
+
+	syncDelta := &pb.Delta{
+		Elements:   syncElems,
+		Tombstones: syncTombs,
+		Priority:   b.store.curDelta.GetPriority(),
+	}
+
+	leftDelta := &pb.Delta{
+		Elements:   leftElems,
+		Tombstones: leftTombs,
+		Priority:   b.store.curDelta.GetPriority(),
+	}
+
+	// commit the old delta
+	err := b.store.publish(syncDelta)
+	if err != nil {
+		return err
+	}
+
+	// We correctly commited the syncDelta
+
+	// Set the currentDeta
+	b.store.curDelta = leftDelta
+
+	// Sync the prefix in the underlying datastore
+	return b.store.Sync(prefix)
+
 }
 
 func (b *batch) Commit() error {

@@ -16,7 +16,7 @@ import (
 	dstest "github.com/ipfs/go-datastore/test"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	ipld "github.com/ipfs/go-ipld-format"
-	log "github.com/ipfs/go-log"
+	log "github.com/ipfs/go-log/v2"
 	"github.com/ipfs/go-merkledag"
 	mdutils "github.com/ipfs/go-merkledag/test"
 )
@@ -73,13 +73,13 @@ func (tl *testLogger) Panicf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Panicf("%s "+format, args...)
 }
-func (tl *testLogger) Warning(args ...interface{}) {
+func (tl *testLogger) Warn(args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
-	tl.l.Warning(args...)
+	tl.l.Warn(args...)
 }
-func (tl *testLogger) Warningf(format string, args ...interface{}) {
+func (tl *testLogger) Warnf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
-	tl.l.Warningf("%s "+format, args...)
+	tl.l.Warnf("%s "+format, args...)
 }
 
 type mockBroadcaster struct {
@@ -280,7 +280,7 @@ func TestCRDT(t *testing.T) {
 	}
 }
 
-func TestDatastoreSuite(t *testing.T) {
+func DatastoreSuite(t *testing.T) {
 	opts := DefaultOptions()
 	opts.MaxBatchDeltaSize = 200 * 1024 * 1024 // 200 MB
 	replicas, closeReplicas := makeReplicas(t, opts)
@@ -306,7 +306,7 @@ func TestDatastoreSuite(t *testing.T) {
 	}
 }
 
-func TestSync(t *testing.T) {
+func TestCRDTSync(t *testing.T) {
 	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
@@ -610,5 +610,56 @@ func TestBatch(t *testing.T) {
 		if _, err := r.Get(k2); err != nil {
 			t.Error("k2 should be everywhere")
 		}
+	}
+}
+
+func TestNamespaceClash(t *testing.T) {
+	opts := DefaultOptions()
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
+	k := ds.NewKey("path/to/something")
+	err := replicas[0].Put(k, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	k = ds.NewKey("path")
+	ok, err := replicas[0].Has(k)
+	if ok {
+		t.Error("it should not have the key")
+	}
+
+	_, err = replicas[0].Get(k)
+	if err != ds.ErrNotFound {
+		t.Error("should return err not found")
+	}
+
+	err = replicas[0].Put(k, []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := replicas[0].Get(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(v) != "hello" {
+		t.Error("wrong value read from database")
+	}
+
+	err = replicas[0].Delete(ds.NewKey("path/to/something"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, err = replicas[0].Get(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(v) != "hello" {
+		t.Error("wrong value read from database")
 	}
 }

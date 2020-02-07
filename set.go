@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	pb "github.com/ipfs/go-ds-crdt/pb"
+	"github.com/jbenet/goprocess"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
@@ -135,10 +136,9 @@ func (f *filterIsKey) Filter(e query.Entry) bool {
 }
 
 // Elements returns all the elements in the set.
-// It comes handy to use query.Result to wrap key, value and error.
-func (s *set) Elements() <-chan query.Result {
-	prefix := s.keyPrefix(keysNs).String()
-	q := query.Query{
+func (s *set) Elements(q query.Query) (query.Results, error) {
+	prefix := s.keyPrefix(keysNs).ChildString(q.Prefix).String()
+	setQuery := query.Query{
 		Prefix:   prefix,
 		KeysOnly: true,
 		Filters: []query.Filter{
@@ -146,19 +146,32 @@ func (s *set) Elements() <-chan query.Result {
 		},
 	}
 
-	retChan := make(chan query.Result, 1)
-	go func() {
-		defer close(retChan)
-		results, err := s.store.Query(q)
+	// send the result and returns false if we must exit
+	sendResult := func(b *query.ResultBuilder, p goprocess.Process, r query.Result) bool {
+		select {
+		case b.Output <- r:
+		case <-p.Closing():
+			return false
+		}
+		if r.Error != nil {
+			return false
+		}
+		return true
+	}
+
+	b := query.NewResultBuilder(q)
+	b.Process.Go(func(p goprocess.Process) {
+		results, err := s.store.Query(setQuery)
 		if err != nil {
-			retChan <- query.Result{Error: err}
+			sendResult(b, p, query.Result{Error: err})
 			return
 		}
 		defer results.Close()
 
+		var entry query.Entry
 		for r := range results.Next() {
 			if r.Error != nil {
-				retChan <- query.Result{Error: err}
+				sendResult(b, p, query.Result{Error: r.Error})
 				return
 			}
 
@@ -170,23 +183,40 @@ func (s *set) Elements() <-chan query.Result {
 				"/"+valueSuffix,
 			)
 
-			value, err := s.Element(key)
-			if err == ds.ErrNotFound {
-				continue
-			}
-			if err != nil {
-				retChan <- query.Result{Error: err}
-				return
-			}
-			entry := query.Entry{
-				Key:   key,
-				Value: value,
-			}
+			entry.Key = key
+			if q.KeysOnly {
+				has, err := s.InSet(key)
+				if err != nil {
+					sendResult(b, p, query.Result{Error: err})
+					return
+				}
 
-			retChan <- query.Result{Entry: entry}
+				if !has {
+					continue
+				}
+
+				entry.Size = -1
+				if !sendResult(b, p, query.Result{Entry: entry}) {
+					return
+				}
+			} else {
+				value, err := s.Element(key)
+				if err == ds.ErrNotFound {
+					continue
+				} else if err != nil {
+					sendResult(b, p, query.Result{Error: err})
+					return
+				}
+				entry.Value = value
+				entry.Size = len(value)
+				if !sendResult(b, p, query.Result{Entry: entry}) {
+					return
+				}
+			}
 		}
-	}()
-	return retChan
+	})
+	go b.Process.CloseAfterChildren() //nolint
+	return b.Results(), nil
 }
 
 // InSet returns true if the key belongs to one of the elements in the "elems"
@@ -212,6 +242,14 @@ func (s *set) InSet(key string) (bool, error) {
 		}
 
 		id := strings.TrimPrefix(r.Key, prefix.String())
+		if !ds.NewKey(id).IsTopLevel() {
+			// our prefix matches blocks from other keys i.e. our
+			// prefix is "hello" and we have a different key like
+			// "hello/bye" so we have a block id like
+			// "bye/<block>". If we got the right key, then the id
+			// should be the block id only.
+			continue
+		}
 		// if not tombstoned, we have it
 		inTomb, err := s.inTombsKeyID(key, id)
 		if err != nil {
@@ -432,3 +470,21 @@ func (s *set) inTombsKeyID(key, id string) (bool, error) {
 
 // 	return s.inElemsKeyID(key, id)
 // }
+
+// perform a sync against all the paths associated with a key prefix
+func (s *set) datastoreSync(prefix ds.Key) error {
+	prefixStr := prefix.String()
+	toSync := []ds.Key{
+		s.elemsPrefix(prefixStr),
+		s.tombsPrefix(prefixStr),
+		s.keyPrefix(keysNs).Child(prefix), // covers values and priorities
+	}
+
+	for _, k := range toSync {
+		if err := s.store.Sync(k); s != nil {
+			return err
+		}
+	}
+
+	return nil
+}
