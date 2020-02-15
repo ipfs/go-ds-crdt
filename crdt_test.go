@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -194,6 +195,30 @@ func (mds *mockDAGSync) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipl
 	return ch
 }
 
+func storeFolder(i int) string {
+	return fmt.Sprintf("test-badger-%d", i)
+}
+
+// func makeStore(t *testing.T, i int) ds.Datastore {
+// 	t.Helper()
+// 	folder := storeFolder(i)
+// 	err := os.MkdirAll(folder, 0700)
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+
+// 	badgerOpts := badger.DefaultOptions("")
+// 	badgerOpts.SyncWrites = false
+// 	badgerOpts.MaxTableSize = 1048576
+
+// 	opts := badgerds.Options{Options: badgerOpts}
+// 	dstore, err := badgerds.NewDatastore(folder, &opts)
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	return dstore
+// }
+
 func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 	bcasts, bcastCancel := newBroadcasters(t, numReplicas)
 	bs := mdutils.Bserv()
@@ -227,7 +252,9 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 
 		var err error
 		replicas[i], err = New(
+			//makeStore(t, i),
 			dssync.MutexWrap(ds.NewMapDatastore()),
+			//
 			// ds.NewLogDatastore(
 			// 	dssync.MutexWrap(ds.NewMapDatastore()),
 			// 	fmt.Sprintf("crdt-test-%d", i),
@@ -247,11 +274,12 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 
 	closeReplicas := func() {
 		bcastCancel()
-		for _, r := range replicas {
+		for i, r := range replicas {
 			err := r.Close()
 			if err != nil {
 				t.Error(err)
 			}
+			os.RemoveAll(storeFolder(i))
 		}
 	}
 
@@ -286,7 +314,6 @@ func TestDatastoreSuite(t *testing.T) {
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 	dstest.SubtestAll(t, replicas[0])
-
 	time.Sleep(time.Second)
 
 	for _, r := range replicas {

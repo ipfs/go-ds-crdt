@@ -127,23 +127,21 @@ func (s *set) Element(key string) ([]byte, error) {
 	return value, nil
 }
 
-type filterIsKey struct {
-}
-
-func (f *filterIsKey) Filter(e query.Entry) bool {
-	dsk := ds.NewKey(e.Key)
-	return ds.NewKey(valueSuffix).IsAncestorOf(dsk.Reverse())
-}
-
 // Elements returns all the elements in the set.
 func (s *set) Elements(q query.Query) (query.Results, error) {
-	prefix := s.keyPrefix(keysNs).ChildString(q.Prefix).String()
+	// This will cleanup user the query prefix first.
+	// This makes sure the use of things like "/../" in the query
+	// does not affect our setQuery.
+	srcQueryPrefixKey := ds.NewKey(q.Prefix)
+
+	keyNamespacePrefix := s.keyPrefix(keysNs)
+	keyNamespacePrefixStr := keyNamespacePrefix.String()
+	setQueryPrefix := keyNamespacePrefix.Child(srcQueryPrefixKey).String()
+	vSuffix := "/" + valueSuffix
+
 	setQuery := query.Query{
-		Prefix:   prefix,
+		Prefix:   setQueryPrefix,
 		KeysOnly: true,
-		Filters: []query.Filter{
-			&filterIsKey{},
-		},
 	}
 
 	// send the result and returns false if we must exit
@@ -175,11 +173,17 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 				return
 			}
 
+			// We will be getting keys in the form of
+			// /namespace/keys/<key>/v and /namespace/keys/<key>/p
+			// We discard anything not ending in /v and sanitize
+			// those from:
 			// /namespace/keys/<key>/v -> <key>
-			// If our filter worked well we should have only
-			// got good keys like that.
+			if !strings.HasSuffix(r.Key, vSuffix) { // "/v"
+				continue
+			}
+
 			key := strings.TrimSuffix(
-				strings.TrimPrefix(r.Key, prefix),
+				strings.TrimPrefix(r.Key, keyNamespacePrefixStr),
 				"/"+valueSuffix,
 			)
 
