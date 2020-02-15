@@ -280,7 +280,7 @@ func TestCRDT(t *testing.T) {
 	}
 }
 
-func DatastoreSuite(t *testing.T) {
+func TestDatastoreSuite(t *testing.T) {
 	opts := DefaultOptions()
 	opts.MaxBatchDeltaSize = 200 * 1024 * 1024 // 200 MB
 	replicas, closeReplicas := makeReplicas(t, opts)
