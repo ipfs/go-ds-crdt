@@ -25,6 +25,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	pb "github.com/ipfs/go-ds-crdt/pb"
+	dshelp "github.com/ipfs/go-ipfs-ds-help"
 
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
@@ -524,7 +525,7 @@ func (store *Datastore) sendJobWorker() {
 func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
 	// merge the delta
 	current := node.Cid()
-	err := store.set.Merge(delta, cidToDsKey(current).String())
+	err := store.set.Merge(delta, dshelp.MultihashToDsKey(current.Hash()).String())
 	if err != nil {
 		return nil, errors.Wrapf(err, "error merging delta from %s", current)
 	}

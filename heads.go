@@ -10,6 +10,7 @@ import (
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
+	dshelp "github.com/ipfs/go-ipfs-ds-help"
 	logging "github.com/ipfs/go-log/v2"
 )
 
@@ -30,7 +31,7 @@ func newHeads(store ds.Datastore, namespace ds.Key, logger logging.StandardLogge
 
 func (hh *heads) key(c cid.Cid) ds.Key {
 	// /<namespace>/<cid>
-	return hh.namespace.Child(cidToDsKey(c))
+	return hh.namespace.Child(dshelp.MultihashToDsKey(c.Hash()))
 }
 
 func (hh *heads) load(c cid.Cid) (uint64, error) {
@@ -137,7 +138,7 @@ func (hh *heads) List() ([]cid.Cid, uint64, error) {
 			return nil, 0, r.Error
 		}
 		headKey := ds.NewKey(strings.TrimPrefix(r.Key, hh.namespace.String()))
-		headCid, err := dsKeyToCid(headKey)
+		headCid, err := dshelp.DsKeyToCidV1(headKey, cid.DagProtobuf)
 		if err != nil {
 			return nil, 0, err
 		}
