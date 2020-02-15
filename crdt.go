@@ -670,9 +670,7 @@ func (store *Datastore) Sync(prefix ds.Key) error {
 	//   - If we find an element which is not tombstoned, then value is in the set
 	// - In order to retrieve an element's value:
 	//   - Check that it is in the set
-	//   - Read the value entry
-	// - Given that <key> can actually be "path/to/something" and another key may be "path",
-	//   we might find
+	//   - Read the value entry from the /setNamespace/keysNamespace/<key>/valueSuffix path
 	return store.set.datastoreSync(prefix)
 }
 
@@ -883,7 +881,8 @@ func (b *batch) Delete(key ds.Key) error {
 }
 
 // Sync creates a new batch with all the keys matching the prefix,
-// and commits it and syncs the underlying datastore.
+// and commits it and syncs the underlying datastore. Keys not matching
+// the prefix remain in the current batch.
 func (b *batch) Sync(prefix ds.Key) error {
 	syncElems := make([]*pb.Element, 0)
 	syncTombs := make([]*pb.Element, 0)

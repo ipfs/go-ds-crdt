@@ -157,6 +157,8 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 		return true
 	}
 
+	// The code below is very inspired in the Query implementation in
+	// flatfs.
 	b := query.NewResultBuilder(q)
 	b.Process.Go(func(p goprocess.Process) {
 		results, err := s.store.Query(setQuery)
