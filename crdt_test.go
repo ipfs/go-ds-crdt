@@ -10,11 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger"
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 	dssync "github.com/ipfs/go-datastore/sync"
 	dstest "github.com/ipfs/go-datastore/test"
+	badgerds "github.com/ipfs/go-ds-badger"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
@@ -24,6 +26,13 @@ import (
 
 var numReplicas = 15
 var debug = false
+
+const (
+	mapStore = iota
+	badgerStore
+)
+
+var store int = mapStore
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
@@ -200,25 +209,35 @@ func storeFolder(i int) string {
 	return fmt.Sprintf("test-badger-%d", i)
 }
 
-// func makeStore(t *testing.T, i int) ds.Datastore {
-// 	t.Helper()
-// 	folder := storeFolder(i)
-// 	err := os.MkdirAll(folder, 0700)
-// 	if err != nil {
-// 		t.Fatal(err)
-// 	}
+func makeStore(t *testing.T, i int) ds.Datastore {
+	t.Helper()
 
-// 	badgerOpts := badger.DefaultOptions("")
-// 	badgerOpts.SyncWrites = false
-// 	badgerOpts.MaxTableSize = 1048576
+	switch store {
+	case mapStore:
+		return dssync.MutexWrap(ds.NewMapDatastore())
+	case badgerStore:
+		folder := storeFolder(i)
+		err := os.MkdirAll(folder, 0700)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-// 	opts := badgerds.Options{Options: badgerOpts}
-// 	dstore, err := badgerds.NewDatastore(folder, &opts)
-// 	if err != nil {
-// 		t.Fatal(err)
-// 	}
-// 	return dstore
-// }
+		badgerOpts := badger.DefaultOptions("")
+		badgerOpts.SyncWrites = false
+		badgerOpts.MaxTableSize = 1048576
+
+		opts := badgerds.Options{Options: badgerOpts}
+		dstore, err := badgerds.NewDatastore(folder, &opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dstore
+	default:
+		t.Fatal("bad store type selected for tests")
+		return nil
+
+	}
+}
 
 func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 	bcasts, bcastCancel := newBroadcasters(t, numReplicas)
@@ -253,11 +272,9 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 
 		var err error
 		replicas[i], err = New(
-			//makeStore(t, i),
-			dssync.MutexWrap(ds.NewMapDatastore()),
-			//
+			makeStore(t, i),
 			// ds.NewLogDatastore(
-			// 	dssync.MutexWrap(ds.NewMapDatastore()),
+			// 	makeStore(t, i),
 			// 	fmt.Sprintf("crdt-test-%d", i),
 			// ),
 			ds.NewKey("crdttest"),
@@ -310,6 +327,11 @@ func TestCRDT(t *testing.T) {
 }
 
 func TestDatastoreSuite(t *testing.T) {
+	numReplicasOld := numReplicas
+	numReplicas = 1
+	defer func() {
+		numReplicas = numReplicasOld
+	}()
 	opts := DefaultOptions()
 	opts.MaxBatchDeltaSize = 200 * 1024 * 1024 // 200 MB
 	replicas, closeReplicas := makeReplicas(t, opts)
@@ -318,7 +340,7 @@ func TestDatastoreSuite(t *testing.T) {
 	time.Sleep(time.Second)
 
 	for _, r := range replicas {
-		q := query.Query{}
+		q := query.Query{KeysOnly: true}
 		results, err := r.Query(q)
 		if err != nil {
 			t.Fatal(err)
