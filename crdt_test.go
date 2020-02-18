@@ -14,6 +14,7 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 	dssync "github.com/ipfs/go-datastore/sync"
+	dstest "github.com/ipfs/go-datastore/test"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
@@ -26,6 +27,7 @@ var debug = false
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+	dstest.ElemCount = 20
 }
 
 type testLogger struct {
@@ -307,30 +309,30 @@ func TestCRDT(t *testing.T) {
 	}
 }
 
-// func TestDatastoreSuite(t *testing.T) {
-// 	opts := DefaultOptions()
-// 	opts.MaxBatchDeltaSize = 200 * 1024 * 1024 // 200 MB
-// 	replicas, closeReplicas := makeReplicas(t, opts)
-// 	defer closeReplicas()
-// 	dstest.SubtestAll(t, replicas[0])
-// 	time.Sleep(time.Second)
+func TestDatastoreSuite(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxBatchDeltaSize = 200 * 1024 * 1024 // 200 MB
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+	dstest.SubtestAll(t, replicas[0])
+	time.Sleep(time.Second)
 
-// 	for _, r := range replicas {
-// 		q := query.Query{}
-// 		results, err := r.Query(q)
-// 		if err != nil {
-// 			t.Fatal(err)
-// 		}
-// 		defer results.Close()
-// 		rest, err := results.Rest()
-// 		if err != nil {
-// 			t.Fatal(err)
-// 		}
-// 		if len(rest) != 0 {
-// 			t.Error("all elements in the suite should be gone")
-// 		}
-// 	}
-// }
+	for _, r := range replicas {
+		q := query.Query{}
+		results, err := r.Query(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer results.Close()
+		rest, err := results.Rest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rest) != 0 {
+			t.Error("all elements in the suite should be gone")
+		}
+	}
+}
 
 func TestCRDTSync(t *testing.T) {
 	nItems := 50
