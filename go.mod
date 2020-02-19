@@ -1,7 +1,5 @@
 module github.com/ipfs/go-ds-crdt
 
-replace github.com/ipfs/go-datastore => ../go-datastore
-
 require (
 	github.com/dgraph-io/badger v1.6.0
 	github.com/gogo/protobuf v1.3.1
