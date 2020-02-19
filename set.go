@@ -103,24 +103,27 @@ func (s *set) Element(key string) ([]byte, error) {
 	//   -> It may or not be tombstoned
 	// * If the key does not have a value in the store:
 	//   -> It was either never added
-	//   -> Or it was tombstoned
+	//   -> Or it was tombstoned and value deleted
 	//   -> In both cases the element "does not exist".
-
 	valueK := s.valueKey(key)
 	value, err := s.store.Get(valueK)
-	if err != nil { // not found is fine
+	if err != nil { // not found is fine, we just return it
 		return value, err
 	}
 
 	// We have an existing element. Check if tombstoned.
-	inSet, err := s.InSet(key)
+	inSet, err := s.inElemsNotTombstoned(key)
 	if err != nil {
 		return nil, err
 	}
+
 	if !inSet {
 		// attempt to remove so next time we do not have to do this
 		// lookup.
-		s.store.Delete(valueK)
+		// In concurrency, this may delete a key that was just written
+		// and should not be deleted.
+		// s.store.Delete(valueK)
+
 		return nil, ds.ErrNotFound
 	}
 	// otherwise return the value
@@ -191,7 +194,7 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 
 			entry.Key = key
 			if q.KeysOnly {
-				has, err := s.InSet(key)
+				has, err := s.inElemsNotTombstoned(key)
 				if err != nil {
 					sendResult(b, p, query.Result{Error: err})
 					return
@@ -228,6 +231,20 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 // InSet returns true if the key belongs to one of the elements in the "elems"
 // set, and this element is not tombstoned.
 func (s *set) InSet(key string) (bool, error) {
+	// Optimization: if we do not have a value
+	// this key was never added.
+	valueK := s.valueKey(key)
+	if ok, err := s.store.Has(valueK); !ok {
+		return false, err
+	}
+
+	// Otherwise, do the long check.
+	return s.inElemsNotTombstoned(key)
+}
+
+// Returns in we have a key/block combinations in the
+// elements set that has not been tombstoned.
+func (s *set) inElemsNotTombstoned(key string) (bool, error) {
 	// /namespace/elems/<key>
 	prefix := s.elemsPrefix(key)
 	q := query.Query{
