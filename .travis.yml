@@ -12,9 +12,15 @@ env:
 
 install: true
 
-script:
-  - go test -v -run "TestDatastoreSuite" .
-  - go test -v -run "TestCRDT" -race -covermode=atomic -coverprofile=coverage.txt .
+jobs:
+  include:
+    - stage: "Testing stage"
+      name: "Test datastore dshelp suite"
+      script:
+        - go test -v -run "TestDatastoreSuite" .
+    - name: "Test CRDT datastore"
+      script:
+        - go test -v -run "TestCRDT" -race -covermode=atomic -coverprofile=coverage.txt .
+      after_success:
+        - bash <(curl -s https://codecov.io/bash)
 
-after_success:
-  - bash <(curl -s https://codecov.io/bash)

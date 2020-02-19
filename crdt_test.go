@@ -36,7 +36,7 @@ var store int = mapStore
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
-	dstest.ElemCount = 10
+	dstest.ElemCount = 20
 }
 
 type testLogger struct {
