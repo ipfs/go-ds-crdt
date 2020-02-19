@@ -514,9 +514,12 @@ func (store *Datastore) sendJobWorker() {
 			}
 			return
 		case j := <-store.sendJobs:
-			// If jobqueue was buffered to the number of workers
-			// this would be faster as jobs could grab data rigth
-			// away. But how do we shutdown things then.
+			// TODO: jobqueue could be buffered. But then we'd
+			// need to make sure workers abort when
+			// store.ctx.Done() even if more jobs are made
+			// available until the other case closes the channel.
+			// Not overly worried, may not make much difference
+			// anyways.
 			store.jobQueue <- j
 		}
 	}

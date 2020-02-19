@@ -103,8 +103,6 @@ func (s *set) Element(key string) ([]byte, error) {
 	//   -> It may or not be tombstoned
 	// * If the key does not have a value in the store:
 	//   -> It was either never added
-	//   -> Or it was tombstoned and value deleted
-	//   -> In both cases the element "does not exist".
 	valueK := s.valueKey(key)
 	value, err := s.store.Get(valueK)
 	if err != nil { // not found is fine, we just return it
