@@ -502,7 +502,7 @@ func (s *set) datastoreSync(prefix ds.Key) error {
 	}
 
 	for _, k := range toSync {
-		if err := s.store.Sync(k); s != nil {
+		if err := s.store.Sync(k); err != nil {
 			return err
 		}
 	}

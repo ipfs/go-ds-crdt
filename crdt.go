@@ -884,64 +884,6 @@ func (b *batch) Delete(key ds.Key) error {
 	return nil
 }
 
-// Sync creates a new batch with all the keys matching the prefix,
-// and commits it and syncs the underlying datastore. Keys not matching
-// the prefix remain in the current batch.
-func (b *batch) Sync(prefix ds.Key) error {
-	syncElems := make([]*pb.Element, 0)
-	syncTombs := make([]*pb.Element, 0)
-	leftElems := make([]*pb.Element, 0)
-	leftTombs := make([]*pb.Element, 0)
-
-	b.store.curDeltaMux.Lock()
-	defer b.store.curDeltaMux.Unlock()
-
-	for _, e := range b.store.curDelta.GetElements() {
-		eKey := ds.NewKey(e.GetKey())
-		if eKey.Equal(prefix) || eKey.IsDescendantOf(prefix) {
-			syncElems = append(syncElems, e)
-		} else {
-			leftElems = append(leftElems, e)
-		}
-	}
-
-	for _, e := range b.store.curDelta.GetTombstones() {
-		eKey := ds.NewKey(e.GetKey())
-		if eKey.Equal(prefix) || eKey.IsDescendantOf(prefix) {
-			syncTombs = append(syncElems, e)
-		} else {
-			leftTombs = append(leftElems, e)
-		}
-	}
-
-	syncDelta := &pb.Delta{
-		Elements:   syncElems,
-		Tombstones: syncTombs,
-		Priority:   b.store.curDelta.GetPriority(),
-	}
-
-	leftDelta := &pb.Delta{
-		Elements:   leftElems,
-		Tombstones: leftTombs,
-		Priority:   b.store.curDelta.GetPriority(),
-	}
-
-	// commit the old delta
-	err := b.store.publish(syncDelta)
-	if err != nil {
-		return err
-	}
-
-	// We correctly commited the syncDelta
-
-	// Set the currentDeta
-	b.store.curDelta = leftDelta
-
-	// Sync the prefix in the underlying datastore
-	return b.store.Sync(prefix)
-
-}
-
 func (b *batch) Commit() error {
 	return b.store.publishDelta()
 }

@@ -356,7 +356,7 @@ func TestDatastoreSuite(t *testing.T) {
 	}
 }
 
-func TestCRDTSync(t *testing.T) {
+func TestCRDTReplication(t *testing.T) {
 	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
@@ -711,5 +711,88 @@ func TestCRDTNamespaceClash(t *testing.T) {
 	}
 	if string(v) != "hello" {
 		t.Error("wrong value read from database")
+	}
+}
+
+type syncedTrackDs struct {
+	ds.Datastore
+	syncs map[ds.Key]struct{}
+	set   *set
+}
+
+func (st *syncedTrackDs) Sync(k ds.Key) error {
+	st.syncs[k] = struct{}{}
+	return st.Datastore.Sync(k)
+}
+
+func (st *syncedTrackDs) isSynced(k ds.Key) bool {
+	prefixStr := k.String()
+	mustBeSynced := []ds.Key{
+		st.set.elemsPrefix(prefixStr),
+		st.set.tombsPrefix(prefixStr),
+		st.set.keyPrefix(keysNs).Child(k),
+	}
+
+	for k := range st.syncs {
+		synced := false
+		for _, t := range mustBeSynced {
+			if k == t || k.IsAncestorOf(t) {
+				synced = true
+				break
+			}
+		}
+		if !synced {
+			return false
+		}
+	}
+	return true
+}
+
+func TestCRDTSync(t *testing.T) {
+	opts := DefaultOptions()
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
+	syncedDs := &syncedTrackDs{
+		Datastore: replicas[0].set.store,
+		syncs:     make(map[ds.Key]struct{}),
+		set:       replicas[0].set,
+	}
+
+	replicas[0].set.store = syncedDs
+	k1 := ds.NewKey("/hello/bye")
+	k2 := ds.NewKey("/hello")
+	k3 := ds.NewKey("/hell")
+
+	err := replicas[0].Put(k1, []byte("value1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Put(k2, []byte("value2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Put(k3, []byte("value3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Sync(ds.NewKey("/hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !syncedDs.isSynced(k1) {
+		t.Error("k1 should have been synced")
+	}
+
+	if !syncedDs.isSynced(k2) {
+		t.Error("k2 should have been synced")
+	}
+
+	if syncedDs.isSynced(k3) {
+		t.Error("k3 should have not been synced")
 	}
 }
