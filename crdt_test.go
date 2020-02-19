@@ -206,7 +206,7 @@ func (mds *mockDAGSync) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipl
 }
 
 func storeFolder(i int) string {
-	return fmt.Sprintf("test-badger-%d", i)
+	return fmt.Sprintf("/dev/shm/test-badger-%d", i)
 }
 
 func makeStore(t *testing.T, i int) ds.Datastore {
@@ -336,6 +336,24 @@ func TestDatastoreSuite(t *testing.T) {
 	opts.MaxBatchDeltaSize = 200 * 1024 * 1024 // 200 MB
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
+
+	go func() {
+		for {
+			q := query.Query{KeysOnly: true}
+			results, err := replicas[0].store.Query(q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer results.Close()
+			rest, err := results.Rest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fmt.Println(len(rest))
+			time.Sleep(5 * time.Second)
+		}
+	}()
+
 	dstest.SubtestAll(t, replicas[0])
 	time.Sleep(time.Second)
 
@@ -456,7 +474,7 @@ func TestCRDTSync(t *testing.T) {
 	//replicas[1].PrintDAG()
 }
 
-func TestPriority(t *testing.T) {
+func TestCRDTPriority(t *testing.T) {
 	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
@@ -509,7 +527,7 @@ func TestPriority(t *testing.T) {
 	//replicas[1].PrintDAG()
 }
 
-func TestCatchUp(t *testing.T) {
+func TestCRDTCatchUp(t *testing.T) {
 	nItems := 50
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -552,7 +570,7 @@ func TestCatchUp(t *testing.T) {
 	}
 }
 
-func TestPrintDAG(t *testing.T) {
+func TestCRDTPrintDAG(t *testing.T) {
 	nItems := 5
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -571,7 +589,7 @@ func TestPrintDAG(t *testing.T) {
 	}
 }
 
-func TestHooks(t *testing.T) {
+func TestCRDTHooks(t *testing.T) {
 	var put int64
 	var deleted int64
 
@@ -605,7 +623,7 @@ func TestHooks(t *testing.T) {
 	}
 }
 
-func TestBatch(t *testing.T) {
+func TestCRDTBatch(t *testing.T) {
 	opts := DefaultOptions()
 	opts.MaxBatchDeltaSize = 500 // bytes
 
@@ -663,7 +681,7 @@ func TestBatch(t *testing.T) {
 	}
 }
 
-func TestNamespaceClash(t *testing.T) {
+func TestCRDTNamespaceClash(t *testing.T) {
 	opts := DefaultOptions()
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
