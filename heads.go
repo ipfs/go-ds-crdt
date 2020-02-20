@@ -91,12 +91,12 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 		}
 	}
 
-	err = hh.delete(store, h)
+	err = hh.write(store, c, height)
 	if err != nil {
 		return err
 	}
 
-	err = hh.write(store, c, height)
+	err = hh.delete(store, h)
 	if err != nil {
 		return err
 	}
