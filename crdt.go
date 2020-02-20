@@ -311,29 +311,10 @@ func (store *Datastore) handleNext() {
 			continue
 		}
 
-		var bCastHeads []cid.Cid
-
-		// Make a list of heads we received
-		bcastData := pb.CRDTBroadcast{}
-		err = proto.Unmarshal(data, &bcastData)
+		bCastHeads, err := store.decodeBroadcast(data)
 		if err != nil {
-			// Backwards compatibility
-			c, err2 := cid.Cast(data)
-			if err2 != nil {
-				store.logger.Error(err)
-				store.logger.Error(err2)
-				continue
-			}
-			bCastHeads = []cid.Cid{c}
-		} else {
-			for _, protoHead := range bcastData.Heads {
-				c, err := cid.Cast(protoHead.Cid)
-				if err != nil {
-					store.logger.Error(err)
-					continue
-				}
-				bCastHeads = append(bCastHeads, c)
-			}
+			store.logger.Error(err)
+			continue
 		}
 
 		// For each head, we process it.
@@ -355,6 +336,44 @@ func (store *Datastore) handleNext() {
 		// Other peers can use the signatures to verify that the
 		// received CIDs have been issued by a trusted peer.
 	}
+}
+
+func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
+	// Make a list of heads we received
+	bcastData := pb.CRDTBroadcast{}
+	err := proto.Unmarshal(data, &bcastData)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(bcastData.XXX_unrecognized) > 0 {
+		store.logger.Warnf("backwards compatibility: parsing head as CID.", err)
+		// Backwards compatibility
+		c, err := cid.Cast(bcastData.XXX_unrecognized)
+		if err != nil {
+			return nil, err
+		}
+		return []cid.Cid{c}, nil
+	}
+
+	var bCastHeads []cid.Cid
+	for _, protoHead := range bcastData.Heads {
+		c, err := cid.Cast(protoHead.Cid)
+		if err != nil {
+			return bCastHeads, err
+		}
+		bCastHeads = append(bCastHeads, c)
+	}
+	return bCastHeads, nil
+}
+
+func (store *Datastore) encodeBroadcast(heads []cid.Cid) ([]byte, error) {
+	bcastData := pb.CRDTBroadcast{}
+	for _, c := range heads {
+		bcastData.Heads = append(bcastData.Heads, &pb.Head{Cid: c.Bytes()})
+	}
+
+	return proto.Marshal(&bcastData)
 }
 
 func (store *Datastore) rebroadcast() {
@@ -839,12 +858,7 @@ func (store *Datastore) broadcast(cids []cid.Cid) error {
 	}
 	store.logger.Debugf("broadcasting %s", cids)
 
-	bcastData := pb.CRDTBroadcast{}
-	for _, c := range cids {
-		bcastData.Heads = append(bcastData.Heads, &pb.Head{Cid: c.Bytes()})
-	}
-
-	bcastBytes, err := proto.Marshal(&bcastData)
+	bcastBytes, err := store.encodeBroadcast(cids)
 	if err != nil {
 		return err
 	}

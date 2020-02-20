@@ -14,6 +14,7 @@ require (
 	github.com/ipfs/go-merkledag v0.3.1
 	github.com/jbenet/goprocess v0.1.3
 	github.com/libp2p/go-libp2p-pubsub v0.2.5
+	github.com/multiformats/go-multihash v0.0.13
 	github.com/pkg/errors v0.9.1
 )
 
