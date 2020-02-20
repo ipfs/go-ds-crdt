@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	"github.com/jbenet/goprocess"
+	"go.uber.org/multierr"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
@@ -501,11 +502,13 @@ func (s *set) datastoreSync(prefix ds.Key) error {
 		s.keyPrefix(keysNs).Child(prefix), // covers values and priorities
 	}
 
+	var errs []error
+
 	for _, k := range toSync {
 		if err := s.store.Sync(k); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
 
-	return nil
+	return multierr.Combine(errs...)
 }
