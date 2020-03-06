@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"strings"
+	"sync"
 
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	"github.com/jbenet/goprocess"
@@ -33,6 +34,10 @@ type set struct {
 	namespace  ds.Key
 	putHook    func(key string, v []byte)
 	deleteHook func(key string)
+
+	// Avoid merging two things at the same time since
+	// we read-write value-priorities in a non-atomic way.
+	putElemsMux sync.Mutex
 }
 
 func newCRDTSet(
@@ -375,8 +380,19 @@ func (s *set) setValue(writeStore ds.Write, key string, value []byte, prio uint6
 	return nil
 }
 
-// putElems adds items to the "elems" set.
+// putElems adds items to the "elems" set. It will also set current
+// values and priorities for each element. This needs to run in a lock,
+// as otherwise races may occurr when reading/writing the priorities, resulting
+// in bad behaviours.
+//
+// Technically the lock should only affect the keys that are being written,
+// but with the batching optimization the locks would need to be hold until
+// the batch is written), and one lock per key might be way worse than a single
+// global lock in the end.
 func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
+	s.putElemsMux.Lock()
+	defer s.putElemsMux.Unlock()
+
 	if len(elems) == 0 {
 		return nil
 	}
