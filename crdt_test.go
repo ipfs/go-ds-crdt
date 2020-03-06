@@ -479,7 +479,7 @@ func TestCRDTPriority(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(len(replicas))
 	for i, r := range replicas {
-		go func(i int) {
+		go func(r *Datastore, i int) {
 			defer wg.Done()
 			for j := 0; j < nItems; j++ {
 				err := r.Put(k, []byte(fmt.Sprintf("r#%d", i)))
@@ -487,7 +487,7 @@ func TestCRDTPriority(t *testing.T) {
 					t.Error(err)
 				}
 			}
-		}(i)
+		}(r, i)
 	}
 	wg.Wait()
 	time.Sleep(1000 * time.Millisecond)
