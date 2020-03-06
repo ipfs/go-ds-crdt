@@ -935,8 +935,10 @@ func (store *Datastore) PrintDAG() error {
 
 	ng := &crdtNodeGetter{NodeGetter: store.dagSyncer}
 
+	set := cid.NewSet()
+
 	for _, h := range heads {
-		err := store.printDAGRec(h, 0, ng)
+		err := store.printDAGRec(h, 0, ng, set)
 		if err != nil {
 			return err
 		}
@@ -944,18 +946,26 @@ func (store *Datastore) PrintDAG() error {
 	return nil
 }
 
-func (store *Datastore) printDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGetter) error {
-	nd, delta, err := ng.GetDelta(context.Background(), from)
-	if err != nil {
-		return err
-	}
-
+func (store *Datastore) printDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set) error {
 	line := ""
 	for i := uint64(0); i < depth; i++ {
 		line += " "
 	}
 
-	line += fmt.Sprintf("- %d | %s: ", delta.GetPriority(), nd.Cid().String()[0:4])
+	ok := set.Visit(from)
+	if !ok {
+		line += "..."
+		fmt.Println(line)
+		return nil
+	}
+
+	nd, delta, err := ng.GetDelta(context.Background(), from)
+	if err != nil {
+		return err
+	}
+	cidStr := nd.Cid().String()
+	cidStr = cidStr[len(cidStr)-4:]
+	line += fmt.Sprintf("- %d | %s: ", delta.GetPriority(), cidStr)
 	line += "Add: {"
 	for _, e := range delta.GetElements() {
 		line += fmt.Sprintf("%s:%s,", e.GetKey(), e.GetValue())
@@ -966,12 +976,14 @@ func (store *Datastore) printDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGett
 	}
 	line += "}. Links: {"
 	for _, l := range nd.Links() {
-		line += fmt.Sprintf("%s,", l.Cid.String()[0:4])
+		cidStr := l.Cid.String()
+		cidStr = cidStr[len(cidStr)-4:]
+		line += fmt.Sprintf("%s,", cidStr)
 	}
 	line += "}:"
 	fmt.Println(line)
 	for _, l := range nd.Links() {
-		store.printDAGRec(l.Cid, depth+1, ng)
+		store.printDAGRec(l.Cid, depth+1, ng, set)
 	}
 	return nil
 }
