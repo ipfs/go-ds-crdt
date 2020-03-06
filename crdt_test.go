@@ -490,7 +490,7 @@ func TestCRDTPriority(t *testing.T) {
 		}(r, i)
 	}
 	wg.Wait()
-	time.Sleep(1000 * time.Millisecond)
+	time.Sleep(5000 * time.Millisecond)
 	var v, lastv []byte
 	var err error
 	for i, r := range replicas {
