@@ -26,6 +26,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	dshelp "github.com/ipfs/go-ipfs-ds-help"
+	"go.uber.org/multierr"
 
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
@@ -195,8 +196,19 @@ type dagJob struct {
 // all the necessary data under the given namespace. It needs a DAG-Syncer
 // component for IPLD nodes and a Broadcaster component to distribute and
 // receive information to and from the rest of replicas. Actual implementation
-// of these must be provided by the user.
+// of these must be provided by the user, but it normally means using
+// ipfs-lite (https://github.com/hsanjuan/ipfs-lite) as a DAG Syncer and the
+// included libp2p PubSubBroadcaster as a Broadcaster.
 //
+// The given Datastatore is used to back all CRDT-datastore contents and
+// accounting information. When using an asynchronous datastore, the user is
+// in charge of calling Sync() regularly. Sync() will persist paths related to
+// the given prefix, but note that if other replicas are modifying the
+// datastore, the prefixes that will need syncing are not only those modified
+// by the local replica. Therefore the user should consider calling Sync("/"),
+// with an empty prefix, in that case, or use a synchronouse underlying
+// datastore that persists things directly on write.
+
 // The CRDT-Datastore should call Close() before the given store is closed.
 func New(
 	store ds.Datastore,
@@ -667,7 +679,10 @@ func (store *Datastore) Delete(key ds.Key) error {
 // Sync ensures that all the data under the given prefix is flushed to disk in
 // the underlying datastore.
 func (store *Datastore) Sync(prefix ds.Key) error {
-	// Recap:
+	// This is a quick write up of the internals from the time when
+	// I was thinking many underlying datastore entries are affected when
+	// an add operation happens:
+	//
 	// When a key is added:
 	// - a new delta is made
 	// - Delta is marshalled and a DAG-node is created with the bytes,
@@ -693,7 +708,17 @@ func (store *Datastore) Sync(prefix ds.Key) error {
 	// - In order to retrieve an element's value:
 	//   - Check that it is in the set
 	//   - Read the value entry from the /setNamespace/keysNamespace/<key>/valueSuffix path
-	return store.set.datastoreSync(prefix)
+
+	// Be safe and just sync everything in our namespace
+	if prefix.String() == "/" {
+		return store.store.Sync(store.namespace)
+	}
+
+	// attempt to be intelligent and sync only all heads and the
+	// set entries related to the given prefix.
+	err := store.set.datastoreSync(prefix)
+	err2 := store.store.Sync(store.heads.namespace)
+	return multierr.Combine(err, err2)
 }
 
 // Close shuts down the CRDT datastore. It should not be used afterwards.

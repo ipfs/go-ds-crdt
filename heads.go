@@ -107,15 +107,12 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 			return err
 		}
 	}
-	return hh.store.Sync(hh.namespace)
+	return nil
 }
 
 func (hh *heads) Add(c cid.Cid, height uint64) error {
 	hh.logger.Infof("adding new DAG head: %s (height: %d)", c, height)
-	if err := hh.write(hh.store, c, height); err != nil {
-		return err
-	}
-	return hh.store.Sync(hh.namespace)
+	return hh.write(hh.store, c, height)
 }
 
 // List returns the list of current heads plus the max height.
