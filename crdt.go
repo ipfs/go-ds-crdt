@@ -252,7 +252,7 @@ func New(
 		broadcaster:       bcast,
 		seenHeads:         make(map[cid.Cid]struct{}),
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
-		jobQueue:          make(chan *dagJob),
+		jobQueue:          make(chan *dagJob, opts.NumWorkers),
 		sendJobs:          make(chan *dagJob),
 	}
 
@@ -453,6 +453,14 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 // initialization in New().
 func (store *Datastore) dagWorker() {
 	for job := range store.jobQueue {
+		select {
+		case <-store.ctx.Done():
+			// drain jobs from queue when we are done
+			job.session.Done()
+			continue
+		default:
+		}
+
 		children, err := store.processNode(
 			job.nodeGetter,
 			job.root,
@@ -528,18 +536,8 @@ func (store *Datastore) sendJobWorker() {
 		select {
 		case <-store.ctx.Done():
 			close(store.jobQueue)
-			// drain jobs
-			for j := range store.jobQueue {
-				j.session.Done()
-			}
 			return
 		case j := <-store.sendJobs:
-			// TODO: jobqueue could be buffered. But then we'd
-			// need to make sure workers abort when
-			// store.ctx.Done() even if more jobs are made
-			// available until the other case closes the channel.
-			// Not overly worried, may not make much difference
-			// anyways.
 			store.jobQueue <- j
 		}
 	}
