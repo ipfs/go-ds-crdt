@@ -457,6 +457,17 @@ func TestCRDTReplication(t *testing.T) {
 	//replicas[1].PrintDAG()
 }
 
+// TestCRDTPriority tests that given multiple concurrent updates from several
+// replicas on the same key, the resulting values converge to the same key.
+//
+// It does this by launching one go routine for every replica, where it replica
+// writes the value #replica-number repeteadly (nItems-times).
+//
+// Finally, it puts a final value for a single key in the first replica and
+// checks that all replicas got it.
+//
+// If key priority rules are respected, the "last" update emitted for the key
+// K (which could have come from any replica) should take place everywhere.
 func TestCRDTPriority(t *testing.T) {
 	nItems := 50
 
@@ -465,15 +476,21 @@ func TestCRDTPriority(t *testing.T) {
 
 	k := ds.NewKey("k")
 
+	var wg sync.WaitGroup
+	wg.Add(len(replicas))
 	for i, r := range replicas {
-		for j := 0; j < nItems; j++ {
-			err := r.Put(k, []byte(fmt.Sprintf("r#%d", i)))
-			if err != nil {
-				t.Error(err)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < nItems; j++ {
+				err := r.Put(k, []byte(fmt.Sprintf("r#%d", i)))
+				if err != nil {
+					t.Error(err)
+				}
 			}
-		}
+		}(i)
 	}
-	time.Sleep(500 * time.Millisecond)
+	wg.Wait()
+	time.Sleep(1000 * time.Millisecond)
 	var v, lastv []byte
 	var err error
 	for i, r := range replicas {
@@ -493,7 +510,7 @@ func TestCRDTPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1000 * time.Millisecond)
 
 	for i, r := range replicas {
 		v, err := r.Get(k)
