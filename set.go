@@ -502,11 +502,11 @@ func (s *set) datastoreSync(prefix ds.Key) error {
 		s.keyPrefix(keysNs).Child(prefix), // covers values and priorities
 	}
 
-	var errs []error
+	errs := make([]error, len(toSync), len(toSync))
 
-	for _, k := range toSync {
+	for i, k := range toSync {
 		if err := s.store.Sync(k); err != nil {
-			errs = append(errs, err)
+			errs[i] = err
 		}
 	}
 

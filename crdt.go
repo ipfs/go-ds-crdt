@@ -356,13 +356,13 @@ func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
 		return []cid.Cid{c}, nil
 	}
 
-	var bCastHeads []cid.Cid
-	for _, protoHead := range bcastData.Heads {
+	bCastHeads := make([]cid.Cid, len(bcastData.Heads), len(bcastData.Heads))
+	for i, protoHead := range bcastData.Heads {
 		c, err := cid.Cast(protoHead.Cid)
 		if err != nil {
 			return bCastHeads, err
 		}
-		bCastHeads = append(bCastHeads, c)
+		bCastHeads[i] = c
 	}
 	return bCastHeads, nil
 }
@@ -397,10 +397,11 @@ func (store *Datastore) rebroadcastHeads() {
 		store.logger.Error(err)
 		return
 	}
-	var headsToBroadcast []cid.Cid
 
+	var headsToBroadcast []cid.Cid
 	store.seenHeadsMux.RLock()
 	{
+		headsToBroadcast = make([]cid.Cid, 0, len(store.seenHeads))
 		for _, h := range heads {
 			if _, ok := store.seenHeads[h]; !ok {
 				headsToBroadcast = append(headsToBroadcast, h)
