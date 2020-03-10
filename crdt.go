@@ -25,13 +25,14 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	pb "github.com/ipfs/go-ds-crdt/pb"
+	dshelp "github.com/ipfs/go-ipfs-ds-help"
+	"go.uber.org/multierr"
 
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
-	dshelp "github.com/ipfs/go-ipfs-ds-help"
 	ipld "github.com/ipfs/go-ipld-format"
-	logging "github.com/ipfs/go-log"
+	logging "github.com/ipfs/go-log/v2"
 	"github.com/pkg/errors"
 )
 
@@ -195,8 +196,19 @@ type dagJob struct {
 // all the necessary data under the given namespace. It needs a DAG-Syncer
 // component for IPLD nodes and a Broadcaster component to distribute and
 // receive information to and from the rest of replicas. Actual implementation
-// of these must be provided by the user.
+// of these must be provided by the user, but it normally means using
+// ipfs-lite (https://github.com/hsanjuan/ipfs-lite) as a DAG Syncer and the
+// included libp2p PubSubBroadcaster as a Broadcaster.
 //
+// The given Datastatore is used to back all CRDT-datastore contents and
+// accounting information. When using an asynchronous datastore, the user is
+// in charge of calling Sync() regularly. Sync() will persist paths related to
+// the given prefix, but note that if other replicas are modifying the
+// datastore, the prefixes that will need syncing are not only those modified
+// by the local replica. Therefore the user should consider calling Sync("/"),
+// with an empty prefix, in that case, or use a synchronouse underlying
+// datastore that persists things directly on write.
+
 // The CRDT-Datastore should call Close() before the given store is closed.
 func New(
 	store ds.Datastore,
@@ -252,7 +264,7 @@ func New(
 		broadcaster:       bcast,
 		seenHeads:         make(map[cid.Cid]struct{}),
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
-		jobQueue:          make(chan *dagJob),
+		jobQueue:          make(chan *dagJob, opts.NumWorkers),
 		sendJobs:          make(chan *dagJob),
 	}
 
@@ -311,23 +323,69 @@ func (store *Datastore) handleNext() {
 			continue
 		}
 
-		c, err := cid.Cast(data)
+		bCastHeads, err := store.decodeBroadcast(data)
 		if err != nil {
 			store.logger.Error(err)
 			continue
 		}
 
-		//go func(c cid.Cid) {
-		err = store.handleBlock(c)
-		if err != nil {
-			store.logger.Error(err)
+		// For each head, we process it.
+		for _, head := range bCastHeads {
+			//go func(c cid.Cid) {
+			err = store.handleBlock(head)
+			if err != nil {
+				store.logger.Error(err)
+			}
+			//}(c)
+			store.seenHeadsMux.Lock()
+			store.seenHeads[head] = struct{}{}
+			store.seenHeadsMux.Unlock()
 		}
-		//}(c)
 
-		store.seenHeadsMux.Lock()
-		store.seenHeads[c] = struct{}{}
-		store.seenHeadsMux.Unlock()
+		// TODO: We should store trusted-peer signatures associated to
+		// each head in a timecache. When we broadcast, attach the
+		// signatures (along with our own) to the broadcast.
+		// Other peers can use the signatures to verify that the
+		// received CIDs have been issued by a trusted peer.
 	}
+}
+
+func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
+	// Make a list of heads we received
+	bcastData := pb.CRDTBroadcast{}
+	err := proto.Unmarshal(data, &bcastData)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(bcastData.XXX_unrecognized) > 0 {
+		store.logger.Warnf("backwards compatibility: parsing head as CID.", err)
+		// Backwards compatibility
+		c, err := cid.Cast(bcastData.XXX_unrecognized)
+		if err != nil {
+			return nil, err
+		}
+		return []cid.Cid{c}, nil
+	}
+
+	bCastHeads := make([]cid.Cid, len(bcastData.Heads), len(bcastData.Heads))
+	for i, protoHead := range bcastData.Heads {
+		c, err := cid.Cast(protoHead.Cid)
+		if err != nil {
+			return bCastHeads, err
+		}
+		bCastHeads[i] = c
+	}
+	return bCastHeads, nil
+}
+
+func (store *Datastore) encodeBroadcast(heads []cid.Cid) ([]byte, error) {
+	bcastData := pb.CRDTBroadcast{}
+	for _, c := range heads {
+		bcastData.Heads = append(bcastData.Heads, &pb.Head{Cid: c.Bytes()})
+	}
+
+	return proto.Marshal(&bcastData)
 }
 
 func (store *Datastore) rebroadcast() {
@@ -343,22 +401,29 @@ func (store *Datastore) rebroadcast() {
 	}
 }
 
+// regularly send out a list of heads that we have not recently seen
 func (store *Datastore) rebroadcastHeads() {
+	// Get our current list of heads
 	heads, _, err := store.heads.List()
 	if err != nil {
 		store.logger.Error(err)
 		return
 	}
 
+	var headsToBroadcast []cid.Cid
 	store.seenHeadsMux.RLock()
 	{
+		headsToBroadcast = make([]cid.Cid, 0, len(store.seenHeads))
 		for _, h := range heads {
 			if _, ok := store.seenHeads[h]; !ok {
-				store.broadcast(h)
+				headsToBroadcast = append(headsToBroadcast, h)
 			}
 		}
 	}
 	store.seenHeadsMux.RUnlock()
+
+	// Send them out
+	store.broadcast(headsToBroadcast)
 
 	// Reset the map
 	store.seenHeadsMux.Lock()
@@ -400,6 +465,14 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 // initialization in New().
 func (store *Datastore) dagWorker() {
 	for job := range store.jobQueue {
+		select {
+		case <-store.ctx.Done():
+			// drain jobs from queue when we are done
+			job.session.Done()
+			continue
+		default:
+		}
+
 		children, err := store.processNode(
 			job.nodeGetter,
 			job.root,
@@ -459,6 +532,8 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 		select {
 		case store.sendJobs <- job:
 		case <-store.ctx.Done():
+			// the job was never sent, so it cannot complete.
+			session.Done()
 			return
 		}
 	}
@@ -483,7 +558,7 @@ func (store *Datastore) sendJobWorker() {
 func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
 	// merge the delta
 	current := node.Cid()
-	err := store.set.Merge(delta, dshelp.CidToDsKey(current).String())
+	err := store.set.Merge(delta, dshelp.MultihashToDsKey(current.Hash()).String())
 	if err != nil {
 		return nil, errors.Wrapf(err, "error merging delta from %s", current)
 	}
@@ -575,7 +650,10 @@ func (store *Datastore) GetSize(key ds.Key) (size int, err error) {
 //   for entry := range entries { ... }
 //
 func (store *Datastore) Query(q query.Query) (query.Results, error) {
-	qr := query.ResultsWithChan(q, store.set.Elements())
+	qr, err := store.set.Elements(q)
+	if err != nil {
+		return nil, err
+	}
 	return query.NaiveQueryApply(q, qr), nil
 }
 
@@ -596,6 +674,51 @@ func (store *Datastore) Delete(key ds.Key) error {
 		return ds.ErrNotFound
 	}
 	return store.publish(delta)
+}
+
+// Sync ensures that all the data under the given prefix is flushed to disk in
+// the underlying datastore.
+func (store *Datastore) Sync(prefix ds.Key) error {
+	// This is a quick write up of the internals from the time when
+	// I was thinking many underlying datastore entries are affected when
+	// an add operation happens:
+	//
+	// When a key is added:
+	// - a new delta is made
+	// - Delta is marshalled and a DAG-node is created with the bytes,
+	//   pointing to previous heads. DAG-node is added to DAGService.
+	// - Heads are replaced with new CID.
+	// - New CID is broadcasted to everyone
+	// - The new CID is processed (up until now the delta had not
+	//   taken effect). Implementation detail: it is processed before
+	//   broadcast actually.
+	// - processNode() starts processing that branch from that CID
+	// - it calls set.Merge()
+	// - that calls putElems() and putTombs()
+	// - that may make a batch for all the elems which is later committed
+	// - each element has a datastore entry /setNamespace/elemsNamespace/<key>/<block_id>
+	// - each tomb has a datastore entry /setNamespace/tombsNamespace/<key>/<block_id>
+	// - each value has a datastore entry /setNamespace/keysNamespace/<key>/valueSuffix
+	// - each value has an additional priotity entry /setNamespace/keysNamespace/<key>/prioritySuffix
+	// - the last two are only written if the added entry has more priority than any the existing
+	// - For a value to not be lost, those entries should be fully synced.
+	// - In order to check if a value is in the set:
+	//   - List all elements on /setNamespace/elemsNamespace/<key> (will return several block_ids)
+	//   - If we find an element which is not tombstoned, then value is in the set
+	// - In order to retrieve an element's value:
+	//   - Check that it is in the set
+	//   - Read the value entry from the /setNamespace/keysNamespace/<key>/valueSuffix path
+
+	// Be safe and just sync everything in our namespace
+	if prefix.String() == "/" {
+		return store.store.Sync(store.namespace)
+	}
+
+	// attempt to be intelligent and sync only all heads and the
+	// set entries related to the given prefix.
+	err := store.set.datastoreSync(prefix)
+	err2 := store.store.Sync(store.heads.namespace)
+	return multierr.Combine(err, err2)
 }
 
 // Close shuts down the CRDT datastore. It should not be used afterwards.
@@ -710,7 +833,7 @@ func (store *Datastore) publish(delta *pb.Delta) error {
 	if err != nil {
 		return err
 	}
-	return store.broadcast(c)
+	return store.broadcast([]cid.Cid{c})
 }
 
 func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
@@ -747,20 +870,26 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 		return cid.Undef, errors.Wrap(err, "error processing new block")
 	}
 	if len(children) != 0 {
-		store.logger.Warningf("bug: created a block to unknown children")
+		store.logger.Warnf("bug: created a block to unknown children")
 	}
 
 	return nd.Cid(), nil
 }
 
-func (store *Datastore) broadcast(c cid.Cid) error {
+func (store *Datastore) broadcast(cids []cid.Cid) error {
 	if store.broadcaster == nil { // offline
 		return nil
 	}
-	store.logger.Debugf("broadcasting %s", c)
-	err := store.broadcaster.Broadcast(c.Bytes())
+	store.logger.Debugf("broadcasting %s", cids)
+
+	bcastBytes, err := store.encodeBroadcast(cids)
 	if err != nil {
-		return errors.Wrapf(err, "error broadcasting %s", c)
+		return err
+	}
+
+	err = store.broadcaster.Broadcast(bcastBytes)
+	if err != nil {
+		return errors.Wrapf(err, "error broadcasting %s", cids)
 	}
 	return nil
 }
@@ -775,7 +904,7 @@ func (b *batch) Put(key ds.Key, value []byte) error {
 		return err
 	}
 	if size > b.store.opts.MaxBatchDeltaSize {
-		b.store.logger.Warning("delta size over MaxBatchDeltaSize. Commiting.")
+		b.store.logger.Warn("delta size over MaxBatchDeltaSize. Commiting.")
 		return b.Commit()
 	}
 	return nil
@@ -787,7 +916,7 @@ func (b *batch) Delete(key ds.Key) error {
 		return err
 	}
 	if size > b.store.opts.MaxBatchDeltaSize {
-		b.store.logger.Warning("delta size over MaxBatchDeltaSize. Commiting.")
+		b.store.logger.Warn("delta size over MaxBatchDeltaSize. Commiting.")
 		return b.Commit()
 	}
 	return nil
@@ -806,8 +935,10 @@ func (store *Datastore) PrintDAG() error {
 
 	ng := &crdtNodeGetter{NodeGetter: store.dagSyncer}
 
+	set := cid.NewSet()
+
 	for _, h := range heads {
-		err := store.printDAGRec(h, 0, ng)
+		err := store.printDAGRec(h, 0, ng, set)
 		if err != nil {
 			return err
 		}
@@ -815,18 +946,26 @@ func (store *Datastore) PrintDAG() error {
 	return nil
 }
 
-func (store *Datastore) printDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGetter) error {
-	nd, delta, err := ng.GetDelta(context.Background(), from)
-	if err != nil {
-		return err
-	}
-
+func (store *Datastore) printDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set) error {
 	line := ""
 	for i := uint64(0); i < depth; i++ {
 		line += " "
 	}
 
-	line += fmt.Sprintf("- %d | %s: ", delta.GetPriority(), nd.Cid().String()[0:4])
+	ok := set.Visit(from)
+	if !ok {
+		line += "..."
+		fmt.Println(line)
+		return nil
+	}
+
+	nd, delta, err := ng.GetDelta(context.Background(), from)
+	if err != nil {
+		return err
+	}
+	cidStr := nd.Cid().String()
+	cidStr = cidStr[len(cidStr)-4:]
+	line += fmt.Sprintf("- %d | %s: ", delta.GetPriority(), cidStr)
 	line += "Add: {"
 	for _, e := range delta.GetElements() {
 		line += fmt.Sprintf("%s:%s,", e.GetKey(), e.GetValue())
@@ -837,12 +976,14 @@ func (store *Datastore) printDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGett
 	}
 	line += "}. Links: {"
 	for _, l := range nd.Links() {
-		line += fmt.Sprintf("%s,", l.Cid.String()[0:4])
+		cidStr := l.Cid.String()
+		cidStr = cidStr[len(cidStr)-4:]
+		line += fmt.Sprintf("%s,", cidStr)
 	}
 	line += "}:"
 	fmt.Println(line)
 	for _, l := range nd.Links() {
-		store.printDAGRec(l.Cid, depth+1, ng)
+		store.printDAGRec(l.Cid, depth+1, ng, set)
 	}
 	return nil
 }

@@ -5,8 +5,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"strings"
+	"sync"
 
 	pb "github.com/ipfs/go-ds-crdt/pb"
+	"github.com/jbenet/goprocess"
+	"go.uber.org/multierr"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
@@ -31,6 +34,10 @@ type set struct {
 	namespace  ds.Key
 	putHook    func(key string, v []byte)
 	deleteHook func(key string)
+
+	// Avoid merging two things at the same time since
+	// we read-write value-priorities in a non-atomic way.
+	putElemsMux sync.Mutex
 }
 
 func newCRDTSet(
@@ -102,96 +109,146 @@ func (s *set) Element(key string) ([]byte, error) {
 	//   -> It may or not be tombstoned
 	// * If the key does not have a value in the store:
 	//   -> It was either never added
-	//   -> Or it was tombstoned
-	//   -> In both cases the element "does not exist".
-
 	valueK := s.valueKey(key)
 	value, err := s.store.Get(valueK)
-	if err != nil { // not found is fine
+	if err != nil { // not found is fine, we just return it
 		return value, err
 	}
 
 	// We have an existing element. Check if tombstoned.
-	inSet, err := s.InSet(key)
+	inSet, err := s.inElemsNotTombstoned(key)
 	if err != nil {
 		return nil, err
 	}
+
 	if !inSet {
 		// attempt to remove so next time we do not have to do this
 		// lookup.
-		s.store.Delete(valueK)
+		// In concurrency, this may delete a key that was just written
+		// and should not be deleted.
+		// s.store.Delete(valueK)
+
 		return nil, ds.ErrNotFound
 	}
 	// otherwise return the value
 	return value, nil
 }
 
-type filterIsKey struct {
-}
-
-func (f *filterIsKey) Filter(e query.Entry) bool {
-	dsk := ds.NewKey(e.Key)
-	return ds.NewKey(valueSuffix).IsAncestorOf(dsk.Reverse())
-}
-
 // Elements returns all the elements in the set.
-// It comes handy to use query.Result to wrap key, value and error.
-func (s *set) Elements() <-chan query.Result {
-	prefix := s.keyPrefix(keysNs).String()
-	q := query.Query{
-		Prefix:   prefix,
+func (s *set) Elements(q query.Query) (query.Results, error) {
+	// This will cleanup user the query prefix first.
+	// This makes sure the use of things like "/../" in the query
+	// does not affect our setQuery.
+	srcQueryPrefixKey := ds.NewKey(q.Prefix)
+
+	keyNamespacePrefix := s.keyPrefix(keysNs)
+	keyNamespacePrefixStr := keyNamespacePrefix.String()
+	setQueryPrefix := keyNamespacePrefix.Child(srcQueryPrefixKey).String()
+	vSuffix := "/" + valueSuffix
+
+	setQuery := query.Query{
+		Prefix:   setQueryPrefix,
 		KeysOnly: true,
-		Filters: []query.Filter{
-			&filterIsKey{},
-		},
 	}
 
-	retChan := make(chan query.Result, 1)
-	go func() {
-		defer close(retChan)
-		results, err := s.store.Query(q)
+	// send the result and returns false if we must exit
+	sendResult := func(b *query.ResultBuilder, p goprocess.Process, r query.Result) bool {
+		select {
+		case b.Output <- r:
+		case <-p.Closing():
+			return false
+		}
+		if r.Error != nil {
+			return false
+		}
+		return true
+	}
+
+	// The code below is very inspired in the Query implementation in
+	// flatfs.
+	b := query.NewResultBuilder(q)
+	b.Process.Go(func(p goprocess.Process) {
+		results, err := s.store.Query(setQuery)
 		if err != nil {
-			retChan <- query.Result{Error: err}
+			sendResult(b, p, query.Result{Error: err})
 			return
 		}
 		defer results.Close()
 
+		var entry query.Entry
 		for r := range results.Next() {
 			if r.Error != nil {
-				retChan <- query.Result{Error: err}
+				sendResult(b, p, query.Result{Error: r.Error})
 				return
 			}
 
+			// We will be getting keys in the form of
+			// /namespace/keys/<key>/v and /namespace/keys/<key>/p
+			// We discard anything not ending in /v and sanitize
+			// those from:
 			// /namespace/keys/<key>/v -> <key>
-			// If our filter worked well we should have only
-			// got good keys like that.
+			if !strings.HasSuffix(r.Key, vSuffix) { // "/v"
+				continue
+			}
+
 			key := strings.TrimSuffix(
-				strings.TrimPrefix(r.Key, prefix),
+				strings.TrimPrefix(r.Key, keyNamespacePrefixStr),
 				"/"+valueSuffix,
 			)
 
-			value, err := s.Element(key)
-			if err == ds.ErrNotFound {
-				continue
-			}
-			if err != nil {
-				retChan <- query.Result{Error: err}
-				return
-			}
-			entry := query.Entry{
-				Key:   key,
-				Value: value,
-			}
+			entry.Key = key
+			if q.KeysOnly {
+				has, err := s.inElemsNotTombstoned(key)
+				if err != nil {
+					sendResult(b, p, query.Result{Error: err})
+					return
+				}
 
-			retChan <- query.Result{Entry: entry}
+				if !has {
+					continue
+				}
+
+				entry.Size = -1
+				if !sendResult(b, p, query.Result{Entry: entry}) {
+					return
+				}
+			} else {
+				value, err := s.Element(key)
+				if err == ds.ErrNotFound {
+					continue
+				} else if err != nil {
+					sendResult(b, p, query.Result{Error: err})
+					return
+				}
+				entry.Value = value
+				entry.Size = len(value)
+				if !sendResult(b, p, query.Result{Entry: entry}) {
+					return
+				}
+			}
 		}
-	}()
-	return retChan
+	})
+	go b.Process.CloseAfterChildren() //nolint
+	return b.Results(), nil
 }
 
 // InSet returns true if the key belongs to one of the elements in the "elems"
 // set, and this element is not tombstoned.
 func (s *set) InSet(key string) (bool, error) {
+	// Optimization: if we do not have a value
+	// this key was never added.
+	valueK := s.valueKey(key)
+	if ok, err := s.store.Has(valueK); !ok {
+		return false, err
+	}
+
+	// Otherwise, do the long check.
+	return s.inElemsNotTombstoned(key)
+}
+
+// Returns in we have a key/block combinations in the
+// elements set that has not been tombstoned.
+func (s *set) inElemsNotTombstoned(key string) (bool, error) {
 	// /namespace/elems/<key>
 	prefix := s.elemsPrefix(key)
 	q := query.Query{
@@ -212,6 +269,14 @@ func (s *set) InSet(key string) (bool, error) {
 		}
 
 		id := strings.TrimPrefix(r.Key, prefix.String())
+		if !ds.NewKey(id).IsTopLevel() {
+			// our prefix matches blocks from other keys i.e. our
+			// prefix is "hello" and we have a different key like
+			// "hello/bye" so we have a block id like
+			// "bye/<block>". If we got the right key, then the id
+			// should be the block id only.
+			continue
+		}
 		// if not tombstoned, we have it
 		inTomb, err := s.inTombsKeyID(key, id)
 		if err != nil {
@@ -315,8 +380,19 @@ func (s *set) setValue(writeStore ds.Write, key string, value []byte, prio uint6
 	return nil
 }
 
-// putElems adds items to the "elems" set.
+// putElems adds items to the "elems" set. It will also set current
+// values and priorities for each element. This needs to run in a lock,
+// as otherwise races may occurr when reading/writing the priorities, resulting
+// in bad behaviours.
+//
+// Technically the lock should only affect the keys that are being written,
+// but with the batching optimization the locks would need to be hold until
+// the batch is written), and one lock per key might be way worse than a single
+// global lock in the end.
 func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
+	s.putElemsMux.Lock()
+	defer s.putElemsMux.Unlock()
+
 	if len(elems) == 0 {
 		return nil
 	}
@@ -432,3 +508,23 @@ func (s *set) inTombsKeyID(key, id string) (bool, error) {
 
 // 	return s.inElemsKeyID(key, id)
 // }
+
+// perform a sync against all the paths associated with a key prefix
+func (s *set) datastoreSync(prefix ds.Key) error {
+	prefixStr := prefix.String()
+	toSync := []ds.Key{
+		s.elemsPrefix(prefixStr),
+		s.tombsPrefix(prefixStr),
+		s.keyPrefix(keysNs).Child(prefix), // covers values and priorities
+	}
+
+	errs := make([]error, len(toSync), len(toSync))
+
+	for i, k := range toSync {
+		if err := s.store.Sync(k); err != nil {
+			errs[i] = err
+		}
+	}
+
+	return multierr.Combine(errs...)
+}

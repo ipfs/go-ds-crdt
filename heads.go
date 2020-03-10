@@ -11,7 +11,7 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
 	dshelp "github.com/ipfs/go-ipfs-ds-help"
-	logging "github.com/ipfs/go-log"
+	logging "github.com/ipfs/go-log/v2"
 )
 
 // heads manages the current Merkle-CRDT heads.
@@ -31,7 +31,7 @@ func newHeads(store ds.Datastore, namespace ds.Key, logger logging.StandardLogge
 
 func (hh *heads) key(c cid.Cid) ds.Key {
 	// /<namespace>/<cid>
-	return hh.namespace.Child(dshelp.CidToDsKey(c))
+	return hh.namespace.Child(dshelp.MultihashToDsKey(c.Hash()))
 }
 
 func (hh *heads) load(c cid.Cid) (uint64, error) {
@@ -91,12 +91,12 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 		}
 	}
 
-	err = hh.delete(store, h)
+	err = hh.write(store, c, height)
 	if err != nil {
 		return err
 	}
 
-	err = hh.write(store, c, height)
+	err = hh.delete(store, h)
 	if err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ func (hh *heads) List() ([]cid.Cid, uint64, error) {
 			return nil, 0, r.Error
 		}
 		headKey := ds.NewKey(strings.TrimPrefix(r.Key, hh.namespace.String()))
-		headCid, err := dshelp.DsKeyToCid(headKey)
+		headCid, err := dshelp.DsKeyToCidV1(headKey, cid.DagProtobuf)
 		if err != nil {
 			return nil, 0, err
 		}

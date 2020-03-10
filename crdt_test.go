@@ -4,28 +4,40 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger"
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 	dssync "github.com/ipfs/go-datastore/sync"
 	dstest "github.com/ipfs/go-datastore/test"
+	badgerds "github.com/ipfs/go-ds-badger"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	ipld "github.com/ipfs/go-ipld-format"
-	log "github.com/ipfs/go-log"
+	log "github.com/ipfs/go-log/v2"
 	"github.com/ipfs/go-merkledag"
 	mdutils "github.com/ipfs/go-merkledag/test"
+	"github.com/multiformats/go-multihash"
 )
 
 var numReplicas = 15
 var debug = false
 
+const (
+	mapStore = iota
+	badgerStore
+)
+
+var store int = mapStore
+
 func init() {
 	rand.Seed(time.Now().UnixNano())
+	dstest.ElemCount = 10
 }
 
 type testLogger struct {
@@ -73,13 +85,13 @@ func (tl *testLogger) Panicf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Panicf("%s "+format, args...)
 }
-func (tl *testLogger) Warning(args ...interface{}) {
+func (tl *testLogger) Warn(args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
-	tl.l.Warning(args...)
+	tl.l.Warn(args...)
 }
-func (tl *testLogger) Warningf(format string, args ...interface{}) {
+func (tl *testLogger) Warnf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
-	tl.l.Warningf("%s "+format, args...)
+	tl.l.Warnf("%s "+format, args...)
 }
 
 type mockBroadcaster struct {
@@ -194,6 +206,40 @@ func (mds *mockDAGSync) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipl
 	return ch
 }
 
+func storeFolder(i int) string {
+	return fmt.Sprintf("test-badger-%d", i)
+}
+
+func makeStore(t *testing.T, i int) ds.Datastore {
+	t.Helper()
+
+	switch store {
+	case mapStore:
+		return dssync.MutexWrap(ds.NewMapDatastore())
+	case badgerStore:
+		folder := storeFolder(i)
+		err := os.MkdirAll(folder, 0700)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		badgerOpts := badger.DefaultOptions("")
+		badgerOpts.SyncWrites = false
+		badgerOpts.MaxTableSize = 1048576
+
+		opts := badgerds.Options{Options: badgerOpts}
+		dstore, err := badgerds.NewDatastore(folder, &opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dstore
+	default:
+		t.Fatal("bad store type selected for tests")
+		return nil
+
+	}
+}
+
 func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 	bcasts, bcastCancel := newBroadcasters(t, numReplicas)
 	bs := mdutils.Bserv()
@@ -227,9 +273,9 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 
 		var err error
 		replicas[i], err = New(
-			dssync.MutexWrap(ds.NewMapDatastore()),
+			makeStore(t, i),
 			// ds.NewLogDatastore(
-			// 	dssync.MutexWrap(ds.NewMapDatastore()),
+			// 	makeStore(t, i),
 			// 	fmt.Sprintf("crdt-test-%d", i),
 			// ),
 			ds.NewKey("crdttest"),
@@ -247,11 +293,12 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 
 	closeReplicas := func() {
 		bcastCancel()
-		for _, r := range replicas {
+		for i, r := range replicas {
 			err := r.Close()
 			if err != nil {
 				t.Error(err)
 			}
+			os.RemoveAll(storeFolder(i))
 		}
 	}
 
@@ -281,16 +328,20 @@ func TestCRDT(t *testing.T) {
 }
 
 func TestDatastoreSuite(t *testing.T) {
+	numReplicasOld := numReplicas
+	numReplicas = 1
+	defer func() {
+		numReplicas = numReplicasOld
+	}()
 	opts := DefaultOptions()
 	opts.MaxBatchDeltaSize = 200 * 1024 * 1024 // 200 MB
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 	dstest.SubtestAll(t, replicas[0])
-
 	time.Sleep(time.Second)
 
 	for _, r := range replicas {
-		q := query.Query{}
+		q := query.Query{KeysOnly: true}
 		results, err := r.Query(q)
 		if err != nil {
 			t.Fatal(err)
@@ -306,7 +357,7 @@ func TestDatastoreSuite(t *testing.T) {
 	}
 }
 
-func TestSync(t *testing.T) {
+func TestCRDTReplication(t *testing.T) {
 	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
@@ -406,7 +457,18 @@ func TestSync(t *testing.T) {
 	//replicas[1].PrintDAG()
 }
 
-func TestPriority(t *testing.T) {
+// TestCRDTPriority tests that given multiple concurrent updates from several
+// replicas on the same key, the resulting values converge to the same key.
+//
+// It does this by launching one go routine for every replica, where it replica
+// writes the value #replica-number repeteadly (nItems-times).
+//
+// Finally, it puts a final value for a single key in the first replica and
+// checks that all replicas got it.
+//
+// If key priority rules are respected, the "last" update emitted for the key
+// K (which could have come from any replica) should take place everywhere.
+func TestCRDTPriority(t *testing.T) {
 	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
@@ -414,15 +476,21 @@ func TestPriority(t *testing.T) {
 
 	k := ds.NewKey("k")
 
+	var wg sync.WaitGroup
+	wg.Add(len(replicas))
 	for i, r := range replicas {
-		for j := 0; j < nItems; j++ {
-			err := r.Put(k, []byte(fmt.Sprintf("r#%d", i)))
-			if err != nil {
-				t.Error(err)
+		go func(r *Datastore, i int) {
+			defer wg.Done()
+			for j := 0; j < nItems; j++ {
+				err := r.Put(k, []byte(fmt.Sprintf("r#%d", i)))
+				if err != nil {
+					t.Error(err)
+				}
 			}
-		}
+		}(r, i)
 	}
-	time.Sleep(500 * time.Millisecond)
+	wg.Wait()
+	time.Sleep(5000 * time.Millisecond)
 	var v, lastv []byte
 	var err error
 	for i, r := range replicas {
@@ -442,7 +510,7 @@ func TestPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1000 * time.Millisecond)
 
 	for i, r := range replicas {
 		v, err := r.Get(k)
@@ -459,7 +527,7 @@ func TestPriority(t *testing.T) {
 	//replicas[1].PrintDAG()
 }
 
-func TestCatchUp(t *testing.T) {
+func TestCRDTCatchUp(t *testing.T) {
 	nItems := 50
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -502,7 +570,7 @@ func TestCatchUp(t *testing.T) {
 	}
 }
 
-func TestPrintDAG(t *testing.T) {
+func TestCRDTPrintDAG(t *testing.T) {
 	nItems := 5
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -521,7 +589,7 @@ func TestPrintDAG(t *testing.T) {
 	}
 }
 
-func TestHooks(t *testing.T) {
+func TestCRDTHooks(t *testing.T) {
 	var put int64
 	var deleted int64
 
@@ -555,7 +623,7 @@ func TestHooks(t *testing.T) {
 	}
 }
 
-func TestBatch(t *testing.T) {
+func TestCRDTBatch(t *testing.T) {
 	opts := DefaultOptions()
 	opts.MaxBatchDeltaSize = 500 // bytes
 
@@ -610,5 +678,174 @@ func TestBatch(t *testing.T) {
 		if _, err := r.Get(k2); err != nil {
 			t.Error("k2 should be everywhere")
 		}
+	}
+}
+
+func TestCRDTNamespaceClash(t *testing.T) {
+	opts := DefaultOptions()
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
+	k := ds.NewKey("path/to/something")
+	err := replicas[0].Put(k, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	k = ds.NewKey("path")
+	ok, err := replicas[0].Has(k)
+	if ok {
+		t.Error("it should not have the key")
+	}
+
+	_, err = replicas[0].Get(k)
+	if err != ds.ErrNotFound {
+		t.Error("should return err not found")
+	}
+
+	err = replicas[0].Put(k, []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := replicas[0].Get(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(v) != "hello" {
+		t.Error("wrong value read from database")
+	}
+
+	err = replicas[0].Delete(ds.NewKey("path/to/something"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, err = replicas[0].Get(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(v) != "hello" {
+		t.Error("wrong value read from database")
+	}
+}
+
+type syncedTrackDs struct {
+	ds.Datastore
+	syncs map[ds.Key]struct{}
+	set   *set
+}
+
+func (st *syncedTrackDs) Sync(k ds.Key) error {
+	st.syncs[k] = struct{}{}
+	return st.Datastore.Sync(k)
+}
+
+func (st *syncedTrackDs) isSynced(k ds.Key) bool {
+	prefixStr := k.String()
+	mustBeSynced := []ds.Key{
+		st.set.elemsPrefix(prefixStr),
+		st.set.tombsPrefix(prefixStr),
+		st.set.keyPrefix(keysNs).Child(k),
+	}
+
+	for k := range st.syncs {
+		synced := false
+		for _, t := range mustBeSynced {
+			if k == t || k.IsAncestorOf(t) {
+				synced = true
+				break
+			}
+		}
+		if !synced {
+			return false
+		}
+	}
+	return true
+}
+
+func TestCRDTSync(t *testing.T) {
+	opts := DefaultOptions()
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
+	syncedDs := &syncedTrackDs{
+		Datastore: replicas[0].set.store,
+		syncs:     make(map[ds.Key]struct{}),
+		set:       replicas[0].set,
+	}
+
+	replicas[0].set.store = syncedDs
+	k1 := ds.NewKey("/hello/bye")
+	k2 := ds.NewKey("/hello")
+	k3 := ds.NewKey("/hell")
+
+	err := replicas[0].Put(k1, []byte("value1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Put(k2, []byte("value2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Put(k3, []byte("value3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Sync(ds.NewKey("/hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !syncedDs.isSynced(k1) {
+		t.Error("k1 should have been synced")
+	}
+
+	if !syncedDs.isSynced(k2) {
+		t.Error("k2 should have been synced")
+	}
+
+	if syncedDs.isSynced(k3) {
+		t.Error("k3 should have not been synced")
+	}
+}
+
+func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
+	mh, err := multihash.Sum([]byte("emacs is best"), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cidV0 := cid.NewCidV0(mh)
+
+	opts := DefaultOptions()
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
+	cids, err := replicas[0].decodeBroadcast(cidV0.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(cids) != 1 || !cids[0].Equals(cidV0) {
+		t.Error("should have returned a single cidV0", cids)
+	}
+
+	data, err := replicas[0].encodeBroadcast(cids)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cids2, err := replicas[0].decodeBroadcast(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(cids2) != 1 || !cids[0].Equals(cidV0) {
+		t.Error("should have reparsed cid0", cids2)
 	}
 }
