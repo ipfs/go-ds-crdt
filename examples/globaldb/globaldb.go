@@ -18,10 +18,9 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
 	crdt "github.com/ipfs/go-ds-crdt"
-	logging "github.com/ipfs/go-log"
+	logging "github.com/ipfs/go-log/v2"
 
-	"github.com/libp2p/go-libp2p-core/crypto"
-	corecrypto "github.com/libp2p/go-libp2p-core/crypto"
+	crypto "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -35,7 +34,7 @@ import (
 var (
 	logger    = logging.Logger("globaldb")
 	listen, _ = multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/33123")
-	topic     = "globaldb-example"
+	topicName = "globaldb-example"
 	netTopic  = "globaldb-example-net"
 	config    = "globaldb-example"
 )
@@ -43,7 +42,7 @@ var (
 func main() {
 	// Bootstrappers are using 1024 keys. See:
 	// https://github.com/ipfs/infra/issues/378
-	corecrypto.MinRsaKeyBits = 1024
+	crypto.MinRsaKeyBits = 1024
 
 	logging.SetLogLevel("*", "error")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,7 +52,7 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	data := filepath.Join(dir, "globaldb-example")
+	data := filepath.Join(dir, config)
 
 	store, err := ipfslite.BadgerDatastore(data)
 	if err != nil {
@@ -100,6 +99,7 @@ func main() {
 		priv,
 		nil,
 		[]multiaddr.Multiaddr{listen},
+		nil,
 		ipfslite.Libp2pOptionsExtra...,
 	)
 	if err != nil {
@@ -113,7 +113,12 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	netSubs, err := psub.Subscribe(netTopic)
+	topic, err := psub.Join(netTopic)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	netSubs, err := topic.Subscribe()
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -137,7 +142,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			default:
-				psub.Publish(netTopic, []byte("hi!"))
+				topic.Publish(ctx, []byte("hi!"))
 				time.Sleep(20 * time.Second)
 			}
 		}
@@ -148,7 +153,7 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	pubsubBC, err := crdt.NewPubSubBroadcaster(ctx, psub, "globaldb-example")
+	pubsubBC, err := crdt.NewPubSubBroadcaster(ctx, psub, topicName)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -195,7 +200,7 @@ Commands:
 
 
 `,
-		pid, listen, topic, data,
+		pid, listen, topicName, data,
 	)
 
 	if len(os.Args) > 1 && os.Args[1] == "daemon" {
@@ -246,7 +251,7 @@ Commands:
 				for _, p := range connectedPeers(h) {
 					addrs, err := peer.AddrInfoToP2pAddrs(p)
 					if err != nil {
-						logger.Warning(err)
+						logger.Warn(err)
 						continue
 					}
 					for _, a := range addrs {
