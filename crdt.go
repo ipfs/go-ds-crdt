@@ -208,7 +208,7 @@ type dagJob struct {
 // by the local replica. Therefore the user should consider calling Sync("/"),
 // with an empty prefix, in that case, or use a synchronouse underlying
 // datastore that persists things directly on write.
-
+//
 // The CRDT-Datastore should call Close() before the given store is closed.
 func New(
 	store ds.Datastore,
@@ -368,7 +368,7 @@ func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
 		return []cid.Cid{c}, nil
 	}
 
-	bCastHeads := make([]cid.Cid, len(bcastData.Heads), len(bcastData.Heads))
+	bCastHeads := make([]cid.Cid, len(bcastData.Heads))
 	for i, protoHead := range bcastData.Heads {
 		c, err := cid.Cast(protoHead.Cid)
 		if err != nil {

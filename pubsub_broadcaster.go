@@ -9,9 +9,10 @@ import (
 
 // PubSubBroadcaster implements a Broadcaster using libp2p PubSub.
 type PubSubBroadcaster struct {
-	ctx  context.Context
-	psub *pubsub.PubSub
-	subs *pubsub.Subscription
+	ctx   context.Context
+	psub  *pubsub.PubSub
+	topic *pubsub.Topic
+	subs  *pubsub.Subscription
 }
 
 // NewPubSubBroadcaster returns a new broadcaster using the given PubSub and
@@ -23,29 +24,32 @@ type PubSubBroadcaster struct {
 // This must be done before Closing the crdt.Datastore, otherwise things
 // may hang.
 func NewPubSubBroadcaster(ctx context.Context, psub *pubsub.PubSub, topic string) (*PubSubBroadcaster, error) {
-	subs, err := psub.Subscribe(topic)
+	psubTopic, err := psub.Join(topic)
+	if err != nil {
+		return nil, err
+	}
+
+	subs, err := psubTopic.Subscribe()
 	if err != nil {
 		return nil, err
 	}
 
 	go func(ctx context.Context, subs *pubsub.Subscription) {
-		select {
-		case <-ctx.Done():
-			subs.Cancel()
-
-		}
+		<-ctx.Done()
+		subs.Cancel()
 	}(ctx, subs)
 
 	return &PubSubBroadcaster{
-		ctx:  ctx,
-		psub: psub,
-		subs: subs,
+		ctx:   ctx,
+		psub:  psub,
+		topic: psubTopic,
+		subs:  subs,
 	}, nil
 }
 
 // Broadcast publishes some data.
 func (pbc *PubSubBroadcaster) Broadcast(data []byte) error {
-	return pbc.psub.Publish(pbc.subs.Topic(), data)
+	return pbc.topic.Publish(pbc.ctx, data)
 }
 
 // Next returns published data.
