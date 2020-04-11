@@ -104,8 +104,8 @@ type mockBroadcaster struct {
 
 func newBroadcasters(t *testing.T, n int) ([]*mockBroadcaster, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	broadcasters := make([]*mockBroadcaster, n, n)
-	chans := make([]chan []byte, n, n)
+	broadcasters := make([]*mockBroadcaster, n)
+	chans := make([]chan []byte, n)
 	for i := range chans {
 		chans[i] = make(chan []byte, 300)
 		broadcasters[i] = &mockBroadcaster{
@@ -131,7 +131,10 @@ func (mb *mockBroadcaster) Broadcast(data []byte) error {
 			defer wg.Done()
 			// randomize when we send a little bit
 			if rand.Intn(100) < 30 {
-				time.Sleep(1)
+				// Sleep for a very small time that will
+				// effectively be pretty random
+				time.Sleep(time.Nanosecond)
+
 			}
 			timer := time.NewTimer(5 * time.Second)
 			defer timer.Stop()
@@ -263,7 +266,7 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 		replicaOpts[i].DAGSyncerTimeout = time.Second
 	}
 
-	replicas := make([]*Datastore, numReplicas, numReplicas)
+	replicas := make([]*Datastore, numReplicas)
 	for i := range replicas {
 		dagsync := &mockDAGSync{
 			DAGService:  dagserv,
@@ -695,7 +698,7 @@ func TestCRDTNamespaceClash(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	k = ds.NewKey("path")
-	ok, err := replicas[0].Has(k)
+	ok, _ := replicas[0].Has(k)
 	if ok {
 		t.Error("it should not have the key")
 	}

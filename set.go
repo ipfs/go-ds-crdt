@@ -158,10 +158,7 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 		case <-p.Closing():
 			return false
 		}
-		if r.Error != nil {
-			return false
-		}
-		return true
+		return r.Error == nil
 	}
 
 	// The code below is very inspired in the Query implementation in
@@ -484,10 +481,11 @@ func (s *set) Merge(d *pb.Delta, id string) error {
 	return s.putTombs(d.GetTombstones())
 }
 
-func (s *set) inElemsKeyID(key, id string) (bool, error) {
-	k := s.elemsPrefix(key).ChildString(id)
-	return s.store.Has(k)
-}
+// currently unused
+// func (s *set) inElemsKeyID(key, id string) (bool, error) {
+// 	k := s.elemsPrefix(key).ChildString(id)
+// 	return s.store.Has(k)
+// }
 
 func (s *set) inTombsKeyID(key, id string) (bool, error) {
 	k := s.tombsPrefix(key).ChildString(id)
@@ -518,7 +516,7 @@ func (s *set) datastoreSync(prefix ds.Key) error {
 		s.keyPrefix(keysNs).Child(prefix), // covers values and priorities
 	}
 
-	errs := make([]error, len(toSync), len(toSync))
+	errs := make([]error, len(toSync))
 
 	for i, k := range toSync {
 		if err := s.store.Sync(k); err != nil {
