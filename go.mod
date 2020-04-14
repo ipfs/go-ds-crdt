@@ -12,7 +12,7 @@ require (
 	github.com/ipfs/go-ipld-format v0.2.0
 	github.com/ipfs/go-log/v2 v2.0.2
 	github.com/ipfs/go-merkledag v0.3.1
-	github.com/jbenet/goprocess v0.1.3
+	github.com/jbenet/goprocess v0.1.4
 	github.com/libp2p/go-libp2p-pubsub v0.2.7
 	github.com/multiformats/go-multihash v0.0.13
 	github.com/pkg/errors v0.9.1
