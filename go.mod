@@ -6,7 +6,7 @@ require (
 	github.com/golang/protobuf v1.3.4
 	github.com/ipfs/go-cid v0.0.5
 	github.com/ipfs/go-datastore v0.4.4
-	github.com/ipfs/go-ds-badger v0.2.1
+	github.com/ipfs/go-ds-badger v0.2.4
 	github.com/ipfs/go-ipfs-blockstore v1.0.0
 	github.com/ipfs/go-ipfs-ds-help v1.0.0
 	github.com/ipfs/go-ipld-format v0.2.0
