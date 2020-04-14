@@ -23,10 +23,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	dshelp "github.com/ipfs/go-ipfs-ds-help"
 	"go.uber.org/multierr"
+	"google.golang.org/protobuf/proto"
 
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
@@ -359,7 +359,7 @@ func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
 	}
 
 	// Compatibility: before we were publishing CIDs direclty
-	msgReflect := proto.MessageReflect(&bcastData)
+	msgReflect := bcastData.ProtoReflect()
 	if len(msgReflect.GetUnknown()) > 0 {
 		store.logger.Warnf("backwards compatibility: parsing head as CID.", err)
 		// Backwards compatibility
