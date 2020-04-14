@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 
-	"github.com/gogo/protobuf/proto"
 	cid "github.com/ipfs/go-cid"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	dag "github.com/ipfs/go-merkledag"
+	"google.golang.org/protobuf/proto"
 )
 
 // IPLD related things
