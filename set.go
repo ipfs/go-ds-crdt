@@ -482,12 +482,12 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 }
 
 func (s *set) Merge(d *pb.Delta, id string) error {
-	err := s.putElems(d.GetElements(), id, d.GetPriority())
+	err := s.putTombs(d.GetTombstones())
 	if err != nil {
 		return err
 	}
 
-	return s.putTombs(d.GetTombstones())
+	return s.putElems(d.GetElements(), id, d.GetPriority())
 }
 
 // currently unused
