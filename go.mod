@@ -2,7 +2,7 @@ module github.com/ipfs/go-ds-crdt
 
 require (
 	github.com/dgraph-io/badger v1.6.1
-	github.com/golang/protobuf v1.4.0
+	github.com/golang/protobuf v1.4.1
 	github.com/ipfs/go-cid v0.0.5
 	github.com/ipfs/go-datastore v0.4.4
 	github.com/ipfs/go-ds-badger v0.2.4
