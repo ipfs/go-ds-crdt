@@ -341,7 +341,14 @@ func (s *set) setPriority(writeStore ds.Write, key string, prio uint64) error {
 
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
-func (s *set) setValue(writeStore ds.Write, key string, value []byte, prio uint64) error {
+func (s *set) setValue(writeStore ds.Write, key, id string, value []byte, prio uint64) error {
+	// If this key was tombstoned already, do not store/update the value
+	// at all.
+	deleted, err := s.inTombsKeyID(key, id)
+	if err != nil || deleted {
+		return err
+	}
+
 	curPrio, err := s.getPriority(key)
 	if err != nil {
 		return err
@@ -414,8 +421,10 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 			return err
 		}
 
-		// update the value if higher priority than we currently have.
-		err = s.setValue(store, key, e.GetValue(), prio)
+		// update the value if applicable:
+		// * higher priority than we currently have.
+		// * not tombstoned before.
+		err = s.setValue(store, key, id, e.GetValue(), prio)
 		if err != nil {
 			return err
 		}
