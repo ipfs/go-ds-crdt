@@ -361,12 +361,12 @@ func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
 	// Compatibility: before we were publishing CIDs direclty
 	msgReflect := bcastData.ProtoReflect()
 	if len(msgReflect.GetUnknown()) > 0 {
-		store.logger.Warnf("backwards compatibility: parsing head as CID.", err)
 		// Backwards compatibility
 		c, err := cid.Cast(msgReflect.GetUnknown())
 		if err != nil {
 			return nil, err
 		}
+		store.logger.Debugf("a legacy CID broadcast was received for: %s", c)
 		return []cid.Cid{c}, nil
 	}
 
