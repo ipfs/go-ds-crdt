@@ -90,10 +90,19 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 		}
 
 		id := strings.TrimPrefix(r.Key, prefix.String())
-		delta.Tombstones = append(delta.Tombstones, &pb.Element{
-			Key: key,
-			Id:  id,
-		})
+
+		// check if its already tombed, which case don't add it to the Rmv delta set
+		deleted, err := s.inTombsKeyID(key, id)
+		if err != nil {
+			return delta, err
+		}
+
+		if !deleted {
+			delta.Tombstones = append(delta.Tombstones, &pb.Element{
+				Key: key,
+				Id:  id,
+			})
+		}
 	}
 	return delta, nil
 }
