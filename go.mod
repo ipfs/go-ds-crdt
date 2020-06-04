@@ -16,7 +16,7 @@ require (
 	github.com/multiformats/go-multihash v0.0.13
 	github.com/pkg/errors v0.9.1
 	go.uber.org/multierr v1.5.0
-	google.golang.org/protobuf v1.23.0
+	google.golang.org/protobuf v1.24.0
 )
 
 go 1.13
