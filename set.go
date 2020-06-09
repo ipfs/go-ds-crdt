@@ -88,15 +88,22 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 		if r.Error != nil {
 			return delta, err
 		}
-
 		id := strings.TrimPrefix(r.Key, prefix.String())
+		if !ds.RawKey(id).IsTopLevel() {
+			// our prefix matches blocks from other keys i.e. our
+			// prefix is "hello" and we have a different key like
+			// "hello/bye" so we have a block id like
+			// "bye/<block>". If we got the right key, then the id
+			// should be the block id only.
+			continue
+		}
 
-		// check if its already tombed, which case don't add it to the Rmv delta set
+		// check if its already tombed, which case don't add it to the
+		// Rmv delta set.
 		deleted, err := s.inTombsKeyID(key, id)
 		if err != nil {
 			return delta, err
 		}
-
 		if !deleted {
 			delta.Tombstones = append(delta.Tombstones, &pb.Element{
 				Key: key,
@@ -275,7 +282,7 @@ func (s *set) inElemsNotTombstoned(key string) (bool, error) {
 		}
 
 		id := strings.TrimPrefix(r.Key, prefix.String())
-		if !ds.NewKey(id).IsTopLevel() {
+		if !ds.RawKey(id).IsTopLevel() {
 			// our prefix matches blocks from other keys i.e. our
 			// prefix is "hello" and we have a different key like
 			// "hello/bye" so we have a block id like
