@@ -247,7 +247,10 @@ func New(
 	}
 
 	set := newCRDTSet(store, fullSetNs, setPutHook, setDeleteHook)
-	heads := newHeads(store, fullHeadsNs, opts.Logger)
+	heads, err := newHeads(store, fullHeadsNs, opts.Logger)
+	if err != nil {
+		return nil, errors.Wrap(err, "error building heads")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 

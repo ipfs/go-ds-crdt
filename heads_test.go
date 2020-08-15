@@ -18,10 +18,13 @@ var headsTestNS = ds.NewKey("headstest")
 func newTestHeads(t *testing.T) *heads {
 	t.Helper()
 	store := dssync.MutexWrap(ds.NewMapDatastore())
-	heads := newHeads(store, headsTestNS, &testLogger{
+	heads, err := newHeads(store, headsTestNS, &testLogger{
 		name: t.Name(),
 		l:    DefaultOptions().Logger,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return heads
 }
 
@@ -44,7 +47,7 @@ func TestHeadsBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 	if l != 0 {
-		t.Errorf("new heads should have empty Len, got: %d", l)
+		t.Errorf("new heads should have Len==0, got: %d", l)
 	}
 
 	cidHeights := make(map[cid.Cid]uint64)
@@ -70,6 +73,22 @@ func TestHeadsBasic(t *testing.T) {
 		cidHeights[newC] = newHeight
 		assertHeads(t, heads, cidHeights)
 	}
+
+	// Now try creating a new heads object and make sure what we
+	// stored before is still there.
+	err = heads.store.Sync(headsTestNS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	heads, err = newHeads(heads.store, headsTestNS, &testLogger{
+		name: t.Name(),
+		l:    DefaultOptions().Logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHeads(t, heads, cidHeights)
 }
 
 func assertHeads(t *testing.T, hh *heads, cidHeights map[cid.Cid]uint64) {
