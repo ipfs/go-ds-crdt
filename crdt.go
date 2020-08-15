@@ -425,7 +425,10 @@ func (store *Datastore) rebroadcastHeads() {
 	store.seenHeadsMux.RUnlock()
 
 	// Send them out
-	store.broadcast(headsToBroadcast)
+	err = store.broadcast(headsToBroadcast)
+	if err != nil {
+		store.logger.Warn("broadcast failed: %v", err)
+	}
 
 	// Reset the map
 	store.seenHeadsMux.Lock()
@@ -608,7 +611,10 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		if known {
 			// we reached a non-head node in the known tree.
 			// This means our root block is a new head.
-			store.heads.Add(root, rootPrio)
+			err = store.heads.Add(root, rootPrio)
+			if err != nil {
+				return nil, errors.Wrapf(err, "error adding head %s", root)
+			}
 			continue
 		}
 
