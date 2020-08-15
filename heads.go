@@ -56,11 +56,7 @@ func (hh *heads) write(store ds.Write, c cid.Cid, height uint64) error {
 }
 
 func (hh *heads) delete(store ds.Write, c cid.Cid) error {
-	err := store.Delete(hh.key(c))
-	if err == ds.ErrNotFound {
-		return nil
-	}
-	return err
+	return store.Delete(hh.key(c))
 }
 
 // IsHead returns if a given cid is among the current heads.
