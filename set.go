@@ -117,7 +117,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 // Element retrieves the value of an element from the CRDT set.
 func (s *set) Element(key string) ([]byte, error) {
 	// We can only GET an element if it's part of the Set (in
-	// "elemements" and not in "tombstones").
+	// "elements" and not in "tombstones").
 
 	// As an optimization:
 	// * If the key has a value in the store it means:
@@ -402,7 +402,7 @@ func (s *set) setValue(writeStore ds.Write, key, id string, value []byte, prio u
 
 // putElems adds items to the "elems" set. It will also set current
 // values and priorities for each element. This needs to run in a lock,
-// as otherwise races may occurr when reading/writing the priorities, resulting
+// as otherwise races may occur when reading/writing the priorities, resulting
 // in bad behaviours.
 //
 // Technically the lock should only affect the keys that are being written,
@@ -519,7 +519,7 @@ func (s *set) inTombsKeyID(key, id string) (bool, error) {
 
 // currently unused
 // // inSet returns if the given cid/block is in elems and not in tombs (and
-// // thus, it is an elemement of the set).
+// // thus, it is an element of the set).
 // func (s *set) inSetKeyID(key, id string) (bool, error) {
 // 	inTombs, err := s.inTombsKeyID(key, id)
 // 	if err != nil {
