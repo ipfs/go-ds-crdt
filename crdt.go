@@ -613,7 +613,8 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			// This means our root block is a new head.
 			err = store.heads.Add(root, rootPrio)
 			if err != nil {
-				return nil, errors.Wrapf(err, "error adding head %s", root)
+				// Don't let this failure prevent us from processing the other links.
+				store.logger.Error(errors.Wrapf(err, "error adding head %s", root))
 			}
 			continue
 		}

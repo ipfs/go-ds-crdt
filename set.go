@@ -82,11 +82,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if results != nil {
-			_ = results.Close()
-		}
-	}()
+	defer results.Close()
 
 	for r := range results.Next() {
 		if r.Error != nil {
@@ -114,10 +110,6 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 				Id:  id,
 			})
 		}
-	}
-	err = results.Close()
-	if err != nil {
-		return nil, err
 	}
 	return delta, nil
 }
