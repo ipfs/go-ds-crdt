@@ -206,7 +206,7 @@ type dagJob struct {
 // the given prefix, but note that if other replicas are modifying the
 // datastore, the prefixes that will need syncing are not only those modified
 // by the local replica. Therefore the user should consider calling Sync("/"),
-// with an empty prefix, in that case, or use a synchronouse underlying
+// with an empty prefix, in that case, or use a synchronous underlying
 // datastore that persists things directly on write.
 //
 // The CRDT-Datastore should call Close() before the given store is closed.
@@ -358,7 +358,7 @@ func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
 		return nil, err
 	}
 
-	// Compatibility: before we were publishing CIDs direclty
+	// Compatibility: before we were publishing CIDs directly
 	msgReflect := bcastData.ProtoReflect()
 	if len(msgReflect.GetUnknown()) > 0 {
 		// Backwards compatibility
@@ -466,7 +466,7 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 	return nil
 }
 
-// dagWorker shouold run in its own gorountine. Workers are launched during
+// dagWorker should run in its own goroutine. Workers are launched during
 // initialization in New().
 func (store *Datastore) dagWorker() {
 	for job := range store.jobQueue {
@@ -498,7 +498,7 @@ func (store *Datastore) dagWorker() {
 	}
 }
 
-// sendNewJobs calls getDeltas (GetMany) on the crdtDAGService with the given
+// sendNewJobs calls getDeltas (GetMany) on the crdtNodeGetter with the given
 // children and sends each response to the workers. It will block until all
 // jobs have been queued.
 func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, children []cid.Cid) {
@@ -680,7 +680,7 @@ func (store *Datastore) Delete(key ds.Key) error {
 	}
 
 	if len(delta.Tombstones) == 0 {
-		return ds.ErrNotFound
+		return nil
 	}
 	return store.publish(delta)
 }
@@ -708,7 +708,7 @@ func (store *Datastore) Sync(prefix ds.Key) error {
 	// - each element has a datastore entry /setNamespace/elemsNamespace/<key>/<block_id>
 	// - each tomb has a datastore entry /setNamespace/tombsNamespace/<key>/<block_id>
 	// - each value has a datastore entry /setNamespace/keysNamespace/<key>/valueSuffix
-	// - each value has an additional priotity entry /setNamespace/keysNamespace/<key>/prioritySuffix
+	// - each value has an additional priority entry /setNamespace/keysNamespace/<key>/prioritySuffix
 	// - the last two are only written if the added entry has more priority than any the existing
 	// - For a value to not be lost, those entries should be fully synced.
 	// - In order to check if a value is in the set:
