@@ -86,7 +86,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 
 	for r := range results.Next() {
 		if r.Error != nil {
-			return delta, err
+			return nil, err
 		}
 		id := strings.TrimPrefix(r.Key, prefix.String())
 		if !ds.RawKey(id).IsTopLevel() {
@@ -102,7 +102,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 		// Rmv delta set.
 		deleted, err := s.inTombsKeyID(key, id)
 		if err != nil {
-			return delta, err
+			return nil, err
 		}
 		if !deleted {
 			delta.Tombstones = append(delta.Tombstones, &pb.Element{
