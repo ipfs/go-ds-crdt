@@ -86,14 +86,30 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 
 	for r := range results.Next() {
 		if r.Error != nil {
-			return delta, err
+			return nil, err
+		}
+		id := strings.TrimPrefix(r.Key, prefix.String())
+		if !ds.RawKey(id).IsTopLevel() {
+			// our prefix matches blocks from other keys i.e. our
+			// prefix is "hello" and we have a different key like
+			// "hello/bye" so we have a block id like
+			// "bye/<block>". If we got the right key, then the id
+			// should be the block id only.
+			continue
 		}
 
-		id := strings.TrimPrefix(r.Key, prefix.String())
-		delta.Tombstones = append(delta.Tombstones, &pb.Element{
-			Key: key,
-			Id:  id,
-		})
+		// check if its already tombed, which case don't add it to the
+		// Rmv delta set.
+		deleted, err := s.inTombsKeyID(key, id)
+		if err != nil {
+			return nil, err
+		}
+		if !deleted {
+			delta.Tombstones = append(delta.Tombstones, &pb.Element{
+				Key: key,
+				Id:  id,
+			})
+		}
 	}
 	return delta, nil
 }
@@ -101,7 +117,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 // Element retrieves the value of an element from the CRDT set.
 func (s *set) Element(key string) ([]byte, error) {
 	// We can only GET an element if it's part of the Set (in
-	// "elemements" and not in "tombstones").
+	// "elements" and not in "tombstones").
 
 	// As an optimization:
 	// * If the key has a value in the store it means:
@@ -266,7 +282,7 @@ func (s *set) inElemsNotTombstoned(key string) (bool, error) {
 		}
 
 		id := strings.TrimPrefix(r.Key, prefix.String())
-		if !ds.NewKey(id).IsTopLevel() {
+		if !ds.RawKey(id).IsTopLevel() {
 			// our prefix matches blocks from other keys i.e. our
 			// prefix is "hello" and we have a different key like
 			// "hello/bye" so we have a block id like
@@ -386,7 +402,7 @@ func (s *set) setValue(writeStore ds.Write, key, id string, value []byte, prio u
 
 // putElems adds items to the "elems" set. It will also set current
 // values and priorities for each element. This needs to run in a lock,
-// as otherwise races may occurr when reading/writing the priorities, resulting
+// as otherwise races may occur when reading/writing the priorities, resulting
 // in bad behaviours.
 //
 // Technically the lock should only affect the keys that are being written,
@@ -503,7 +519,7 @@ func (s *set) inTombsKeyID(key, id string) (bool, error) {
 
 // currently unused
 // // inSet returns if the given cid/block is in elems and not in tombs (and
-// // thus, it is an elemement of the set).
+// // thus, it is an element of the set).
 // func (s *set) inSetKeyID(key, id string) (bool, error) {
 // 	inTombs, err := s.inTombsKeyID(key, id)
 // 	if err != nil {
