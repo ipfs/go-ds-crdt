@@ -170,6 +170,8 @@ func (hh *heads) List() ([]cid.Cid, uint64, error) {
 	return heads, maxHeight, nil
 }
 
+// primeCache builds the heads cache based on what's in storage; since
+// it is called from the constructor only we don't bother locking.
 func (hh *heads) primeCache() (ret error) {
 	q := query.Query{
 		Prefix:   hh.namespace.String(),
@@ -196,11 +198,7 @@ func (hh *heads) primeCache() (ret error) {
 			return errors.New("error decoding height")
 		}
 
-		hh.cacheMux.Lock()
-		{
-			hh.cache[headCid] = height
-		}
-		hh.cacheMux.Unlock()
+		hh.cache[headCid] = height
 	}
 
 	return nil
