@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
@@ -16,34 +17,30 @@ import (
 
 // heads manages the current Merkle-CRDT heads.
 type heads struct {
-	store     ds.Datastore
+	store ds.Datastore
+	// cache contains the current contents of the store
+	cache     map[cid.Cid]uint64
+	cacheMux  sync.RWMutex
 	namespace ds.Key
 	logger    logging.StandardLogger
 }
 
-func newHeads(store ds.Datastore, namespace ds.Key, logger logging.StandardLogger) *heads {
-	return &heads{
+func newHeads(store ds.Datastore, namespace ds.Key, logger logging.StandardLogger) (*heads, error) {
+	hh := &heads{
 		store:     store,
 		namespace: namespace,
 		logger:    logger,
+		cache:     make(map[cid.Cid]uint64),
 	}
+	if err := hh.primeCache(); err != nil {
+		return nil, err
+	}
+	return hh, nil
 }
 
 func (hh *heads) key(c cid.Cid) ds.Key {
 	// /<namespace>/<cid>
 	return hh.namespace.Child(dshelp.MultihashToDsKey(c.Hash()))
-}
-
-func (hh *heads) load(c cid.Cid) (uint64, error) {
-	v, err := hh.store.Get(hh.key(c))
-	if err != nil {
-		return 0, err
-	}
-	height, n := binary.Uvarint(v)
-	if n <= 0 {
-		return 0, errors.New("error decoding height")
-	}
-	return height, nil
 }
 
 func (hh *heads) write(store ds.Write, c cid.Cid, height uint64) error {
@@ -68,25 +65,33 @@ func (hh *heads) delete(store ds.Write, c cid.Cid) error {
 
 // IsHead returns if a given cid is among the current heads.
 func (hh *heads) IsHead(c cid.Cid) (bool, uint64, error) {
-	height, err := hh.load(c)
-	if err == ds.ErrNotFound {
-		return false, 0, nil
+	var height uint64
+	var ok bool
+	hh.cacheMux.RLock()
+	{
+		height, ok = hh.cache[c]
 	}
-	return err == nil, height, err
+	hh.cacheMux.RUnlock()
+	return ok, height, nil
 }
 
 func (hh *heads) Len() (int, error) {
-	list, _, err := hh.List()
-	return len(list), err
+	var ret int
+	hh.cacheMux.RLock()
+	{
+		ret = len(hh.cache)
+	}
+	hh.cacheMux.RUnlock()
+	return ret, nil
 }
 
 // Replace replaces a head with a new cid.
 func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 	hh.logger.Infof("replacing DAG head: %s -> %s (new height: %d)", h, c, height)
 	var store ds.Write = hh.store
-	var err error
 
 	batchingDs, batching := store.(ds.Batching)
+	var err error
 	if batching {
 		store, err = batchingDs.Batch()
 		if err != nil {
@@ -99,9 +104,19 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 		return err
 	}
 
+	hh.cacheMux.Lock()
+	defer hh.cacheMux.Unlock()
+
+	if !batching {
+		hh.cache[c] = height
+	}
+
 	err = hh.delete(store, h)
 	if err != nil {
 		return err
+	}
+	if !batching {
+		delete(hh.cache, h)
 	}
 
 	if batching {
@@ -109,48 +124,43 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 		if err != nil {
 			return err
 		}
+		delete(hh.cache, h)
+		hh.cache[c] = height
 	}
 	return nil
 }
 
 func (hh *heads) Add(c cid.Cid, height uint64) error {
 	hh.logger.Infof("adding new DAG head: %s (height: %d)", c, height)
-	return hh.write(hh.store, c, height)
+	if err := hh.write(hh.store, c, height); err != nil {
+		return err
+	}
+
+	hh.cacheMux.Lock()
+	{
+		hh.cache[c] = height
+	}
+	hh.cacheMux.Unlock()
+	return nil
 }
 
 // List returns the list of current heads plus the max height.
 func (hh *heads) List() ([]cid.Cid, uint64, error) {
-	q := query.Query{
-		Prefix:   hh.namespace.String(),
-		KeysOnly: false,
-	}
-
-	results, err := hh.store.Query(q)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer results.Close()
-
-	heads := make([]cid.Cid, 0)
 	var maxHeight uint64
-	for r := range results.Next() {
-		if r.Error != nil {
-			return nil, 0, r.Error
-		}
-		headKey := ds.NewKey(strings.TrimPrefix(r.Key, hh.namespace.String()))
-		headCid, err := dshelp.DsKeyToCidV1(headKey, cid.DagProtobuf)
-		if err != nil {
-			return nil, 0, err
-		}
-		height, n := binary.Uvarint(r.Value)
-		if n <= 0 {
-			return nil, 0, errors.New("error decocding height")
-		}
-		heads = append(heads, headCid)
-		if height > maxHeight {
-			maxHeight = height
+	var heads []cid.Cid
+
+	hh.cacheMux.RLock()
+	{
+		heads = make([]cid.Cid, 0, len(hh.cache))
+		for head, height := range hh.cache {
+			heads = append(heads, head)
+			if height > maxHeight {
+				maxHeight = height
+			}
 		}
 	}
+	hh.cacheMux.RUnlock()
+
 	sort.Slice(heads, func(i, j int) bool {
 		ci := heads[i].Bytes()
 		cj := heads[j].Bytes()
@@ -158,4 +168,38 @@ func (hh *heads) List() ([]cid.Cid, uint64, error) {
 	})
 
 	return heads, maxHeight, nil
+}
+
+// primeCache builds the heads cache based on what's in storage; since
+// it is called from the constructor only we don't bother locking.
+func (hh *heads) primeCache() (ret error) {
+	q := query.Query{
+		Prefix:   hh.namespace.String(),
+		KeysOnly: false,
+	}
+
+	results, err := hh.store.Query(q)
+	if err != nil {
+		return err
+	}
+	defer results.Close()
+
+	for r := range results.Next() {
+		if r.Error != nil {
+			return r.Error
+		}
+		headKey := ds.NewKey(strings.TrimPrefix(r.Key, hh.namespace.String()))
+		headCid, err := dshelp.DsKeyToCidV1(headKey, cid.DagProtobuf)
+		if err != nil {
+			return err
+		}
+		height, n := binary.Uvarint(r.Value)
+		if n <= 0 {
+			return errors.New("error decoding height")
+		}
+
+		hh.cache[headCid] = height
+	}
+
+	return nil
 }
