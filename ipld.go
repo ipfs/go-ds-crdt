@@ -100,5 +100,7 @@ func makeNode(delta *pb.Delta, heads []cid.Cid) (ipld.Node, error) {
 			return nil, err
 		}
 	}
+	// Ensure we work with CIDv1
+	nd.SetCidBuilder(dag.V1CidPrefix())
 	return nd, nil
 }
