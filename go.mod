@@ -2,7 +2,7 @@ module github.com/ipfs/go-ds-crdt
 
 require (
 	github.com/dgraph-io/badger v1.6.2
-	github.com/golang/protobuf v1.4.3
+	github.com/golang/protobuf v1.5.1
 	github.com/ipfs/go-cid v0.0.7
 	github.com/ipfs/go-datastore v0.4.5
 	github.com/ipfs/go-ds-badger v0.2.6
@@ -16,7 +16,8 @@ require (
 	github.com/multiformats/go-multihash v0.0.14
 	github.com/pkg/errors v0.9.1
 	go.uber.org/multierr v1.6.0
-	google.golang.org/protobuf v1.25.0
+	google.golang.org/genproto v0.0.0-20200526211855-cb27e3aa2013 // indirect
+	google.golang.org/protobuf v1.26.0
 )
 
 go 1.15
