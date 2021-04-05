@@ -13,7 +13,7 @@ require (
 	github.com/ipfs/go-merkledag v0.3.2
 	github.com/jbenet/goprocess v0.1.4
 	github.com/libp2p/go-libp2p-pubsub v0.4.1
-	github.com/multiformats/go-multihash v0.0.14
+	github.com/multiformats/go-multihash v0.0.15
 	github.com/pkg/errors v0.9.1
 	go.uber.org/multierr v1.6.0
 	google.golang.org/protobuf v1.25.0
