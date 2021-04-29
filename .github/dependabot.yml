@@ -1,0 +1,16 @@
+version: 2
+updates:
+- package-ecosystem: gomod
+  directory: "/"
+  schedule:
+    interval: weekly
+    time: "11:00"
+  open-pull-requests-limit: 10
+  target-branch: dependency-upgrades
+  ignore:
+  - dependency-name: github.com/golang/protobuf
+    versions:
+    - 1.5.1
+  - dependency-name: github.com/ipfs/go-log/v2
+    versions:
+    - 2.1.2
