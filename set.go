@@ -58,7 +58,7 @@ func newCRDTSet(
 func (s *set) Add(key string, value []byte) *pb.Delta {
 	return &pb.Delta{
 		Elements: []*pb.Element{
-			&pb.Element{
+			{
 				Key:   key,
 				Value: value,
 			},
