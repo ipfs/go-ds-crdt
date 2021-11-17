@@ -3,6 +3,7 @@
 package crdt
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 )
 
 func TestDatastoreSuite(t *testing.T) {
+	ctx := context.Background()
+
 	numReplicasOld := numReplicas
 	numReplicas = 1
 	defer func() {
@@ -25,7 +28,7 @@ func TestDatastoreSuite(t *testing.T) {
 
 	for _, r := range replicas {
 		q := query.Query{KeysOnly: true}
-		results, err := r.Query(q)
+		results, err := r.Query(ctx, q)
 		if err != nil {
 			t.Fatal(err)
 		}

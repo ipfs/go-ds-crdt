@@ -2,14 +2,16 @@ package crdt
 
 import (
 	"bytes"
-	"github.com/ipfs/go-cid"
-	ds "github.com/ipfs/go-datastore"
-	dssync "github.com/ipfs/go-datastore/sync"
-	"github.com/multiformats/go-multihash"
+	"context"
 	"math/rand"
 	"reflect"
 	"sort"
 	"testing"
+
+	"github.com/ipfs/go-cid"
+	ds "github.com/ipfs/go-datastore"
+	dssync "github.com/ipfs/go-datastore/sync"
+	"github.com/multiformats/go-multihash"
 )
 
 var headsTestNS = ds.NewKey("headstest")
@@ -41,6 +43,8 @@ func newCID(t *testing.T) cid.Cid {
 }
 
 func TestHeadsBasic(t *testing.T) {
+	ctx := context.Background()
+
 	heads := newTestHeads(t)
 	l, err := heads.Len()
 	if err != nil {
@@ -55,7 +59,7 @@ func TestHeadsBasic(t *testing.T) {
 	for i := 0; i < numHeads; i++ {
 		c, height := newCID(t), uint64(rand.Int())
 		cidHeights[c] = height
-		err := heads.Add(c, height)
+		err := heads.Add(ctx, c, height)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -65,7 +69,7 @@ func TestHeadsBasic(t *testing.T) {
 
 	for c := range cidHeights {
 		newC, newHeight := newCID(t), uint64(rand.Int())
-		err := heads.Replace(c, newC, newHeight)
+		err := heads.Replace(ctx, c, newC, newHeight)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -76,7 +80,7 @@ func TestHeadsBasic(t *testing.T) {
 
 	// Now try creating a new heads object and make sure what we
 	// stored before is still there.
-	err = heads.store.Sync(headsTestNS)
+	err = heads.store.Sync(ctx, headsTestNS)
 	if err != nil {
 		t.Fatal(err)
 	}
