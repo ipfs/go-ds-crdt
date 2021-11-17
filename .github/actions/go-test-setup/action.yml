@@ -1,0 +1,9 @@
+name: extend-tests-timeout
+description: add -timeout 20m flag to GOFLAGS to extend timeout for tests
+
+runs:
+  using: "composite"
+  steps:
+    - name: Extend timeout for tests
+      shell: bash
+      run: echo "GOFLAGS=$GOFLAGS -timeout=20m" >> $GITHUB_ENV
