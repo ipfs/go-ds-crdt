@@ -1,6 +1,6 @@
 module github.com/ipfs/go-ds-crdt/examples/globaldb
 
-go 1.12
+go 1.16
 
 require (
 	github.com/hsanjuan/ipfs-lite v1.1.6
