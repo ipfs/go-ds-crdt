@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"sort"
@@ -32,7 +33,7 @@ func newHeads(store ds.Datastore, namespace ds.Key, logger logging.StandardLogge
 		logger:    logger,
 		cache:     make(map[cid.Cid]uint64),
 	}
-	if err := hh.primeCache(); err != nil {
+	if err := hh.primeCache(context.Background()); err != nil {
 		return nil, err
 	}
 	return hh, nil
@@ -43,17 +44,17 @@ func (hh *heads) key(c cid.Cid) ds.Key {
 	return hh.namespace.Child(dshelp.MultihashToDsKey(c.Hash()))
 }
 
-func (hh *heads) write(store ds.Write, c cid.Cid, height uint64) error {
+func (hh *heads) write(ctx context.Context, store ds.Write, c cid.Cid, height uint64) error {
 	buf := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutUvarint(buf, height)
 	if n == 0 {
 		return errors.New("error encoding height")
 	}
-	return store.Put(hh.key(c), buf[0:n])
+	return store.Put(ctx, hh.key(c), buf[0:n])
 }
 
-func (hh *heads) delete(store ds.Write, c cid.Cid) error {
-	err := store.Delete(hh.key(c))
+func (hh *heads) delete(ctx context.Context, store ds.Write, c cid.Cid) error {
+	err := store.Delete(ctx, hh.key(c))
 	// The go-datastore API currently says Delete doesn't return
 	// ErrNotFound, but it used to say otherwise.  Leave this
 	// here to be safe.
@@ -86,20 +87,20 @@ func (hh *heads) Len() (int, error) {
 }
 
 // Replace replaces a head with a new cid.
-func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
+func (hh *heads) Replace(ctx context.Context, h, c cid.Cid, height uint64) error {
 	hh.logger.Infof("replacing DAG head: %s -> %s (new height: %d)", h, c, height)
 	var store ds.Write = hh.store
 
 	batchingDs, batching := store.(ds.Batching)
 	var err error
 	if batching {
-		store, err = batchingDs.Batch()
+		store, err = batchingDs.Batch(ctx)
 		if err != nil {
 			return err
 		}
 	}
 
-	err = hh.write(store, c, height)
+	err = hh.write(ctx, store, c, height)
 	if err != nil {
 		return err
 	}
@@ -111,7 +112,7 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 		hh.cache[c] = height
 	}
 
-	err = hh.delete(store, h)
+	err = hh.delete(ctx, store, h)
 	if err != nil {
 		return err
 	}
@@ -120,7 +121,7 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 	}
 
 	if batching {
-		err := store.(ds.Batch).Commit()
+		err := store.(ds.Batch).Commit(ctx)
 		if err != nil {
 			return err
 		}
@@ -130,9 +131,9 @@ func (hh *heads) Replace(h, c cid.Cid, height uint64) error {
 	return nil
 }
 
-func (hh *heads) Add(c cid.Cid, height uint64) error {
+func (hh *heads) Add(ctx context.Context, c cid.Cid, height uint64) error {
 	hh.logger.Infof("adding new DAG head: %s (height: %d)", c, height)
-	if err := hh.write(hh.store, c, height); err != nil {
+	if err := hh.write(ctx, hh.store, c, height); err != nil {
 		return err
 	}
 
@@ -172,13 +173,13 @@ func (hh *heads) List() ([]cid.Cid, uint64, error) {
 
 // primeCache builds the heads cache based on what's in storage; since
 // it is called from the constructor only we don't bother locking.
-func (hh *heads) primeCache() (ret error) {
+func (hh *heads) primeCache(ctx context.Context) (ret error) {
 	q := query.Query{
 		Prefix:   hh.namespace.String(),
 		KeysOnly: false,
 	}
 
-	results, err := hh.store.Query(q)
+	results, err := hh.store.Query(ctx, q)
 	if err != nil {
 		return err
 	}

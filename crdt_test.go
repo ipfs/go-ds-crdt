@@ -309,10 +309,11 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 }
 
 func TestCRDT(t *testing.T) {
+	ctx := context.Background()
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
 	k := ds.NewKey("hi")
-	err := replicas[0].Put(k, []byte("hola"))
+	err := replicas[0].Put(ctx, k, []byte("hola"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +321,7 @@ func TestCRDT(t *testing.T) {
 	time.Sleep(time.Second)
 
 	for _, r := range replicas {
-		v, err := r.Get(k)
+		v, err := r.Get(ctx, k)
 		if err != nil {
 			t.Error(err)
 		}
@@ -331,6 +332,7 @@ func TestCRDT(t *testing.T) {
 }
 
 func TestCRDTReplication(t *testing.T) {
+	ctx := context.Background()
 	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
@@ -341,7 +343,7 @@ func TestCRDTReplication(t *testing.T) {
 		k := ds.RandomKey()
 		v := []byte(fmt.Sprintf("%d", i))
 		n := rand.Intn(len(replicas))
-		err := replicas[n].Put(k, v)
+		err := replicas[n].Put(ctx, k, v)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -353,7 +355,7 @@ func TestCRDTReplication(t *testing.T) {
 	q := query.Query{
 		KeysOnly: true,
 	}
-	results, err := replicas[0].Query(q)
+	results, err := replicas[0].Query(ctx, q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +371,7 @@ func TestCRDTReplication(t *testing.T) {
 	// make sure each item has arrived to every replica
 	for _, res := range rest {
 		for _, r := range replicas {
-			ok, err := r.Has(ds.NewKey(res.Key))
+			ok, err := r.Has(ctx, ds.NewKey(res.Key))
 			if err != nil {
 				t.Error(err)
 			}
@@ -382,7 +384,7 @@ func TestCRDTReplication(t *testing.T) {
 	// give a new value for each item
 	for _, r := range rest {
 		n := rand.Intn(len(replicas))
-		err := replicas[n].Put(ds.NewKey(r.Key), []byte("hola"))
+		err := replicas[n].Put(ctx, ds.NewKey(r.Key), []byte("hola"))
 		if err != nil {
 			t.Error(err)
 		}
@@ -391,7 +393,7 @@ func TestCRDTReplication(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// query everything again
-	results, err = replicas[0].Query(q)
+	results, err = replicas[0].Query(ctx, q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +407,7 @@ func TestCRDTReplication(t *testing.T) {
 		}
 		k := ds.NewKey(r.Key)
 		for i, r := range replicas {
-			v, err := r.Get(k)
+			v, err := r.Get(ctx, k)
 			if err != nil {
 				t.Error(err)
 			}
@@ -442,6 +444,7 @@ func TestCRDTReplication(t *testing.T) {
 // If key priority rules are respected, the "last" update emitted for the key
 // K (which could have come from any replica) should take place everywhere.
 func TestCRDTPriority(t *testing.T) {
+	ctx := context.Background()
 	nItems := 50
 
 	replicas, closeReplicas := makeReplicas(t, nil)
@@ -455,7 +458,7 @@ func TestCRDTPriority(t *testing.T) {
 		go func(r *Datastore, i int) {
 			defer wg.Done()
 			for j := 0; j < nItems; j++ {
-				err := r.Put(k, []byte(fmt.Sprintf("r#%d", i)))
+				err := r.Put(ctx, k, []byte(fmt.Sprintf("r#%d", i)))
 				if err != nil {
 					t.Error(err)
 				}
@@ -467,7 +470,7 @@ func TestCRDTPriority(t *testing.T) {
 	var v, lastv []byte
 	var err error
 	for i, r := range replicas {
-		v, err = r.Get(k)
+		v, err = r.Get(ctx, k)
 		if err != nil {
 			t.Error(err)
 		}
@@ -478,7 +481,7 @@ func TestCRDTPriority(t *testing.T) {
 		lastv = v
 	}
 
-	err = replicas[0].Put(k, []byte("final value"))
+	err = replicas[0].Put(ctx, k, []byte("final value"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +489,7 @@ func TestCRDTPriority(t *testing.T) {
 	time.Sleep(1000 * time.Millisecond)
 
 	for i, r := range replicas {
-		v, err := r.Get(k)
+		v, err := r.Get(ctx, k)
 		if err != nil {
 			t.Error(err)
 		}
@@ -501,6 +504,7 @@ func TestCRDTPriority(t *testing.T) {
 }
 
 func TestCRDTCatchUp(t *testing.T) {
+	ctx := context.Background()
 	nItems := 50
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -512,7 +516,7 @@ func TestCRDTCatchUp(t *testing.T) {
 	// this items will not get to anyone
 	for i := 0; i < nItems; i++ {
 		k := ds.RandomKey()
-		err := r.Put(k, nil)
+		err := r.Put(ctx, k, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -522,14 +526,14 @@ func TestCRDTCatchUp(t *testing.T) {
 	br.dropProb = 0
 
 	// this message will get to everyone
-	err := r.Put(ds.RandomKey(), nil)
+	err := r.Put(ctx, ds.RandomKey(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 	q := query.Query{KeysOnly: true}
-	results, err := replicas[0].Query(q)
+	results, err := replicas[0].Query(ctx, q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,6 +548,8 @@ func TestCRDTCatchUp(t *testing.T) {
 }
 
 func TestCRDTPrintDAG(t *testing.T) {
+	ctx := context.Background()
+
 	nItems := 5
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -551,7 +557,7 @@ func TestCRDTPrintDAG(t *testing.T) {
 	// this items will not get to anyone
 	for i := 0; i < nItems; i++ {
 		k := ds.RandomKey()
-		err := replicas[0].Put(k, nil)
+		err := replicas[0].Put(ctx, k, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -563,6 +569,8 @@ func TestCRDTPrintDAG(t *testing.T) {
 }
 
 func TestCRDTHooks(t *testing.T) {
+	ctx := context.Background()
+
 	var put int64
 	var deleted int64
 
@@ -578,12 +586,12 @@ func TestCRDTHooks(t *testing.T) {
 	defer closeReplicas()
 
 	k := ds.RandomKey()
-	err := replicas[0].Put(k, nil)
+	err := replicas[0].Put(ctx, k, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = replicas[0].Delete(k)
+	err = replicas[0].Delete(ctx, k)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,70 +605,74 @@ func TestCRDTHooks(t *testing.T) {
 }
 
 func TestCRDTBatch(t *testing.T) {
+	ctx := context.Background()
+
 	opts := DefaultOptions()
 	opts.MaxBatchDeltaSize = 500 // bytes
 
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
-	btch, err := replicas[0].Batch()
+	btch, err := replicas[0].Batch(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// This should be batched
 	k := ds.RandomKey()
-	err = btch.Put(k, make([]byte, 200))
+	err = btch.Put(ctx, k, make([]byte, 200))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := replicas[0].Get(k); err != ds.ErrNotFound {
+	if _, err := replicas[0].Get(ctx, k); err != ds.ErrNotFound {
 		t.Fatal("should not have commited the batch")
 	}
 
 	k2 := ds.RandomKey()
-	err = btch.Put(k2, make([]byte, 400))
+	err = btch.Put(ctx, k2, make([]byte, 400))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := replicas[0].Get(k2); err != nil {
+	if _, err := replicas[0].Get(ctx, k2); err != nil {
 		t.Fatal("should have commited the batch: delta size was over threshold")
 	}
 
-	err = btch.Delete(k)
+	err = btch.Delete(ctx, k)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := replicas[0].Get(k); err != nil {
+	if _, err := replicas[0].Get(ctx, k); err != nil {
 		t.Fatal("should not have committed the batch")
 	}
 
-	err = btch.Commit()
+	err = btch.Commit(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(100 * time.Millisecond)
 	for _, r := range replicas {
-		if _, err := r.Get(k); err != ds.ErrNotFound {
+		if _, err := r.Get(ctx, k); err != ds.ErrNotFound {
 			t.Error("k should have been deleted everywhere")
 		}
-		if _, err := r.Get(k2); err != nil {
+		if _, err := r.Get(ctx, k2); err != nil {
 			t.Error("k2 should be everywhere")
 		}
 	}
 }
 
 func TestCRDTNamespaceClash(t *testing.T) {
+	ctx := context.Background()
+
 	opts := DefaultOptions()
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
 	k := ds.NewKey("path/to/something")
-	err := replicas[0].Put(k, nil)
+	err := replicas[0].Put(ctx, k, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,22 +680,22 @@ func TestCRDTNamespaceClash(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	k = ds.NewKey("path")
-	ok, _ := replicas[0].Has(k)
+	ok, _ := replicas[0].Has(ctx, k)
 	if ok {
 		t.Error("it should not have the key")
 	}
 
-	_, err = replicas[0].Get(k)
+	_, err = replicas[0].Get(ctx, k)
 	if err != ds.ErrNotFound {
 		t.Error("should return err not found")
 	}
 
-	err = replicas[0].Put(k, []byte("hello"))
+	err = replicas[0].Put(ctx, k, []byte("hello"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	v, err := replicas[0].Get(k)
+	v, err := replicas[0].Get(ctx, k)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,12 +703,12 @@ func TestCRDTNamespaceClash(t *testing.T) {
 		t.Error("wrong value read from database")
 	}
 
-	err = replicas[0].Delete(ds.NewKey("path/to/something"))
+	err = replicas[0].Delete(ctx, ds.NewKey("path/to/something"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	v, err = replicas[0].Get(k)
+	v, err = replicas[0].Get(ctx, k)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,6 +716,8 @@ func TestCRDTNamespaceClash(t *testing.T) {
 		t.Error("wrong value read from database")
 	}
 }
+
+var _ ds.Datastore = (*syncedTrackDs)(nil)
 
 type syncedTrackDs struct {
 	ds.Datastore
@@ -711,9 +725,9 @@ type syncedTrackDs struct {
 	set   *set
 }
 
-func (st *syncedTrackDs) Sync(k ds.Key) error {
+func (st *syncedTrackDs) Sync(ctx context.Context, k ds.Key) error {
 	st.syncs[k] = struct{}{}
-	return st.Datastore.Sync(k)
+	return st.Datastore.Sync(ctx, k)
 }
 
 func (st *syncedTrackDs) isSynced(k ds.Key) bool {
@@ -740,6 +754,8 @@ func (st *syncedTrackDs) isSynced(k ds.Key) bool {
 }
 
 func TestCRDTSync(t *testing.T) {
+	ctx := context.Background()
+
 	opts := DefaultOptions()
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
@@ -755,22 +771,22 @@ func TestCRDTSync(t *testing.T) {
 	k2 := ds.NewKey("/hello")
 	k3 := ds.NewKey("/hell")
 
-	err := replicas[0].Put(k1, []byte("value1"))
+	err := replicas[0].Put(ctx, k1, []byte("value1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = replicas[0].Put(k2, []byte("value2"))
+	err = replicas[0].Put(ctx, k2, []byte("value2"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = replicas[0].Put(k3, []byte("value3"))
+	err = replicas[0].Put(ctx, k3, []byte("value3"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = replicas[0].Sync(ds.NewKey("/hello"))
+	err = replicas[0].Sync(ctx, ds.NewKey("/hello"))
 	if err != nil {
 		t.Fatal(err)
 	}

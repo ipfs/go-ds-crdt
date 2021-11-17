@@ -566,7 +566,7 @@ func (store *Datastore) sendJobWorker() {
 func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
 	// merge the delta
 	current := node.Cid()
-	err := store.set.Merge(delta, dshelp.MultihashToDsKey(current.Hash()).String())
+	err := store.set.Merge(store.ctx, delta, dshelp.MultihashToDsKey(current.Hash()).String())
 	if err != nil {
 		return nil, errors.Wrapf(err, "error merging delta from %s", current)
 	}
@@ -579,7 +579,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 
 	links := node.Links()
 	if len(links) == 0 { // we reached the bottom, we are a leaf.
-		err := store.heads.Add(root, rootPrio)
+		err := store.heads.Add(store.ctx, root, rootPrio)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error adding head %s", root)
 		}
@@ -599,7 +599,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		if isHead {
 			// reached one of the current heads. Replace it with
 			// the tip of this branch
-			err := store.heads.Replace(child, root, rootPrio)
+			err := store.heads.Replace(store.ctx, child, root, rootPrio)
 			if err != nil {
 				return nil, errors.Wrapf(err, "error replacing head: %s->%s", child, root)
 			}
@@ -614,7 +614,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		if known {
 			// we reached a non-head node in the known tree.
 			// This means our root block is a new head.
-			err = store.heads.Add(root, rootPrio)
+			err = store.heads.Add(store.ctx, root, rootPrio)
 			if err != nil {
 				// Don't let this failure prevent us from processing the other links.
 				store.logger.Error(errors.Wrapf(err, "error adding head %s", root))
@@ -630,23 +630,23 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 
 // Get retrieves the object `value` named by `key`.
 // Get will return ErrNotFound if the key is not mapped to a value.
-func (store *Datastore) Get(key ds.Key) (value []byte, err error) {
-	return store.set.Element(key.String())
+func (store *Datastore) Get(ctx context.Context, key ds.Key) (value []byte, err error) {
+	return store.set.Element(ctx, key.String())
 }
 
 // Has returns whether the `key` is mapped to a `value`.
 // In some contexts, it may be much cheaper only to check for existence of
 // a value, rather than retrieving the value itself. (e.g. HTTP HEAD).
 // The default implementation is found in `GetBackedHas`.
-func (store *Datastore) Has(key ds.Key) (exists bool, err error) {
-	return store.set.InSet(key.String())
+func (store *Datastore) Has(ctx context.Context, key ds.Key) (exists bool, err error) {
+	return store.set.InSet(ctx, key.String())
 }
 
 // GetSize returns the size of the `value` named by `key`.
 // In some contexts, it may be much cheaper to only get the size of the
 // value rather than retrieving the value itself.
-func (store *Datastore) GetSize(key ds.Key) (size int, err error) {
-	return ds.GetBackedSize(store, key)
+func (store *Datastore) GetSize(ctx context.Context, key ds.Key) (size int, err error) {
+	return ds.GetBackedSize(ctx, store, key)
 }
 
 // Query searches the datastore and returns a query result. This function
@@ -661,8 +661,8 @@ func (store *Datastore) GetSize(key ds.Key) (size int, err error) {
 //   entries, _ := result.Rest()
 //   for entry := range entries { ... }
 //
-func (store *Datastore) Query(q query.Query) (query.Results, error) {
-	qr, err := store.set.Elements(q)
+func (store *Datastore) Query(ctx context.Context, q query.Query) (query.Results, error) {
+	qr, err := store.set.Elements(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -670,14 +670,14 @@ func (store *Datastore) Query(q query.Query) (query.Results, error) {
 }
 
 // Put stores the object `value` named by `key`.
-func (store *Datastore) Put(key ds.Key, value []byte) error {
-	delta := store.set.Add(key.String(), value)
+func (store *Datastore) Put(ctx context.Context, key ds.Key, value []byte) error {
+	delta := store.set.Add(ctx, key.String(), value)
 	return store.publish(delta)
 }
 
 // Delete removes the value for given `key`.
-func (store *Datastore) Delete(key ds.Key) error {
-	delta, err := store.set.Rmv(key.String())
+func (store *Datastore) Delete(ctx context.Context, key ds.Key) error {
+	delta, err := store.set.Rmv(ctx, key.String())
 	if err != nil {
 		return err
 	}
@@ -690,7 +690,7 @@ func (store *Datastore) Delete(key ds.Key) error {
 
 // Sync ensures that all the data under the given prefix is flushed to disk in
 // the underlying datastore.
-func (store *Datastore) Sync(prefix ds.Key) error {
+func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 	// This is a quick write up of the internals from the time when
 	// I was thinking many underlying datastore entries are affected when
 	// an add operation happens:
@@ -723,13 +723,13 @@ func (store *Datastore) Sync(prefix ds.Key) error {
 
 	// Be safe and just sync everything in our namespace
 	if prefix.String() == "/" {
-		return store.store.Sync(store.namespace)
+		return store.store.Sync(ctx, store.namespace)
 	}
 
 	// attempt to be intelligent and sync only all heads and the
 	// set entries related to the given prefix.
-	err := store.set.datastoreSync(prefix)
-	err2 := store.store.Sync(store.heads.namespace)
+	err := store.set.datastoreSync(ctx, prefix)
+	err2 := store.store.Sync(ctx, store.heads.namespace)
 	return multierr.Combine(err, err2)
 }
 
@@ -743,8 +743,8 @@ func (store *Datastore) Close() error {
 // Batch implements batching for writes by accumulating
 // Put and Delete in the same CRDT-delta and only applying it and
 // broadcasting it on Commit().
-func (store *Datastore) Batch() (ds.Batch, error) {
-	return &batch{store: store}, nil
+func (store *Datastore) Batch(ctx context.Context) (ds.Batch, error) {
+	return &batch{ctx: ctx, store: store}, nil
 }
 
 func deltaMerge(d1, d2 *pb.Delta) *pb.Delta {
@@ -760,14 +760,14 @@ func deltaMerge(d1, d2 *pb.Delta) *pb.Delta {
 }
 
 // returns delta size and error
-func (store *Datastore) addToDelta(key string, value []byte) (int, error) {
-	return store.updateDelta(store.set.Add(key, value)), nil
+func (store *Datastore) addToDelta(ctx context.Context, key string, value []byte) (int, error) {
+	return store.updateDelta(store.set.Add(ctx, key, value)), nil
 
 }
 
 // returns delta size and error
-func (store *Datastore) rmvToDelta(key string) (int, error) {
-	delta, err := store.set.Rmv(key)
+func (store *Datastore) rmvToDelta(ctx context.Context, key string) (int, error) {
+	delta, err := store.set.Rmv(ctx, key)
 	if err != nil {
 		return 0, err
 	}
@@ -907,34 +907,35 @@ func (store *Datastore) broadcast(cids []cid.Cid) error {
 }
 
 type batch struct {
+	ctx   context.Context
 	store *Datastore
 }
 
-func (b *batch) Put(key ds.Key, value []byte) error {
-	size, err := b.store.addToDelta(key.String(), value)
+func (b *batch) Put(ctx context.Context, key ds.Key, value []byte) error {
+	size, err := b.store.addToDelta(ctx, key.String(), value)
 	if err != nil {
 		return err
 	}
 	if size > b.store.opts.MaxBatchDeltaSize {
 		b.store.logger.Warn("delta size over MaxBatchDeltaSize. Commiting.")
-		return b.Commit()
+		return b.Commit(ctx)
 	}
 	return nil
 }
 
-func (b *batch) Delete(key ds.Key) error {
-	size, err := b.store.rmvToDelta(key.String())
+func (b *batch) Delete(ctx context.Context, key ds.Key) error {
+	size, err := b.store.rmvToDelta(ctx, key.String())
 	if err != nil {
 		return err
 	}
 	if size > b.store.opts.MaxBatchDeltaSize {
 		b.store.logger.Warn("delta size over MaxBatchDeltaSize. Commiting.")
-		return b.Commit()
+		return b.Commit(ctx)
 	}
 	return nil
 }
 
-func (b *batch) Commit() error {
+func (b *batch) Commit(ctx context.Context) error {
 	return b.store.publishDelta()
 }
 

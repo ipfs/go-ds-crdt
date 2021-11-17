@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"strings"
@@ -55,7 +56,7 @@ func newCRDTSet(
 }
 
 // Add returns a new delta-set adding the given key/value.
-func (s *set) Add(key string, value []byte) *pb.Delta {
+func (s *set) Add(ctx context.Context, key string, value []byte) *pb.Delta {
 	return &pb.Delta{
 		Elements: []*pb.Element{
 			{
@@ -68,7 +69,7 @@ func (s *set) Add(key string, value []byte) *pb.Delta {
 }
 
 // Rmv returns a new delta-set removing the given key.
-func (s *set) Rmv(key string) (*pb.Delta, error) {
+func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 	delta := &pb.Delta{}
 
 	// /namespace/<key>/elements
@@ -78,7 +79,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 		KeysOnly: true,
 	}
 
-	results, err := s.store.Query(q)
+	results, err := s.store.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +101,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 
 		// check if its already tombed, which case don't add it to the
 		// Rmv delta set.
-		deleted, err := s.inTombsKeyID(key, id)
+		deleted, err := s.inTombsKeyID(ctx, key, id)
 		if err != nil {
 			return nil, err
 		}
@@ -115,7 +116,7 @@ func (s *set) Rmv(key string) (*pb.Delta, error) {
 }
 
 // Element retrieves the value of an element from the CRDT set.
-func (s *set) Element(key string) ([]byte, error) {
+func (s *set) Element(ctx context.Context, key string) ([]byte, error) {
 	// We can only GET an element if it's part of the Set (in
 	// "elements" and not in "tombstones").
 
@@ -126,13 +127,13 @@ func (s *set) Element(key string) ([]byte, error) {
 	// * If the key does not have a value in the store:
 	//   -> It was either never added
 	valueK := s.valueKey(key)
-	value, err := s.store.Get(valueK)
+	value, err := s.store.Get(ctx, valueK)
 	if err != nil { // not found is fine, we just return it
 		return value, err
 	}
 
 	// We have an existing element. Check if tombstoned.
-	inSet, err := s.inElemsNotTombstoned(key)
+	inSet, err := s.inElemsNotTombstoned(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +152,7 @@ func (s *set) Element(key string) ([]byte, error) {
 }
 
 // Elements returns all the elements in the set.
-func (s *set) Elements(q query.Query) (query.Results, error) {
+func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error) {
 	// This will cleanup user the query prefix first.
 	// This makes sure the use of things like "/../" in the query
 	// does not affect our setQuery.
@@ -181,7 +182,7 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 	// flatfs.
 	b := query.NewResultBuilder(q)
 	b.Process.Go(func(p goprocess.Process) {
-		results, err := s.store.Query(setQuery)
+		results, err := s.store.Query(ctx, setQuery)
 		if err != nil {
 			sendResult(b, p, query.Result{Error: err})
 			return
@@ -211,7 +212,7 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 
 			entry.Key = key
 			if q.KeysOnly {
-				has, err := s.inElemsNotTombstoned(key)
+				has, err := s.inElemsNotTombstoned(ctx, key)
 				if err != nil {
 					sendResult(b, p, query.Result{Error: err})
 					return
@@ -226,7 +227,7 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 					return
 				}
 			} else {
-				value, err := s.Element(key)
+				value, err := s.Element(ctx, key)
 				if err == ds.ErrNotFound {
 					continue
 				} else if err != nil {
@@ -247,21 +248,21 @@ func (s *set) Elements(q query.Query) (query.Results, error) {
 
 // InSet returns true if the key belongs to one of the elements in the "elems"
 // set, and this element is not tombstoned.
-func (s *set) InSet(key string) (bool, error) {
+func (s *set) InSet(ctx context.Context, key string) (bool, error) {
 	// Optimization: if we do not have a value
 	// this key was never added.
 	valueK := s.valueKey(key)
-	if ok, err := s.store.Has(valueK); !ok {
+	if ok, err := s.store.Has(ctx, valueK); !ok {
 		return false, err
 	}
 
 	// Otherwise, do the long check.
-	return s.inElemsNotTombstoned(key)
+	return s.inElemsNotTombstoned(ctx, key)
 }
 
 // Returns in we have a key/block combinations in the
 // elements set that has not been tombstoned.
-func (s *set) inElemsNotTombstoned(key string) (bool, error) {
+func (s *set) inElemsNotTombstoned(ctx context.Context, key string) (bool, error) {
 	// /namespace/elems/<key>
 	prefix := s.elemsPrefix(key)
 	q := query.Query{
@@ -269,7 +270,7 @@ func (s *set) inElemsNotTombstoned(key string) (bool, error) {
 		KeysOnly: true,
 	}
 
-	results, err := s.store.Query(q)
+	results, err := s.store.Query(ctx, q)
 	if err != nil {
 		return false, err
 	}
@@ -291,7 +292,7 @@ func (s *set) inElemsNotTombstoned(key string) (bool, error) {
 			continue
 		}
 		// if not tombstoned, we have it
-		inTomb, err := s.inTombsKeyID(key, id)
+		inTomb, err := s.inTombsKeyID(ctx, key, id)
 		if err != nil {
 			return false, err
 		}
@@ -327,9 +328,9 @@ func (s *set) priorityKey(key string) ds.Key {
 	return s.keyPrefix(keysNs).ChildString(key).ChildString(prioritySuffix)
 }
 
-func (s *set) getPriority(key string) (uint64, error) {
+func (s *set) getPriority(ctx context.Context, key string) (uint64, error) {
 	prioK := s.priorityKey(key)
-	data, err := s.store.Get(prioK)
+	data, err := s.store.Get(ctx, prioK)
 	if err != nil {
 		if err == ds.ErrNotFound {
 			return 0, nil
@@ -344,7 +345,7 @@ func (s *set) getPriority(key string) (uint64, error) {
 	return prio - 1, nil
 }
 
-func (s *set) setPriority(writeStore ds.Write, key string, prio uint64) error {
+func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, prio uint64) error {
 	prioK := s.priorityKey(key)
 	buf := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutUvarint(buf, prio+1)
@@ -352,20 +353,20 @@ func (s *set) setPriority(writeStore ds.Write, key string, prio uint64) error {
 		return errors.New("error encoding priority")
 	}
 
-	return writeStore.Put(prioK, buf[0:n])
+	return writeStore.Put(ctx, prioK, buf[0:n])
 }
 
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
-func (s *set) setValue(writeStore ds.Write, key, id string, value []byte, prio uint64) error {
+func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, prio uint64) error {
 	// If this key was tombstoned already, do not store/update the value
 	// at all.
-	deleted, err := s.inTombsKeyID(key, id)
+	deleted, err := s.inTombsKeyID(ctx, key, id)
 	if err != nil || deleted {
 		return err
 	}
 
-	curPrio, err := s.getPriority(key)
+	curPrio, err := s.getPriority(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -376,7 +377,7 @@ func (s *set) setValue(writeStore ds.Write, key, id string, value []byte, prio u
 	valueK := s.valueKey(key)
 
 	if prio == curPrio {
-		curValue, _ := s.store.Get(valueK)
+		curValue, _ := s.store.Get(ctx, valueK)
 		// new value greater than old
 		if bytes.Compare(curValue, value) >= 0 {
 			return nil
@@ -384,13 +385,13 @@ func (s *set) setValue(writeStore ds.Write, key, id string, value []byte, prio u
 	}
 
 	// store value
-	err = writeStore.Put(valueK, value)
+	err = writeStore.Put(ctx, valueK, value)
 	if err != nil {
 		return err
 	}
 
 	// store priority
-	err = s.setPriority(writeStore, key, prio)
+	err = s.setPriority(ctx, writeStore, key, prio)
 	if err != nil {
 		return err
 	}
@@ -409,7 +410,7 @@ func (s *set) setValue(writeStore ds.Write, key, id string, value []byte, prio u
 // but with the batching optimization the locks would need to be hold until
 // the batch is written), and one lock per key might be way worse than a single
 // global lock in the end.
-func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
+func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio uint64) error {
 	s.putElemsMux.Lock()
 	defer s.putElemsMux.Unlock()
 
@@ -421,7 +422,7 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 	var err error
 	batchingDs, batching := store.(ds.Batching)
 	if batching {
-		store, err = batchingDs.Batch()
+		store, err = batchingDs.Batch(ctx)
 		if err != nil {
 			return err
 		}
@@ -432,7 +433,7 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 		key := e.GetKey()
 		// /namespace/elems/<key>/<id>
 		k := s.elemsPrefix(key).ChildString(id)
-		err := store.Put(k, nil)
+		err := store.Put(ctx, k, nil)
 		if err != nil {
 			return err
 		}
@@ -440,14 +441,14 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 		// update the value if applicable:
 		// * higher priority than we currently have.
 		// * not tombstoned before.
-		err = s.setValue(store, key, id, e.GetValue(), prio)
+		err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
 		if err != nil {
 			return err
 		}
 	}
 
 	if batching {
-		err := store.(ds.Batch).Commit()
+		err := store.(ds.Batch).Commit(ctx)
 		if err != nil {
 			return err
 		}
@@ -455,7 +456,7 @@ func (s *set) putElems(elems []*pb.Element, id string, prio uint64) error {
 	return nil
 }
 
-func (s *set) putTombs(tombs []*pb.Element) error {
+func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	if len(tombs) == 0 {
 		return nil
 	}
@@ -464,7 +465,7 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 	var err error
 	batchingDs, batching := store.(ds.Batching)
 	if batching {
-		store, err = batchingDs.Batch()
+		store, err = batchingDs.Batch(ctx)
 		if err != nil {
 			return err
 		}
@@ -475,7 +476,7 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 		// /namespace/tombs/<key>/<id>
 		elemKey := e.GetKey()
 		k := s.tombsPrefix(elemKey).ChildString(e.GetId())
-		err := store.Put(k, nil)
+		err := store.Put(ctx, k, nil)
 		if err != nil {
 			return err
 		}
@@ -489,7 +490,7 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 	}
 
 	if batching {
-		err := store.(ds.Batch).Commit()
+		err := store.(ds.Batch).Commit(ctx)
 		if err != nil {
 			return err
 		}
@@ -497,13 +498,13 @@ func (s *set) putTombs(tombs []*pb.Element) error {
 	return nil
 }
 
-func (s *set) Merge(d *pb.Delta, id string) error {
-	err := s.putTombs(d.GetTombstones())
+func (s *set) Merge(ctx context.Context, d *pb.Delta, id string) error {
+	err := s.putTombs(ctx, d.GetTombstones())
 	if err != nil {
 		return err
 	}
 
-	return s.putElems(d.GetElements(), id, d.GetPriority())
+	return s.putElems(ctx, d.GetElements(), id, d.GetPriority())
 }
 
 // currently unused
@@ -512,9 +513,9 @@ func (s *set) Merge(d *pb.Delta, id string) error {
 // 	return s.store.Has(k)
 // }
 
-func (s *set) inTombsKeyID(key, id string) (bool, error) {
+func (s *set) inTombsKeyID(ctx context.Context, key, id string) (bool, error) {
 	k := s.tombsPrefix(key).ChildString(id)
-	return s.store.Has(k)
+	return s.store.Has(ctx, k)
 }
 
 // currently unused
@@ -533,7 +534,7 @@ func (s *set) inTombsKeyID(key, id string) (bool, error) {
 // }
 
 // perform a sync against all the paths associated with a key prefix
-func (s *set) datastoreSync(prefix ds.Key) error {
+func (s *set) datastoreSync(ctx context.Context, prefix ds.Key) error {
 	prefixStr := prefix.String()
 	toSync := []ds.Key{
 		s.elemsPrefix(prefixStr),
@@ -544,7 +545,7 @@ func (s *set) datastoreSync(prefix ds.Key) error {
 	errs := make([]error, len(toSync))
 
 	for i, k := range toSync {
-		if err := s.store.Sync(k); err != nil {
+		if err := s.store.Sync(ctx, k); err != nil {
 			errs[i] = err
 		}
 	}

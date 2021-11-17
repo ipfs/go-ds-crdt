@@ -22,7 +22,7 @@ jobs:
       run: go build -v ./...
 
     - name: Test
-      run: go test -v -run "TestCRDT" -race -coverprofile=coverage.txt -covermode=atomic
+      run: go test -timeout 20m -v -run "TestCRDT" -race -coverprofile=coverage.txt -covermode=atomic
 
     - name: Staticcheck
       run: staticcheck ./...
