@@ -66,7 +66,7 @@ type DAGSyncer interface {
 	ipld.DAGService
 	// Returns true if the block is locally available (therefore, it
 	// is considered processed).
-	HasBlock(c cid.Cid) (bool, error)
+	HasBlock(ctx context.Context, c cid.Cid) (bool, error)
 }
 
 // A SessionDAGSyncer is a Sessions-enabled DAGSyncer. This type of DAG-Syncer
@@ -445,7 +445,7 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 	// Ignore already known blocks.
 	// This includes the case when the block is a current
 	// head.
-	known, err := store.dagSyncer.HasBlock(c)
+	known, err := store.dagSyncer.HasBlock(store.ctx, c)
 	if err != nil {
 		return errors.Wrap(err, "error checking for known block")
 	}
@@ -607,7 +607,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			continue
 		}
 
-		known, err := store.dagSyncer.HasBlock(child)
+		known, err := store.dagSyncer.HasBlock(store.ctx, child)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error checking for known block %s", child)
 		}
