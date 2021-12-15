@@ -43,4 +43,4 @@ jobs:
         go-version: 1.15
 
     - name: Test
-      run: go test -v -run "TestDatastoreSuite" .
+      run: go test -timeout 30m -v -run "TestDatastoreSuite" .
