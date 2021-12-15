@@ -99,10 +99,10 @@ type mockBroadcaster struct {
 	chans    []chan []byte
 	myChan   chan []byte
 	dropProb int // probability of dropping a message instead of receiving it
-	t        *testing.T
+	t        testing.TB
 }
 
-func newBroadcasters(t *testing.T, n int) ([]*mockBroadcaster, context.CancelFunc) {
+func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	broadcasters := make([]*mockBroadcaster, n)
 	chans := make([]chan []byte, n)
@@ -213,7 +213,7 @@ func storeFolder(i int) string {
 	return fmt.Sprintf("test-badger-%d", i)
 }
 
-func makeStore(t *testing.T, i int) ds.Datastore {
+func makeStore(t testing.TB, i int) ds.Datastore {
 	t.Helper()
 
 	switch store {
@@ -243,12 +243,12 @@ func makeStore(t *testing.T, i int) ds.Datastore {
 	}
 }
 
-func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
-	bcasts, bcastCancel := newBroadcasters(t, numReplicas)
+func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
+	bcasts, bcastCancel := newBroadcasters(t, n)
 	bs := mdutils.Bserv()
 	dagserv := merkledag.NewDAGService(bs)
 
-	replicaOpts := make([]*Options, numReplicas)
+	replicaOpts := make([]*Options, n)
 	for i := range replicaOpts {
 		if opts == nil {
 			replicaOpts[i] = DefaultOptions()
@@ -266,7 +266,7 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 		replicaOpts[i].DAGSyncerTimeout = time.Second
 	}
 
-	replicas := make([]*Datastore, numReplicas)
+	replicas := make([]*Datastore, n)
 	for i := range replicas {
 		dagsync := &mockDAGSync{
 			DAGService:  dagserv,
@@ -306,6 +306,10 @@ func makeReplicas(t *testing.T, opts *Options) ([]*Datastore, func()) {
 	}
 
 	return replicas, closeReplicas
+}
+
+func makeReplicas(t testing.TB, opts *Options) ([]*Datastore, func()) {
+	return makeNReplicas(t, numReplicas, opts)
 }
 
 func TestCRDT(t *testing.T) {
@@ -837,4 +841,88 @@ func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
 	if len(cids2) != 1 || !cids[0].Equals(cidV0) {
 		t.Error("should have reparsed cid0", cids2)
 	}
+}
+
+// There is no easy way to see if the bloom filter is doing its job without
+// wiring some sort of metric or benchmarking. Instead, this just hits the
+// 3 places relevant to bloom filter:
+// * When adding a tomb
+// * When checking if something is tombstoned
+// * When priming the filter
+//
+// The main thing is to manually verify (via printlns) that the bloom filter
+// is used with the expected key everywhere: i.e. "/mykey" and not
+// "mykey". "/something/else" and not "/something". Protip: it has been
+// verified and it does that.
+func TestBloomingTombstones(t *testing.T) {
+	ctx := context.Background()
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+
+	k := ds.NewKey("hola/adios/")
+	err := replicas[0].Put(ctx, k, []byte("bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Delete(ctx, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Put(ctx, k, []byte("bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := query.Query{
+		KeysOnly: false,
+	}
+	results, err := replicas[0].Query(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer results.Close()
+
+	for r := range results.Next() {
+		if r.Error != nil {
+			t.Error(r.Error)
+		}
+	}
+
+	replicas[0].set.primeBloomFilter(ctx)
+}
+
+func BenchmarkQueryElements(b *testing.B) {
+	ctx := context.Background()
+	replicas, closeReplicas := makeNReplicas(b, 1, nil)
+	defer closeReplicas()
+
+	for i := 0; i < b.N; i++ {
+		k := ds.RandomKey()
+		err := replicas[0].Put(ctx, k, make([]byte, 2000))
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ResetTimer()
+
+	q := query.Query{
+		KeysOnly: false,
+	}
+	results, err := replicas[0].Query(ctx, q)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer results.Close()
+
+	totalSize := 0
+	for r := range results.Next() {
+		if r.Error != nil {
+			b.Error(r.Error)
+		}
+		totalSize += len(r.Value)
+	}
+	b.Log(totalSize)
 }

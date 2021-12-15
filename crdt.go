@@ -246,13 +246,17 @@ func New(
 		opts.DeleteHook(dsk)
 	}
 
-	set := newCRDTSet(store, fullSetNs, setPutHook, setDeleteHook)
+	ctx, cancel := context.WithCancel(context.Background())
+	set, err := newCRDTSet(ctx, store, fullSetNs, opts.Logger, setPutHook, setDeleteHook)
+	if err != nil {
+		cancel()
+		return nil, errors.Wrap(err, "error setting up crdt set")
+	}
 	heads, err := newHeads(store, fullHeadsNs, opts.Logger)
 	if err != nil {
+		cancel()
 		return nil, errors.Wrap(err, "error building heads")
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 
 	dstore := &Datastore{
 		ctx:               ctx,
