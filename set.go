@@ -7,10 +7,14 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
+	bloom "github.com/ipfs/bbloom"
 	pb "github.com/ipfs/go-ds-crdt/pb"
-	"github.com/jbenet/goprocess"
-	"go.uber.org/multierr"
+	blockstore "github.com/ipfs/go-ipfs-blockstore"
+	logging "github.com/ipfs/go-log/v2"
+	goprocess "github.com/jbenet/goprocess"
+	multierr "go.uber.org/multierr"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
@@ -35,24 +39,80 @@ type set struct {
 	namespace  ds.Key
 	putHook    func(key string, v []byte)
 	deleteHook func(key string)
+	logger     logging.StandardLogger
 
 	// Avoid merging two things at the same time since
 	// we read-write value-priorities in a non-atomic way.
 	putElemsMux sync.Mutex
+
+	tombstonesBloom *bloom.Bloom
 }
 
 func newCRDTSet(
+	ctx context.Context,
 	d ds.Datastore,
 	namespace ds.Key,
+	logger logging.StandardLogger,
 	putHook func(key string, v []byte),
 	deleteHook func(key string),
-) *set {
-	return &set{
-		namespace:  namespace,
-		store:      d,
-		putHook:    putHook,
-		deleteHook: deleteHook,
+) (*set, error) {
+
+	// see go-ipfs-blockstore
+	opts := blockstore.DefaultCacheOpts()
+	blm, err := bloom.New(
+		float64(opts.HasBloomFilterSize*8),
+		float64(opts.HasBloomFilterHashes),
+	)
+	if err != nil {
+		return nil, err
 	}
+
+	set := &set{
+		namespace:       namespace,
+		store:           d,
+		logger:          logger,
+		putHook:         putHook,
+		deleteHook:      deleteHook,
+		tombstonesBloom: blm,
+	}
+
+	return set, set.primeBloomFilter(ctx)
+}
+
+// We need to add all <key/block> keys in tombstones to the filter.
+func (s *set) primeBloomFilter(ctx context.Context) error {
+	tombsPrefix := s.keyPrefix(tombsNs) // /ns/tombs
+	q := query.Query{
+		Prefix:   tombsPrefix.String(),
+		KeysOnly: true,
+	}
+
+	t := time.Now()
+	nTombs := 0
+
+	results, err := s.store.Query(ctx, q)
+	if err != nil {
+		return err
+	}
+	defer results.Close()
+
+	for r := range results.Next() {
+		if r.Error != nil {
+			return r.Error
+		}
+
+		// Switch from /ns/tombs/key/block to /key/block
+		key := ds.NewKey(
+			strings.TrimPrefix(r.Key, tombsPrefix.String()))
+		// Switch from /key/block to key
+		key = key.Parent()
+		// fmt.Println("Bloom filter priming with:", key)
+		// put the key in the bloom cache
+		s.tombstonesBloom.Add(key.Bytes())
+		nTombs++
+	}
+	s.logger.Info("Tombstones have bloomed: %d tombs. Took: %s", nTombs, time.Since(t))
+	return nil
 }
 
 // Add returns a new delta-set adding the given key/value.
@@ -87,7 +147,7 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 
 	for r := range results.Next() {
 		if r.Error != nil {
-			return nil, err
+			return nil, r.Error
 		}
 		id := strings.TrimPrefix(r.Key, prefix.String())
 		if !ds.RawKey(id).IsTopLevel() {
@@ -133,7 +193,7 @@ func (s *set) Element(ctx context.Context, key string) ([]byte, error) {
 	}
 
 	// We have an existing element. Check if tombstoned.
-	inSet, err := s.inElemsNotTombstoned(ctx, key)
+	inSet, err := s.checkNotTombstoned(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -163,6 +223,30 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 	setQueryPrefix := keyNamespacePrefix.Child(srcQueryPrefixKey).String()
 	vSuffix := "/" + valueSuffix
 
+	// We are going to be reading everything in the /set/ namespace which
+	// will return items in the form:
+	// * /set/<key>/value
+	// * /set<key>/priority (a Uvarint)
+
+	// It is clear that KeysOnly=true should be used here when the original
+	// query only wants keys.
+	//
+	// However, there is a question of what is best when the original
+	// query wants also values:
+	// * KeysOnly: true avoids reading all the priority key values
+	//   which are skipped at the cost of doing a separate Get() for the
+	//   values (50% of the keys).
+	// * KeysOnly: false reads everything from the start. Priorities
+	//   and tombstoned values are read for nothing
+	//
+	// In-mem benchmarking shows no clear winner. Badger docs say that
+	// KeysOnly "is several order of magnitudes faster than regular
+	// iteration".
+	//
+	// In general my feeling is that KeysOnly=true is better for all cases
+	// and that doing a separate Get() is not going to be much worse than
+	// Getting the values with the original query, but depending on the
+	// underlying datastore, things may be different.
 	setQuery := query.Query{
 		Prefix:   setQueryPrefix,
 		KeysOnly: true,
@@ -180,7 +264,29 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 
 	// The code below is very inspired in the Query implementation in
 	// flatfs.
+
+	// NewResultBuilder(q) gives us a ResultBuilder with a channel of
+	// capacity 1 when using KeysOnly = false, and 128 otherwise.
+	//
+	// Having a 128-item buffered channel was an improvement to speed up
+	// keys-only queries, but there is no explanation on how other
+	// non-key only queries would improve.
+	// See: https://github.com/ipfs/go-datastore/issues/40
+	//
+	// I do not see a huge noticeable improvement when forcing a 128
+	// buffer size in all cases, when testing with an inmem-datastore
+	// but leaving this here for later, in case real-world testing
+	// results in noticeable improvements.
 	b := query.NewResultBuilder(q)
+	// b := &query.ResultBuilder{
+	// 	Query:  q,
+	// 	Output: make(chan query.Result, 128),
+	// }
+	// b.Process = goprocess.WithTeardown(func() error {
+	// 	close(b.Output)
+	// 	return nil
+	// })
+
 	b.Process.Go(func(p goprocess.Process) {
 		results, err := s.store.Query(ctx, setQuery)
 		if err != nil {
@@ -211,8 +317,11 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			)
 
 			entry.Key = key
+			entry.Value = r.Value
+			entry.Size = r.Size
+			entry.Expiration = r.Expiration
 			if q.KeysOnly {
-				has, err := s.inElemsNotTombstoned(ctx, key)
+				has, err := s.checkNotTombstoned(ctx, key)
 				if err != nil {
 					sendResult(b, p, query.Result{Error: err})
 					return
@@ -223,6 +332,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 				}
 
 				entry.Size = -1
+				entry.Value = nil
 				if !sendResult(b, p, query.Result{Entry: entry}) {
 					return
 				}
@@ -257,12 +367,27 @@ func (s *set) InSet(ctx context.Context, key string) (bool, error) {
 	}
 
 	// Otherwise, do the long check.
-	return s.inElemsNotTombstoned(ctx, key)
+	return s.checkNotTombstoned(ctx, key)
 }
 
-// Returns in we have a key/block combinations in the
+// Returns true when we have a key/block combination in the
 // elements set that has not been tombstoned.
-func (s *set) inElemsNotTombstoned(ctx context.Context, key string) (bool, error) {
+//
+// Warning: In order to do a quick bloomfilter check, this assumes the key is
+// in elems already. Any code calling this function already has verified
+// that there is a value-key entry for the key, thus there must necessarily
+// be a non-empty set of key/block in elems.
+//
+// Put otherwise: this code will misbehave when called directly to check if an
+// element exists. See Element()/InSet() etc..
+func (s *set) checkNotTombstoned(ctx context.Context, key string) (bool, error) {
+	// Bloom filter check: has this key been potentially tombstoned?
+
+	// fmt.Println("Bloom filter check:", key)
+	if !s.tombstonesBloom.HasTS([]byte(key)) {
+		return true, nil
+	}
+
 	// /namespace/elems/<key>
 	prefix := s.elemsPrefix(key)
 	q := query.Query{
@@ -480,6 +605,8 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		if err != nil {
 			return err
 		}
+		s.tombstonesBloom.AddTS([]byte(elemKey))
+		//fmt.Println("Bloom filter add:", elemKey)
 		// run delete hook only once for all
 		// versions of the same element tombstoned
 		// in this delta
