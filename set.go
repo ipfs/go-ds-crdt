@@ -11,7 +11,6 @@ import (
 
 	bloom "github.com/ipfs/bbloom"
 	pb "github.com/ipfs/go-ds-crdt/pb"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	logging "github.com/ipfs/go-log/v2"
 	goprocess "github.com/jbenet/goprocess"
 	multierr "go.uber.org/multierr"
@@ -48,6 +47,17 @@ type set struct {
 	tombstonesBloom *bloom.Bloom
 }
 
+// Tombstones bloom filter options.
+// We have optimized the defaults for speed:
+// - commit 30 MiB of memory to the filter
+// - only hash twice
+// - False positive probabily is 1 in 10000 when working with 1M items in the filter.
+// See https://hur.st/bloomfilter/?n=&p=0.0001&m=30MiB&k=2
+var (
+	TombstonesBloomFilterSize   float64 = 30 * 1024 * 1024 * 8 // 30 MiB
+	TombstonesBloomFilterHashes float64 = 2
+)
+
 func newCRDTSet(
 	ctx context.Context,
 	d ds.Datastore,
@@ -57,11 +67,9 @@ func newCRDTSet(
 	deleteHook func(key string),
 ) (*set, error) {
 
-	// see go-ipfs-blockstore
-	opts := blockstore.DefaultCacheOpts()
 	blm, err := bloom.New(
-		float64(opts.HasBloomFilterSize*8),
-		float64(opts.HasBloomFilterHashes),
+		float64(TombstonesBloomFilterSize),
+		float64(TombstonesBloomFilterHashes),
 	)
 	if err != nil {
 		return nil, err
