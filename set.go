@@ -111,7 +111,7 @@ func (s *set) primeBloomFilter(ctx context.Context) error {
 		s.tombstonesBloom.Add(key.Bytes())
 		nTombs++
 	}
-	s.logger.Info("Tombstones have bloomed: %d tombs. Took: %s", nTombs, time.Since(t))
+	s.logger.Infof("Tombstones have bloomed: %d tombs. Took: %s", nTombs, time.Since(t))
 	return nil
 }
 
