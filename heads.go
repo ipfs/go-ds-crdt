@@ -88,7 +88,7 @@ func (hh *heads) Len() (int, error) {
 
 // Replace replaces a head with a new cid.
 func (hh *heads) Replace(ctx context.Context, h, c cid.Cid, height uint64) error {
-	hh.logger.Infof("replacing DAG head: %s -> %s (new height: %d)", h, c, height)
+	hh.logger.Debugf("replacing DAG head: %s -> %s (new height: %d)", h, c, height)
 	var store ds.Write = hh.store
 
 	batchingDs, batching := store.(ds.Batching)
@@ -132,7 +132,7 @@ func (hh *heads) Replace(ctx context.Context, h, c cid.Cid, height uint64) error
 }
 
 func (hh *heads) Add(ctx context.Context, c cid.Cid, height uint64) error {
-	hh.logger.Infof("adding new DAG head: %s (height: %d)", c, height)
+	hh.logger.Debugf("adding new DAG head: %s (height: %d)", c, height)
 	if err := hh.write(ctx, hh.store, c, height); err != nil {
 		return err
 	}

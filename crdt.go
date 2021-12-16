@@ -575,7 +575,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		return nil, errors.Wrapf(err, "error merging delta from %s", current)
 	}
 
-	if prio := delta.GetPriority(); prio%10 == 0 {
+	if prio := delta.GetPriority(); prio%50 == 0 {
 		store.logger.Infof("merged delta from %s (priority: %d)", current, prio)
 	} else {
 		store.logger.Debugf("merged delta from %s (priority: %d)", current, prio)
