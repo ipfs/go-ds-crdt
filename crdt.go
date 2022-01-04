@@ -20,6 +20,7 @@ package crdt
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -943,7 +944,8 @@ func (b *batch) Commit(ctx context.Context) error {
 	return b.store.publishDelta()
 }
 
-// PrintDAG pretty prints the current Merkle-DAG using the given printFunc
+// PrintDAG pretty prints the current Merkle-DAG to stdout in a pretty
+// fashion. Only use for small DAGs. DotDAG is an alternative for larger DAGs.
 func (store *Datastore) PrintDAG() error {
 	heads, _, err := store.heads.List()
 	if err != nil {
@@ -1001,6 +1003,76 @@ func (store *Datastore) printDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGett
 	fmt.Println(line)
 	for _, l := range nd.Links() {
 		store.printDAGRec(l.Cid, depth+1, ng, set)
+	}
+	return nil
+}
+
+// DotDAG writes a dot-format representation of the CRDT DAG to the given
+// writer. It can be converted to image format and visualized with graphviz
+// tooling.
+func (store *Datastore) DotDAG(w io.Writer) error {
+	heads, _, err := store.heads.List()
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintln(w, "digraph CRDTDAG {")
+
+	ng := &crdtNodeGetter{NodeGetter: store.dagSyncer}
+
+	set := cid.NewSet()
+
+	fmt.Fprintln(w, "subgraph heads {")
+	for _, h := range heads {
+		fmt.Fprintln(w, h)
+	}
+	fmt.Fprintln(w, "}")
+
+	for _, h := range heads {
+		err := store.dotDAGRec(w, h, 0, ng, set)
+		if err != nil {
+			return err
+		}
+	}
+	fmt.Fprintln(w, "}")
+	return nil
+}
+
+func (store *Datastore) dotDAGRec(w io.Writer, from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set) error {
+	cidLong := from.String()
+	cidShort := cidLong[len(cidLong)-4:]
+
+	ok := set.Visit(from)
+	if !ok {
+		return nil
+	}
+
+	nd, delta, err := ng.GetDelta(context.Background(), from)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(w, "%s [label=\"%d | %s: +%d -%d\"]\n",
+		cidLong,
+		delta.GetPriority(),
+		cidShort,
+		len(delta.GetElements()),
+		len(delta.GetTombstones()),
+	)
+	fmt.Fprintf(w, "%s -> {", cidLong)
+	for _, l := range nd.Links() {
+		fmt.Fprintf(w, "%s ", l.Cid)
+	}
+	fmt.Fprintln(w, "}")
+
+	fmt.Fprintf(w, "subgraph sg_%s {\n", cidLong)
+	for _, l := range nd.Links() {
+		fmt.Fprintln(w, l.Cid)
+	}
+	fmt.Fprintln(w, "}")
+
+	for _, l := range nd.Links() {
+		store.dotDAGRec(w, l.Cid, depth+1, ng, set)
 	}
 	return nil
 }
