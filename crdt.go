@@ -181,6 +181,9 @@ type Datastore struct {
 
 	jobQueue chan *dagJob
 	sendJobs chan *dagJob
+	// keep track of children to be fetched so only one job does every
+	// child
+	queuedChildren *cidSafeSet
 }
 
 type dagJob struct {
@@ -274,6 +277,7 @@ func New(
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
 		jobQueue:          make(chan *dagJob, opts.NumWorkers),
 		sendJobs:          make(chan *dagJob),
+		queuedChildren:    newCidSafeSet(),
 	}
 
 	headList, maxHeight, err := dstore.heads.List()
@@ -527,6 +531,8 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 		rootPrio = prio
 	}
 
+	// This gets deltas but it is unable to tells us which childrens
+	// failed to be fetched though.
 	for deltaOpt := range ng.GetDeltas(ctx, children) {
 		if deltaOpt.err != nil {
 			store.logger.Errorf("error getting delta: %s", deltaOpt.err)
@@ -551,6 +557,10 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 		}
 	}
 
+	// Clear up any children we failed to get from queued children
+	for _, child := range children {
+		store.queuedChildren.Remove(child)
+	}
 }
 
 // the only purpose of this worker is to be able to orderly shut-down job
@@ -626,8 +636,11 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			}
 			continue
 		}
-
-		children = append(children, child)
+		// if no one else has claimed this child for fetching,
+		// add it to the list we return
+		if store.queuedChildren.Visit(child) {
+			children = append(children, child)
+		}
 	}
 
 	return children, nil
@@ -1075,4 +1088,36 @@ func (store *Datastore) dotDAGRec(w io.Writer, from cid.Cid, depth uint64, ng *c
 		store.dotDAGRec(w, l.Cid, depth+1, ng, set)
 	}
 	return nil
+}
+
+type cidSafeSet struct {
+	set map[cid.Cid]struct{}
+	mux sync.Mutex
+}
+
+func newCidSafeSet() *cidSafeSet {
+	return &cidSafeSet{
+		set: make(map[cid.Cid]struct{}),
+	}
+}
+
+func (s *cidSafeSet) Visit(c cid.Cid) bool {
+	var b bool
+	s.mux.Lock()
+	{
+		if _, ok := s.set[c]; !ok {
+			s.set[c] = struct{}{}
+			b = true
+		}
+	}
+	s.mux.Unlock()
+	return b
+}
+
+func (s *cidSafeSet) Remove(c cid.Cid) {
+	s.mux.Lock()
+	{
+		delete(s.set, c)
+	}
+	s.mux.Unlock()
 }
