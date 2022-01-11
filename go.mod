@@ -10,12 +10,14 @@ require (
 	github.com/ipfs/go-ipfs-ds-help v1.1.0
 	github.com/ipfs/go-ipld-format v0.2.0
 	github.com/ipfs/go-log/v2 v2.3.0
-	github.com/ipfs/go-merkledag v0.5.0
+	github.com/ipfs/go-merkledag v0.5.1
 	github.com/jbenet/goprocess v0.1.4
 	github.com/libp2p/go-libp2p-pubsub v0.6.0
 	github.com/multiformats/go-multihash v0.1.0
 	github.com/pkg/errors v0.9.1
 	go.uber.org/multierr v1.7.0
+	golang.org/x/crypto v0.0.0-20210513164829-c07d793c2f9a // indirect
+	golang.org/x/sys v0.0.0-20210514084401-e8d321eab015 // indirect
 	google.golang.org/protobuf v1.27.1
 )
 
