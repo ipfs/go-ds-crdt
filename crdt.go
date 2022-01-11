@@ -302,7 +302,7 @@ func New(
 			dstore.dagWorker()
 		}()
 	}
-	dstore.wg.Add(2)
+	dstore.wg.Add(3)
 	go func() {
 		defer dstore.wg.Done()
 		dstore.handleNext()
@@ -310,6 +310,11 @@ func New(
 	go func() {
 		defer dstore.wg.Done()
 		dstore.rebroadcast()
+	}()
+
+	go func() {
+		defer dstore.wg.Done()
+		dstore.logStats()
 	}()
 
 	return dstore, nil
@@ -446,6 +451,30 @@ func (store *Datastore) rebroadcastHeads() {
 	store.seenHeadsMux.Lock()
 	store.seenHeads = make(map[cid.Cid]struct{})
 	store.seenHeadsMux.Unlock()
+}
+
+// Log some stats every 5 minutes.
+func (store *Datastore) logStats() {
+	ticker := time.NewTicker(5 * time.Minute)
+	for {
+		select {
+		case <-ticker.C:
+			heads, height, err := store.heads.List()
+			if err != nil {
+				store.logger.Errorf("error listing heads: %s", err)
+			}
+
+			store.logger.Infof(
+				"Number of heads: %d. Current max height: %d. Queued jobs: %d.",
+				len(heads),
+				height,
+				len(store.jobQueue),
+			)
+		case <-store.ctx.Done():
+			ticker.Stop()
+			return
+		}
+	}
 }
 
 // handleBlock takes care of vetting, retrieving and applying
@@ -587,9 +616,9 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 	}
 
 	if prio := delta.GetPriority(); prio%50 == 0 {
-		store.logger.Infof("merged delta from %s (priority: %d)", current, prio)
+		store.logger.Infof("merged delta from node %s (priority: %d)", current, prio)
 	} else {
-		store.logger.Debugf("merged delta from %s (priority: %d)", current, prio)
+		store.logger.Debugf("merged delta from node %s (priority: %d)", current, prio)
 	}
 
 	links := node.Links()
