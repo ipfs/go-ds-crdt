@@ -249,15 +249,13 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 	//
 	// In-mem benchmarking shows no clear winner. Badger docs say that
 	// KeysOnly "is several order of magnitudes faster than regular
-	// iteration".
-	//
-	// In general my feeling is that KeysOnly=true is better for all cases
-	// and that doing a separate Get() is not going to be much worse than
-	// Getting the values with the original query, but depending on the
-	// underlying datastore, things may be different.
+	// iteration". Contrary to my original feeling, however, live testing
+	// with a 50GB badger with millions of keys shows more speed when
+	// querying with value. It may be that speed is fully affected by the
+	// current state of table compaction as well.
 	setQuery := query.Query{
 		Prefix:   setQueryPrefix,
-		KeysOnly: true,
+		KeysOnly: false,
 	}
 
 	// send the result and returns false if we must exit
@@ -281,19 +279,19 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 	// non-key only queries would improve.
 	// See: https://github.com/ipfs/go-datastore/issues/40
 	//
-	// I do not see a huge noticeable improvement when forcing a 128
-	// buffer size in all cases, when testing with an inmem-datastore
-	// but leaving this here for later, in case real-world testing
-	// results in noticeable improvements.
-	b := query.NewResultBuilder(q)
-	// b := &query.ResultBuilder{
-	// 	Query:  q,
-	// 	Output: make(chan query.Result, 128),
-	// }
-	// b.Process = goprocess.WithTeardown(func() error {
-	// 	close(b.Output)
-	// 	return nil
-	// })
+	// I do not see a huge noticeable improvement when forcing a 128 with
+	// in-mem stores, but I also don't see how some leeway can make things
+	// worse (real-world testing suggest it is not horrible at least).
+	//
+	// b := query.NewResultBuilder(q)
+	b := &query.ResultBuilder{
+		Query:  q,
+		Output: make(chan query.Result, 128),
+	}
+	b.Process = goprocess.WithTeardown(func() error {
+		close(b.Output)
+		return nil
+	})
 
 	b.Process.Go(func(p goprocess.Process) {
 		results, err := s.store.Query(ctx, setQuery)
@@ -328,35 +326,21 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			entry.Value = r.Value
 			entry.Size = r.Size
 			entry.Expiration = r.Expiration
+			has, err := s.checkNotTombstoned(ctx, key)
+			if err != nil {
+				sendResult(b, p, query.Result{Error: err})
+				return
+			}
+
+			if !has {
+				continue
+			}
 			if q.KeysOnly {
-				has, err := s.checkNotTombstoned(ctx, key)
-				if err != nil {
-					sendResult(b, p, query.Result{Error: err})
-					return
-				}
-
-				if !has {
-					continue
-				}
-
 				entry.Size = -1
 				entry.Value = nil
-				if !sendResult(b, p, query.Result{Entry: entry}) {
-					return
-				}
-			} else {
-				value, err := s.Element(ctx, key)
-				if err == ds.ErrNotFound {
-					continue
-				} else if err != nil {
-					sendResult(b, p, query.Result{Error: err})
-					return
-				}
-				entry.Value = value
-				entry.Size = len(value)
-				if !sendResult(b, p, query.Result{Entry: entry}) {
-					return
-				}
+			}
+			if !sendResult(b, p, query.Result{Entry: entry}) {
+				return
 			}
 		}
 	})
