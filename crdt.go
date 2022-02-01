@@ -599,12 +599,15 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 		rootPrio = prio
 	}
 
+	goodDeltas := make(map[cid.Cid]struct{})
+
 	// This gets deltas but it is unable to tells us which childrens
 	// failed to be fetched though.
 	for deltaOpt := range ng.GetDeltas(ctx, children) {
 		if deltaOpt.err != nil {
 			return errors.Wrapf(deltaOpt.err, "error getting delta")
 		}
+		goodDeltas[deltaOpt.node.Cid()] = struct{}{}
 
 		session.Add(1)
 		job := &dagJob{
@@ -626,9 +629,12 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 		}
 	}
 
-	// Clear up any children we failed to get from queued children
+	// Clear up any children that could not be fetched. The rest will
+	// remove themselves in processNode().
 	for _, child := range children {
-		store.queuedChildren.Remove(child)
+		if _, ok := goodDeltas[child]; !ok {
+			store.queuedChildren.Remove(child)
+		}
 	}
 	return nil
 }
@@ -700,6 +706,8 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		return nil, errors.Wrapf(err, "error recording %s as processed", current)
 	}
 
+	store.queuedChildren.Remove(node.Cid())
+
 	if prio := delta.GetPriority(); prio%50 == 0 {
 		store.logger.Infof("merged delta from node %s (priority: %d)", current, prio)
 	} else {
@@ -707,22 +715,12 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 	}
 
 	links := node.Links()
-	if len(links) == 0 { // we reached the bottom, we are a leaf.
-		// TODO: DO NOT ADD HEAD IN DISCOVERY MODE
-		err := store.heads.Add(store.ctx, root, rootPrio)
-		if err != nil {
-			return nil, errors.Wrapf(err, "error adding head %s", root)
-		}
-		return nil, nil
-	}
-
 	children := []cid.Cid{}
 
 	// walkToChildren
 	for _, l := range links {
 		child := l.Cid
 
-		// TODO: do not check heads on discovery mode.
 		isHead, _, err := store.heads.IsHead(child)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error checking if %s is head", child)
@@ -739,15 +737,18 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			continue
 		}
 
-		// TODO: Replace with if-processed?
-		// known, err := store.dagSyncer.HasBlock(store.ctx, child)
+		// If the child is queued or already processed, our head is a
+		// "new" way to get to it and we are not replacing existing
+		// heads. We make our new head official and add it to the
+		// list.
+		queued := store.queuedChildren.Has(child)
 		alreadyProcessed, err := store.store.Has(store.ctx, store.processedBlockKey(child))
 		if err != nil {
 			return nil, errors.Wrapf(err, "error checking for known block %s", child)
 		}
-		// TODO: do not exit in discovery mode.
-		if alreadyProcessed {
-			// we reached a non-head node in the known tree.
+		if alreadyProcessed || queued {
+			// we reached a non-head node in the known tree or
+			// on a node that someone else will visit.
 			// This means our root block is a new head.
 			err = store.heads.Add(store.ctx, root, rootPrio)
 			if err != nil {
@@ -756,12 +757,20 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			}
 			continue
 		}
-		// if no one else has claimed this child for fetching,
-		// add it to the list we return
 
-		// TODO: do not mark children in discovery mode.
+		// If no one else has claimed this child for fetching,
+		// add it to the list we return to keep searching.
 		if store.queuedChildren.Visit(child) {
 			children = append(children, child)
+		}
+	}
+
+	// we reached the bottom, or someone else is processing our
+	// children. In any case, our head must become a new head.
+	if len(children) == 0 {
+		err := store.heads.Add(store.ctx, root, rootPrio)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error adding head %s", root)
 		}
 	}
 
