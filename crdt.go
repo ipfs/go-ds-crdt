@@ -440,9 +440,14 @@ func (store *Datastore) repair() {
 			}
 			return
 		case <-timer.C:
-			err := store.repairDAG()
-			if err != nil {
-				store.logger.Error(err)
+			if !store.isDirty() {
+				store.logger.Info("store is marked clean. No need to repair")
+			} else {
+				store.logger.Warn("store is marked dirty. Starting DAG repair operation")
+				err := store.repairDAG()
+				if err != nil {
+					store.logger.Error(err)
+				}
 			}
 			timer.Reset(store.opts.RepairInterval)
 		}
@@ -656,6 +661,7 @@ func (store *Datastore) dirtyKey() ds.Key {
 }
 
 func (store *Datastore) markDirty() {
+	store.logger.Error("marking datastore as dirty")
 	err := store.store.Put(store.ctx, store.dirtyKey(), nil)
 	if err != nil {
 		store.logger.Errorf("error setting dirty bit: %s", err)
@@ -671,6 +677,7 @@ func (store *Datastore) isDirty() bool {
 }
 
 func (store *Datastore) markClean() {
+	store.logger.Info("marking datastore as clean")
 	err := store.store.Delete(store.ctx, store.dirtyKey())
 	if err != nil {
 		store.logger.Errorf("error clearing dirty bit: %s", err)
@@ -764,11 +771,6 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 // repairDAG is used to walk down the chain until a non-processed node is
 // found and at that moment, queues it for processing.
 func (store *Datastore) repairDAG() error {
-	if !store.isDirty() {
-		store.logger.Info("store is marked clean. No need to repair")
-		return nil
-	}
-
 	start := time.Now()
 	defer func() {
 		store.logger.Info("DAG reprocessing finished. Took %s", time.Since(start).Truncate(time.Second))
@@ -812,6 +814,15 @@ func (store *Datastore) repairDAG() error {
 	// bottom.
 	store.markClean()
 	return nil
+}
+
+// Repair triggers a DAG-repair, which tries to re-walk the CRDT-DAG from the
+// current heads until the roots, processing currently unprocessed branches.
+//
+// Calling Repair will walk the full DAG even if the dirty bit is unset, but
+// will mark the store as clean unpon successful completion.
+func (store *Datastore) Repair() error {
+	return store.repairDAG()
 }
 
 // Get retrieves the object `value` named by `key`.
