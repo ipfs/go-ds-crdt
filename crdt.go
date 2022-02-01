@@ -897,8 +897,6 @@ func (store *Datastore) repairDAG() error {
 			}
 		}
 
-		queued.Remove(cur)
-
 		atomic.StoreUint64(&queuedNodes, uint64(len(nodes)))
 		atomic.AddUint64(&visitedNodes, 1)
 		atomic.StoreUint64(&lastPriority, delta.Priority)
