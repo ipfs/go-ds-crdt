@@ -354,13 +354,13 @@ func (store *Datastore) handleNext() {
 
 		// For each head, we process it.
 		for _, head := range bCastHeads {
-			//go func(c cid.Cid) {
-			err = store.handleBlock(head) //handleBlock blocks
-			if err != nil {
-				store.logger.Error(err)
-				store.markDirty()
-			}
-			//}(c)
+			go func(c cid.Cid) {
+				err = store.handleBlock(c) //handleBlock blocks
+				if err != nil {
+					store.logger.Error(err)
+					store.markDirty()
+				}
+			}(head)
 			store.seenHeadsMux.Lock()
 			store.seenHeads[head] = struct{}{}
 			store.seenHeadsMux.Unlock()
