@@ -831,17 +831,19 @@ func (store *Datastore) repairDAG() error {
 	defer close(exitLogging)
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
-		select {
-		case <-exitLogging:
-			ticker.Stop()
-			return
-		case <-ticker.C:
-			store.logger.Infof(
-				"DAG repair in progress. Visited nodes: %d. Last priority: %d. Queued nodes: %d",
-				atomic.LoadUint64(&visitedNodes),
-				atomic.LoadUint64(&lastPriority),
-				atomic.LoadUint64(&queuedNodes),
-			)
+		for {
+			select {
+			case <-exitLogging:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				store.logger.Infof(
+					"DAG repair in progress. Visited nodes: %d. Last priority: %d. Queued nodes: %d",
+					atomic.LoadUint64(&visitedNodes),
+					atomic.LoadUint64(&lastPriority),
+					atomic.LoadUint64(&queuedNodes),
+				)
+			}
 		}
 	}()
 
