@@ -98,7 +98,7 @@ type Options struct {
 	// enough that they will be transferred by the network.
 	MaxBatchDeltaSize int
 	// RepairInterval specifies how often to walk the full DAG until
-	// the root(s) if it has been marked dirty.
+	// the root(s) if it has been marked dirty. 0 to disable.
 	RepairInterval time.Duration
 }
 
@@ -127,7 +127,7 @@ func (opts *Options) verify() error {
 		return errors.New("invalid MaxBatchDeltaSize")
 	}
 
-	if opts.RepairInterval <= 0 {
+	if opts.RepairInterval < 0 {
 		return errors.New("invalid RepairInterval")
 	}
 
@@ -428,6 +428,9 @@ func (store *Datastore) rebroadcast() {
 }
 
 func (store *Datastore) repair() {
+	if store.opts.RepairInterval == 0 {
+		return
+	}
 	timer := time.NewTimer(0) // fire immediately on start
 	for {
 		select {
