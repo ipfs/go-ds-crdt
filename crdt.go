@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/ipfs/go-ds-crdt/pb"
@@ -527,6 +528,12 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 		return nil
 	}
 
+	return store.handleBranch(c, c)
+}
+
+// send job starting at the given CID in a branch headed by a given head.
+// this can be used to continue branch processing from a certain point.
+func (store *Datastore) handleBranch(head, c cid.Cid) error {
 	// Walk down from this block.
 	ctx, cancel := context.WithCancel(store.ctx)
 	defer cancel()
@@ -537,7 +544,7 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 	}
 
 	var session sync.WaitGroup
-	err = store.sendNewJobs(&session, dg, c, 0, []cid.Cid{c})
+	err := store.sendNewJobs(&session, dg, head, 0, []cid.Cid{c})
 	session.Wait()
 	return err
 }
@@ -690,8 +697,10 @@ func (store *Datastore) markClean() {
 	}
 }
 
+// processNode merges the delta in a node and has the logic about what to do
+// then.
 func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
-	// merge the delta
+	// First,  merge the delta in this node.
 	current := node.Cid()
 	blockKey := dshelp.MultihashToDsKey(current.Hash()).String()
 	processedBlockKey := store.processedBlockKey(current)
@@ -700,14 +709,18 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		return nil, errors.Wrapf(err, "error merging delta from %s", current)
 	}
 
-	// Record that we have processed this key
+	// Record that we have processed the node so that any other worker
+	// can skip it.
 	err = store.store.Put(store.ctx, processedBlockKey, nil)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error recording %s as processed", current)
 	}
 
+	// Remove from the set that has the children which are queued for
+	// processing.
 	store.queuedChildren.Remove(node.Cid())
 
+	// Some informative logging
 	if prio := delta.GetPriority(); prio%50 == 0 {
 		store.logger.Infof("merged delta from node %s (priority: %d)", current, prio)
 	} else {
@@ -717,7 +730,21 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 	links := node.Links()
 	children := []cid.Cid{}
 
-	// walkToChildren
+	// We reached the bottom. Our head must become a new head.
+	if len(links) == 0 {
+		err := store.heads.Add(store.ctx, root, rootPrio)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error adding head %s", root)
+		}
+	}
+
+	// Return children that:
+	// a) Are not processed
+	// b) Are not going to be processed by someone else.
+	//
+	// For every other child, add our node as Head.
+
+	addedAsHead := false // small optimization to avoid adding as head multiple times.
 	for _, l := range links {
 		child := l.Cid
 
@@ -733,45 +760,36 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			if err != nil {
 				return nil, errors.Wrapf(err, "error replacing head: %s->%s", child, root)
 			}
-
+			addedAsHead = true
 			continue
 		}
 
-		// If the child is queued or already processed, our head is a
-		// "new" way to get to it and we are not replacing existing
-		// heads. We make our new head official and add it to the
-		// list.
-		queued := store.queuedChildren.Has(child)
+		// If the child has already been processed or someone else has
+		// reserved it for processing, then we can make ourselves a
+		// head right away because we are not meant to replace an
+		// existing head. Otherwise, mark it for processing and
+		// keep going down this branch.
 		alreadyProcessed, err := store.store.Has(store.ctx, store.processedBlockKey(child))
 		if err != nil {
 			return nil, errors.Wrapf(err, "error checking for known block %s", child)
 		}
-		if alreadyProcessed || queued {
-			// we reached a non-head node in the known tree or
-			// on a node that someone else will visit.
-			// This means our root block is a new head.
-			err = store.heads.Add(store.ctx, root, rootPrio)
-			if err != nil {
-				// Don't let this failure prevent us from processing the other links.
-				store.logger.Error(errors.Wrapf(err, "error adding head %s", root))
+		if alreadyProcessed || !store.queuedChildren.Visit(child) {
+			if !addedAsHead {
+				err = store.heads.Add(store.ctx, root, rootPrio)
+				if err != nil {
+					// Don't let this failure prevent us
+					// from processing the other links.
+					store.logger.Error(errors.Wrapf(err, "error adding head %s", root))
+				}
 			}
+			addedAsHead = true
 			continue
 		}
 
-		// If no one else has claimed this child for fetching,
-		// add it to the list we return to keep searching.
-		if store.queuedChildren.Visit(child) {
-			children = append(children, child)
-		}
-	}
+		// We can return this child because it is not processed and we
+		// reserved it in the queue.
+		children = append(children, child)
 
-	// we reached the bottom, or someone else is processing our
-	// children. In any case, our head must become a new head.
-	if len(children) == 0 {
-		err := store.heads.Add(store.ctx, root, rootPrio)
-		if err != nil {
-			return nil, errors.Wrapf(err, "error adding head %s", root)
-		}
 	}
 
 	return children, nil
@@ -782,21 +800,71 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 func (store *Datastore) repairDAG() error {
 	start := time.Now()
 	defer func() {
-		store.logger.Info("DAG reprocessing finished. Took %s", time.Since(start).Truncate(time.Second))
+		store.logger.Infof("DAG repair finished. Took %s", time.Since(start).Truncate(time.Second))
 	}()
 
-	nodes, _, err := store.heads.List()
+	getter := &crdtNodeGetter{store.dagService}
+
+	heads, _, err := store.heads.List()
 	if err != nil {
 		return errors.Wrapf(err, "error listing heads")
 	}
 
+	type nodeHead struct {
+		head cid.Cid
+		node cid.Cid
+	}
+
+	var nodes []nodeHead
+	queued := cid.NewSet()
+	for _, h := range heads {
+		nodes = append(nodes, nodeHead{head: h, node: h})
+		queued.Add(h)
+	}
+
+	// For logging
+	var visitedNodes uint64
+	var lastPriority uint64
+	var queuedNodes uint64
+
+	exitLogging := make(chan struct{})
+	defer close(exitLogging)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		select {
+		case <-exitLogging:
+			ticker.Stop()
+			return
+		case <-ticker.C:
+			store.logger.Infof(
+				"DAG repair in progress. Visited nodes: %d. Last priority: %d. Queued nodes: %d",
+				atomic.LoadUint64(&visitedNodes),
+				atomic.LoadUint64(&lastPriority),
+				atomic.LoadUint64(&queuedNodes),
+			)
+		}
+	}()
+
 	for {
+		// GetDelta does not seem to respond well to context
+		// cancellations (probably this goes down to the Blockstore
+		// still working with a cancelled context). So we need to put
+		// this here.
+		select {
+		case <-store.ctx.Done():
+			return nil
+		default:
+		}
+
 		if len(nodes) == 0 {
 			break
 		}
-		cur := nodes[0]
+		nh := nodes[0]
 		nodes = nodes[1:]
-		n, err := store.dagService.Get(store.ctx, cur)
+		cur := nh.node
+		head := nh.head
+
+		n, delta, err := getter.GetDelta(store.ctx, cur)
 		if err != nil {
 			return errors.Wrapf(err, "error getting node for reprocessing %s", cur)
 		}
@@ -804,19 +872,27 @@ func (store *Datastore) repairDAG() error {
 		if err != nil {
 			return errors.Wrapf(err, "error checking for reprocessed block %s", cur)
 		}
-		if alreadyProcessed {
-			links := n.Links()
-			for _, l := range links {
-				nodes = append(nodes, l.Cid)
-			}
-		} else {
+		if !alreadyProcessed {
+			store.logger.Debugf("reprocessing %s / %d", cur, delta.Priority)
 			// start syncing from here.
 			// do not add children to our queue.
-			err = store.handleBlock(cur)
+			err = store.handleBranch(head, cur)
 			if err != nil {
 				return errors.Wrapf(err, "error reprocessing block %s", cur)
 			}
 		}
+		links := n.Links()
+		for _, l := range links {
+			if queued.Visit(l.Cid) {
+				nodes = append(nodes, (nodeHead{head: head, node: l.Cid}))
+			}
+		}
+
+		queued.Remove(cur)
+
+		atomic.StoreUint64(&queuedNodes, uint64(len(nodes)))
+		atomic.AddUint64(&visitedNodes, 1)
+		atomic.StoreUint64(&lastPriority, delta.Priority)
 	}
 
 	// If we are here we have successfully reprocessed the chain until the
