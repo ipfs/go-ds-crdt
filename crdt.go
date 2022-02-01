@@ -1178,6 +1178,11 @@ func (store *Datastore) broadcast(cids []cid.Cid) error {
 	if store.broadcaster == nil { // offline
 		return nil
 	}
+
+	if len(cids) == 0 { // nothing to rebroadcast
+		return nil
+	}
+
 	store.logger.Debugf("broadcasting %s", cids)
 
 	bcastBytes, err := store.encodeBroadcast(cids)
