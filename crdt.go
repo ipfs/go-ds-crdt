@@ -519,11 +519,11 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 	// Ignore already processed blocks.
 	// This includes the case when the block is a current
 	// head.
-	alreadyProcessed, err := store.store.Has(store.ctx, store.processedBlockKey(c))
+	isProcessed, err := store.isProcessed(c)
 	if err != nil {
 		return errors.Wrapf(err, "error checking for known block %s", c)
 	}
-	if alreadyProcessed {
+	if isProcessed {
 		store.logger.Debugf("%s is known. Skip walking tree", c)
 		return nil
 	}
@@ -669,6 +669,14 @@ func (store *Datastore) processedBlockKey(c cid.Cid) ds.Key {
 	return store.namespace.ChildString(processedBlocksNs).ChildString(dshelp.MultihashToDsKey(c.Hash()).String())
 }
 
+func (store *Datastore) isProcessed(c cid.Cid) (bool, error) {
+	return store.store.Has(store.ctx, store.processedBlockKey(c))
+}
+
+func (store *Datastore) markProcessed(c cid.Cid) error {
+	return store.store.Put(store.ctx, store.processedBlockKey(c), nil)
+}
+
 func (store *Datastore) dirtyKey() ds.Key {
 	return store.namespace.ChildString(dirtyBitKey)
 }
@@ -703,7 +711,6 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 	// First,  merge the delta in this node.
 	current := node.Cid()
 	blockKey := dshelp.MultihashToDsKey(current.Hash()).String()
-	processedBlockKey := store.processedBlockKey(current)
 	err := store.set.Merge(store.ctx, delta, blockKey)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error merging delta from %s", current)
@@ -711,7 +718,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 
 	// Record that we have processed the node so that any other worker
 	// can skip it.
-	err = store.store.Put(store.ctx, processedBlockKey, nil)
+	err = store.markProcessed(current)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error recording %s as processed", current)
 	}
@@ -769,11 +776,11 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		// head right away because we are not meant to replace an
 		// existing head. Otherwise, mark it for processing and
 		// keep going down this branch.
-		alreadyProcessed, err := store.store.Has(store.ctx, store.processedBlockKey(child))
+		isProcessed, err := store.isProcessed(child)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error checking for known block %s", child)
 		}
-		if alreadyProcessed || !store.queuedChildren.Visit(child) {
+		if isProcessed || !store.queuedChildren.Visit(child) {
 			if !addedAsHead {
 				err = store.heads.Add(store.ctx, root, rootPrio)
 				if err != nil {
@@ -870,11 +877,11 @@ func (store *Datastore) repairDAG() error {
 		if err != nil {
 			return errors.Wrapf(err, "error getting node for reprocessing %s", cur)
 		}
-		alreadyProcessed, err := store.store.Has(store.ctx, store.processedBlockKey(cur))
+		isProcessed, err := store.isProcessed(cur)
 		if err != nil {
 			return errors.Wrapf(err, "error checking for reprocessed block %s", cur)
 		}
-		if !alreadyProcessed {
+		if !isProcessed {
 			store.logger.Debugf("reprocessing %s / %d", cur, delta.Priority)
 			// start syncing from here.
 			// do not add children to our queue.
