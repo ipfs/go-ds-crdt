@@ -62,22 +62,12 @@ type Broadcaster interface {
 	Next() ([]byte, error)
 }
 
-// A DAGSyncer is an abstraction to an IPLD-based p2p storage layer.  A
-// DAGSyncer is a DAGService with the ability to publish new ipld nodes to the
-// network, and retrieving others from it.
-type DAGSyncer interface {
-	ipld.DAGService
-	// Returns true if the block is locally available (therefore, it
-	// is considered processed).
-	HasBlock(ctx context.Context, c cid.Cid) (bool, error)
-}
-
-// A SessionDAGSyncer is a Sessions-enabled DAGSyncer. This type of DAG-Syncer
+// A SessionDAGService is a Sessions-enabled DAGService. This type of DAG-Service
 // provides an optimized NodeGetter to make multiple related requests. The
 // same session-enabled NodeGetter is used to download DAG branches when
 // the DAGSyncer supports it.
-type SessionDAGSyncer interface {
-	DAGSyncer
+type SessionDAGService interface {
+	ipld.DAGService
 	Session(context.Context) ipld.NodeGetter
 }
 
@@ -176,7 +166,7 @@ type Datastore struct {
 	set       *set
 	heads     *heads
 
-	dagSyncer   DAGSyncer
+	dagService  ipld.DAGService
 	broadcaster Broadcaster
 
 	seenHeadsMux sync.RWMutex
@@ -207,11 +197,11 @@ type dagJob struct {
 }
 
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
-// all the necessary data under the given namespace. It needs a DAG-Syncer
+// all the necessary data under the given namespace. It needs a DAG-Service
 // component for IPLD nodes and a Broadcaster component to distribute and
 // receive information to and from the rest of replicas. Actual implementation
 // of these must be provided by the user, but it normally means using
-// ipfs-lite (https://github.com/hsanjuan/ipfs-lite) as a DAG Syncer and the
+// ipfs-lite (https://github.com/hsanjuan/ipfs-lite) as a DAG Service and the
 // included libp2p PubSubBroadcaster as a Broadcaster.
 //
 // The given Datastatore is used to back all CRDT-datastore contents and
@@ -227,7 +217,7 @@ type dagJob struct {
 func New(
 	store ds.Datastore,
 	namespace ds.Key,
-	dagSyncer DAGSyncer,
+	dagSyncer ipld.DAGService,
 	bcast Broadcaster,
 	opts *Options,
 ) (*Datastore, error) {
@@ -281,7 +271,7 @@ func New(
 		namespace:         namespace,
 		set:               set,
 		heads:             heads,
-		dagSyncer:         dagSyncer,
+		dagService:        dagSyncer,
 		broadcaster:       bcast,
 		seenHeads:         make(map[cid.Cid]struct{}),
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
@@ -533,8 +523,8 @@ func (store *Datastore) handleBlock(c cid.Cid) error {
 	ctx, cancel := context.WithCancel(store.ctx)
 	defer cancel()
 
-	dg := &crdtNodeGetter{NodeGetter: store.dagSyncer}
-	if sessionMaker, ok := store.dagSyncer.(SessionDAGSyncer); ok {
+	dg := &crdtNodeGetter{NodeGetter: store.dagService}
+	if sessionMaker, ok := store.dagService.(SessionDAGService); ok {
 		dg = &crdtNodeGetter{NodeGetter: sessionMaker.Session(ctx)}
 	}
 
@@ -792,7 +782,7 @@ func (store *Datastore) repairDAG() error {
 		}
 		cur := nodes[0]
 		nodes = nodes[1:]
-		n, err := store.dagSyncer.Get(store.ctx, cur)
+		n, err := store.dagService.Get(store.ctx, cur)
 		if err != nil {
 			return errors.Wrapf(err, "error getting node for reprocessing %s", cur)
 		}
@@ -1028,7 +1018,7 @@ func (store *Datastore) putBlock(heads []cid.Cid, height uint64, delta *pb.Delta
 
 	ctx, cancel := context.WithTimeout(store.ctx, store.opts.DAGSyncerTimeout)
 	defer cancel()
-	err = store.dagSyncer.Add(ctx, node)
+	err = store.dagService.Add(ctx, node)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error writing new block %s", node.Cid())
 	}
@@ -1068,7 +1058,7 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 	// should be empty
 	store.logger.Debugf("processing generated block %s", nd.Cid())
 	children, err := store.processNode(
-		&crdtNodeGetter{store.dagSyncer},
+		&crdtNodeGetter{store.dagService},
 		nd.Cid(),
 		height,
 		delta,
@@ -1144,7 +1134,7 @@ func (store *Datastore) PrintDAG() error {
 		return err
 	}
 
-	ng := &crdtNodeGetter{NodeGetter: store.dagSyncer}
+	ng := &crdtNodeGetter{NodeGetter: store.dagService}
 
 	set := cid.NewSet()
 
@@ -1210,7 +1200,7 @@ func (store *Datastore) DotDAG(w io.Writer) error {
 
 	fmt.Fprintln(w, "digraph CRDTDAG {")
 
-	ng := &crdtNodeGetter{NodeGetter: store.dagSyncer}
+	ng := &crdtNodeGetter{NodeGetter: store.dagService}
 
 	set := cid.NewSet()
 

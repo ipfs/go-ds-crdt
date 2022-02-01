@@ -28,8 +28,8 @@ the height of the Merkle-CRDT node in which the key was introduced.
     [libp2p PubSub](https://godoc.org/github.com/libp2p/go-libp2p-pubsub) and
     the provided
     [`PubsubBroadcaster`](https://godoc.org/github.com/ipfs/go-ds-crdt#PubSubBroadcaster).
-  * A user-defined `DAGSyncer` component to publish and retrieve Merkle DAGs
-    to the network. For example, you can use
+  * A user-defined "dag syncer" component (`ipd.DAGService)` to publish and
+    retrieve Merkle DAGs to the network. For example, you can use
     [IPFS-Lite](https://github.com/hsanjuan/ipfs-lite) which casually
     satisfies this interface.
 
