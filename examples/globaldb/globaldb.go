@@ -17,6 +17,7 @@ import (
 
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
+	badger "github.com/ipfs/go-ds-badger"
 	crdt "github.com/ipfs/go-ds-crdt"
 	logging "github.com/ipfs/go-log/v2"
 
@@ -54,7 +55,7 @@ func main() {
 	}
 	data := filepath.Join(dir, config)
 
-	store, err := ipfslite.BadgerDatastore(data)
+	store, err := badger.NewDatastore(data, &badger.DefaultOptions)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -261,7 +262,7 @@ Commands:
 			}
 		case "list":
 			q := query.Query{}
-			results, err := crdt.Query(q)
+			results, err := crdt.Query(ctx, q)
 			if err != nil {
 				printErr(err)
 			}
@@ -279,7 +280,7 @@ Commands:
 				continue
 			}
 			k := ds.NewKey(fields[1])
-			v, err := crdt.Get(k)
+			v, err := crdt.Get(ctx, k)
 			if err != nil {
 				printErr(err)
 				continue
@@ -293,7 +294,7 @@ Commands:
 			}
 			k := ds.NewKey(fields[1])
 			v := strings.Join(fields[2:], " ")
-			err := crdt.Put(k, []byte(v))
+			err := crdt.Put(ctx, k, []byte(v))
 			if err != nil {
 				printErr(err)
 				continue

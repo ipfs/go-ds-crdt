@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/ipfs/go-ds-crdt/pb"
@@ -42,8 +43,10 @@ var _ ds.Batching = (*Datastore)(nil)
 
 // datastore namespace keys. Short keys save space and memory.
 const (
-	headsNs = "h" // heads
-	setNs   = "s" // set
+	headsNs           = "h" // heads
+	setNs             = "s" // set
+	processedBlocksNs = "b" // blocks
+	dirtyBitKey       = "d" // dirty
 )
 
 // Common errors.
@@ -60,22 +63,12 @@ type Broadcaster interface {
 	Next() ([]byte, error)
 }
 
-// A DAGSyncer is an abstraction to an IPLD-based p2p storage layer.  A
-// DAGSyncer is a DAGService with the ability to publish new ipld nodes to the
-// network, and retrieving others from it.
-type DAGSyncer interface {
-	ipld.DAGService
-	// Returns true if the block is locally available (therefore, it
-	// is considered processed).
-	HasBlock(ctx context.Context, c cid.Cid) (bool, error)
-}
-
-// A SessionDAGSyncer is a Sessions-enabled DAGSyncer. This type of DAG-Syncer
+// A SessionDAGService is a Sessions-enabled DAGService. This type of DAG-Service
 // provides an optimized NodeGetter to make multiple related requests. The
 // same session-enabled NodeGetter is used to download DAG branches when
 // the DAGSyncer supports it.
-type SessionDAGSyncer interface {
-	DAGSyncer
+type SessionDAGService interface {
+	ipld.DAGService
 	Session(context.Context) ipld.NodeGetter
 }
 
@@ -105,6 +98,9 @@ type Options struct {
 	// delta size gets too big. This helps keep DAG nodes small
 	// enough that they will be transferred by the network.
 	MaxBatchDeltaSize int
+	// RepairInterval specifies how often to walk the full DAG until
+	// the root(s) if it has been marked dirty. 0 to disable.
+	RepairInterval time.Duration
 }
 
 func (opts *Options) verify() error {
@@ -132,6 +128,10 @@ func (opts *Options) verify() error {
 		return errors.New("invalid MaxBatchDeltaSize")
 	}
 
+	if opts.RepairInterval < 0 {
+		return errors.New("invalid RepairInterval")
+	}
+
 	return nil
 }
 
@@ -148,6 +148,7 @@ func DefaultOptions() *Options {
 		// https://github.com/libp2p/go-libp2p-core/blob/master/network/network.go#L23
 		// in sight
 		MaxBatchDeltaSize: 1 * 1024 * 1024, // 1MB,
+		RepairInterval:    time.Hour,
 	}
 }
 
@@ -166,7 +167,7 @@ type Datastore struct {
 	set       *set
 	heads     *heads
 
-	dagSyncer   DAGSyncer
+	dagService  ipld.DAGService
 	broadcaster Broadcaster
 
 	seenHeadsMux sync.RWMutex
@@ -197,11 +198,11 @@ type dagJob struct {
 }
 
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
-// all the necessary data under the given namespace. It needs a DAG-Syncer
+// all the necessary data under the given namespace. It needs a DAG-Service
 // component for IPLD nodes and a Broadcaster component to distribute and
 // receive information to and from the rest of replicas. Actual implementation
 // of these must be provided by the user, but it normally means using
-// ipfs-lite (https://github.com/hsanjuan/ipfs-lite) as a DAG Syncer and the
+// ipfs-lite (https://github.com/hsanjuan/ipfs-lite) as a DAG Service and the
 // included libp2p PubSubBroadcaster as a Broadcaster.
 //
 // The given Datastatore is used to back all CRDT-datastore contents and
@@ -217,7 +218,7 @@ type dagJob struct {
 func New(
 	store ds.Datastore,
 	namespace ds.Key,
-	dagSyncer DAGSyncer,
+	dagSyncer ipld.DAGService,
 	bcast Broadcaster,
 	opts *Options,
 ) (*Datastore, error) {
@@ -271,7 +272,7 @@ func New(
 		namespace:         namespace,
 		set:               set,
 		heads:             heads,
-		dagSyncer:         dagSyncer,
+		dagService:        dagSyncer,
 		broadcaster:       bcast,
 		seenHeads:         make(map[cid.Cid]struct{}),
 		rebroadcastTicker: time.NewTicker(opts.RebroadcastInterval),
@@ -285,9 +286,10 @@ func New(
 		return nil, err
 	}
 	dstore.logger.Infof(
-		"crdt Datastore created. Number of heads: %d. Current max-height: %d",
+		"crdt Datastore created. Number of heads: %d. Current max-height: %d. Dirty: %t",
 		len(headList),
 		maxHeight,
+		dstore.isDirty(),
 	)
 
 	// sendJobWorker + NumWorkers
@@ -302,7 +304,7 @@ func New(
 			dstore.dagWorker()
 		}()
 	}
-	dstore.wg.Add(3)
+	dstore.wg.Add(4)
 	go func() {
 		defer dstore.wg.Done()
 		dstore.handleNext()
@@ -310,6 +312,11 @@ func New(
 	go func() {
 		defer dstore.wg.Done()
 		dstore.rebroadcast()
+	}()
+
+	go func() {
+		defer dstore.wg.Done()
+		dstore.repair()
 	}()
 
 	go func() {
@@ -348,12 +355,13 @@ func (store *Datastore) handleNext() {
 
 		// For each head, we process it.
 		for _, head := range bCastHeads {
-			//go func(c cid.Cid) {
-			err = store.handleBlock(head)
-			if err != nil {
-				store.logger.Error(err)
-			}
-			//}(c)
+			go func(c cid.Cid) {
+				err = store.handleBlock(c) //handleBlock blocks
+				if err != nil {
+					store.logger.Error(err)
+					store.markDirty()
+				}
+			}(head)
 			store.seenHeadsMux.Lock()
 			store.seenHeads[head] = struct{}{}
 			store.seenHeadsMux.Unlock()
@@ -420,6 +428,33 @@ func (store *Datastore) rebroadcast() {
 	}
 }
 
+func (store *Datastore) repair() {
+	if store.opts.RepairInterval == 0 {
+		return
+	}
+	timer := time.NewTimer(0) // fire immediately on start
+	for {
+		select {
+		case <-store.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+			if !store.isDirty() {
+				store.logger.Info("store is marked clean. No need to repair")
+			} else {
+				store.logger.Warn("store is marked dirty. Starting DAG repair operation")
+				err := store.repairDAG()
+				if err != nil {
+					store.logger.Error(err)
+				}
+			}
+			timer.Reset(store.opts.RepairInterval)
+		}
+	}
+}
+
 // regularly send out a list of heads that we have not recently seen
 func (store *Datastore) rebroadcastHeads() {
 	// Get our current list of heads
@@ -465,10 +500,11 @@ func (store *Datastore) logStats() {
 			}
 
 			store.logger.Infof(
-				"Number of heads: %d. Current max height: %d. Queued jobs: %d.",
+				"Number of heads: %d. Current max height: %d. Queued jobs: %d. Dirty: %t",
 				len(heads),
 				height,
 				len(store.jobQueue),
+				store.isDirty(),
 			)
 		case <-store.ctx.Done():
 			ticker.Stop()
@@ -480,31 +516,37 @@ func (store *Datastore) logStats() {
 // handleBlock takes care of vetting, retrieving and applying
 // CRDT blocks to the Datastore.
 func (store *Datastore) handleBlock(c cid.Cid) error {
-	// Ignore already known blocks.
+	// Ignore already processed blocks.
 	// This includes the case when the block is a current
 	// head.
-	known, err := store.dagSyncer.HasBlock(store.ctx, c)
+	isProcessed, err := store.isProcessed(c)
 	if err != nil {
-		return errors.Wrap(err, "error checking for known block")
+		return errors.Wrapf(err, "error checking for known block %s", c)
 	}
-	if known {
+	if isProcessed {
 		store.logger.Debugf("%s is known. Skip walking tree", c)
 		return nil
 	}
 
+	return store.handleBranch(c, c)
+}
+
+// send job starting at the given CID in a branch headed by a given head.
+// this can be used to continue branch processing from a certain point.
+func (store *Datastore) handleBranch(head, c cid.Cid) error {
 	// Walk down from this block.
 	ctx, cancel := context.WithCancel(store.ctx)
 	defer cancel()
 
-	dg := &crdtNodeGetter{NodeGetter: store.dagSyncer}
-	if sessionMaker, ok := store.dagSyncer.(SessionDAGSyncer); ok {
+	dg := &crdtNodeGetter{NodeGetter: store.dagService}
+	if sessionMaker, ok := store.dagService.(SessionDAGService); ok {
 		dg = &crdtNodeGetter{NodeGetter: sessionMaker.Session(ctx)}
 	}
 
 	var session sync.WaitGroup
-	store.sendNewJobs(&session, dg, c, 0, []cid.Cid{c})
+	err := store.sendNewJobs(&session, dg, head, 0, []cid.Cid{c})
 	session.Wait()
-	return nil
+	return err
 }
 
 // dagWorker should run in its own goroutine. Workers are launched during
@@ -529,11 +571,16 @@ func (store *Datastore) dagWorker() {
 
 		if err != nil {
 			store.logger.Error(err)
+			store.markDirty()
 			job.session.Done()
 			continue
 		}
 		go func(j *dagJob) {
-			store.sendNewJobs(j.session, j.nodeGetter, j.root, j.rootPrio, children)
+			err := store.sendNewJobs(j.session, j.nodeGetter, j.root, j.rootPrio, children)
+			if err != nil {
+				store.logger.Error(err)
+				store.markDirty()
+			}
 			j.session.Done()
 		}(job)
 	}
@@ -542,9 +589,9 @@ func (store *Datastore) dagWorker() {
 // sendNewJobs calls getDeltas (GetMany) on the crdtNodeGetter with the given
 // children and sends each response to the workers. It will block until all
 // jobs have been queued.
-func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, children []cid.Cid) {
+func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, children []cid.Cid) error {
 	if len(children) == 0 {
-		return
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(store.ctx, store.opts.DAGSyncerTimeout)
@@ -554,19 +601,20 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 	if rootPrio == 0 {
 		prio, err := ng.GetPriority(ctx, children[0])
 		if err != nil {
-			store.logger.Errorf("error getting root delta priority: %s", err)
-			return
+			return errors.Wrapf(err, "error getting root delta priority")
 		}
 		rootPrio = prio
 	}
+
+	goodDeltas := make(map[cid.Cid]struct{})
 
 	// This gets deltas but it is unable to tells us which childrens
 	// failed to be fetched though.
 	for deltaOpt := range ng.GetDeltas(ctx, children) {
 		if deltaOpt.err != nil {
-			store.logger.Errorf("error getting delta: %s", deltaOpt.err)
-			continue
+			return errors.Wrapf(deltaOpt.err, "error getting delta")
 		}
+		goodDeltas[deltaOpt.node.Cid()] = struct{}{}
 
 		session.Add(1)
 		job := &dagJob{
@@ -582,14 +630,20 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 		case <-store.ctx.Done():
 			// the job was never sent, so it cannot complete.
 			session.Done()
-			return
+			// We are in the middle of sending jobs, thus we left
+			// something unprocessed.
+			return store.ctx.Err()
 		}
 	}
 
-	// Clear up any children we failed to get from queued children
+	// Clear up any children that could not be fetched. The rest will
+	// remove themselves in processNode().
 	for _, child := range children {
-		store.queuedChildren.Remove(child)
+		if _, ok := goodDeltas[child]; !ok {
+			store.queuedChildren.Remove(child)
+		}
 	}
+	return nil
 }
 
 // the only purpose of this worker is to be able to orderly shut-down job
@@ -599,6 +653,10 @@ func (store *Datastore) sendJobWorker() {
 	for {
 		select {
 		case <-store.ctx.Done():
+			if len(store.sendJobs) > 0 {
+				// we left something in the queue
+				store.markDirty()
+			}
 			close(store.jobQueue)
 			return
 		case j := <-store.sendJobs:
@@ -607,14 +665,69 @@ func (store *Datastore) sendJobWorker() {
 	}
 }
 
+func (store *Datastore) processedBlockKey(c cid.Cid) ds.Key {
+	return store.namespace.ChildString(processedBlocksNs).ChildString(dshelp.MultihashToDsKey(c.Hash()).String())
+}
+
+func (store *Datastore) isProcessed(c cid.Cid) (bool, error) {
+	return store.store.Has(store.ctx, store.processedBlockKey(c))
+}
+
+func (store *Datastore) markProcessed(c cid.Cid) error {
+	return store.store.Put(store.ctx, store.processedBlockKey(c), nil)
+}
+
+func (store *Datastore) dirtyKey() ds.Key {
+	return store.namespace.ChildString(dirtyBitKey)
+}
+
+func (store *Datastore) markDirty() {
+	store.logger.Error("marking datastore as dirty")
+	err := store.store.Put(store.ctx, store.dirtyKey(), nil)
+	if err != nil {
+		store.logger.Errorf("error setting dirty bit: %s", err)
+	}
+}
+
+func (store *Datastore) isDirty() bool {
+	ok, err := store.store.Has(store.ctx, store.dirtyKey())
+	if err != nil {
+		store.logger.Errorf("error checking dirty bit: %s", err)
+	}
+	return ok
+}
+
+func (store *Datastore) markClean() {
+	store.logger.Info("marking datastore as clean")
+	err := store.store.Delete(store.ctx, store.dirtyKey())
+	if err != nil {
+		store.logger.Errorf("error clearing dirty bit: %s", err)
+	}
+}
+
+// processNode merges the delta in a node and has the logic about what to do
+// then.
 func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
-	// merge the delta
+	// First,  merge the delta in this node.
 	current := node.Cid()
-	err := store.set.Merge(store.ctx, delta, dshelp.MultihashToDsKey(current.Hash()).String())
+	blockKey := dshelp.MultihashToDsKey(current.Hash()).String()
+	err := store.set.Merge(store.ctx, delta, blockKey)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error merging delta from %s", current)
 	}
 
+	// Record that we have processed the node so that any other worker
+	// can skip it.
+	err = store.markProcessed(current)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error recording %s as processed", current)
+	}
+
+	// Remove from the set that has the children which are queued for
+	// processing.
+	store.queuedChildren.Remove(node.Cid())
+
+	// Some informative logging
 	if prio := delta.GetPriority(); prio%50 == 0 {
 		store.logger.Infof("merged delta from node %s (priority: %d)", current, prio)
 	} else {
@@ -622,19 +735,26 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 	}
 
 	links := node.Links()
-	if len(links) == 0 { // we reached the bottom, we are a leaf.
+	children := []cid.Cid{}
+
+	// We reached the bottom. Our head must become a new head.
+	if len(links) == 0 {
 		err := store.heads.Add(store.ctx, root, rootPrio)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error adding head %s", root)
 		}
-		return nil, nil
 	}
 
-	children := []cid.Cid{}
+	// Return children that:
+	// a) Are not processed
+	// b) Are not going to be processed by someone else.
+	//
+	// For every other child, add our node as Head.
 
-	// walkToChildren
+	addedAsHead := false // small optimization to avoid adding as head multiple times.
 	for _, l := range links {
 		child := l.Cid
+
 		isHead, _, err := store.heads.IsHead(child)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error checking if %s is head", child)
@@ -647,32 +767,154 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			if err != nil {
 				return nil, errors.Wrapf(err, "error replacing head: %s->%s", child, root)
 			}
-
+			addedAsHead = true
 			continue
 		}
 
-		known, err := store.dagSyncer.HasBlock(store.ctx, child)
+		// If the child has already been processed or someone else has
+		// reserved it for processing, then we can make ourselves a
+		// head right away because we are not meant to replace an
+		// existing head. Otherwise, mark it for processing and
+		// keep going down this branch.
+		isProcessed, err := store.isProcessed(child)
 		if err != nil {
 			return nil, errors.Wrapf(err, "error checking for known block %s", child)
 		}
-		if known {
-			// we reached a non-head node in the known tree.
-			// This means our root block is a new head.
-			err = store.heads.Add(store.ctx, root, rootPrio)
-			if err != nil {
-				// Don't let this failure prevent us from processing the other links.
-				store.logger.Error(errors.Wrapf(err, "error adding head %s", root))
+		if isProcessed || !store.queuedChildren.Visit(child) {
+			if !addedAsHead {
+				err = store.heads.Add(store.ctx, root, rootPrio)
+				if err != nil {
+					// Don't let this failure prevent us
+					// from processing the other links.
+					store.logger.Error(errors.Wrapf(err, "error adding head %s", root))
+				}
 			}
+			addedAsHead = true
 			continue
 		}
-		// if no one else has claimed this child for fetching,
-		// add it to the list we return
-		if store.queuedChildren.Visit(child) {
-			children = append(children, child)
-		}
+
+		// We can return this child because it is not processed and we
+		// reserved it in the queue.
+		children = append(children, child)
+
 	}
 
 	return children, nil
+}
+
+// repairDAG is used to walk down the chain until a non-processed node is
+// found and at that moment, queues it for processing.
+func (store *Datastore) repairDAG() error {
+	start := time.Now()
+	defer func() {
+		store.logger.Infof("DAG repair finished. Took %s", time.Since(start).Truncate(time.Second))
+	}()
+
+	getter := &crdtNodeGetter{store.dagService}
+
+	heads, _, err := store.heads.List()
+	if err != nil {
+		return errors.Wrapf(err, "error listing heads")
+	}
+
+	type nodeHead struct {
+		head cid.Cid
+		node cid.Cid
+	}
+
+	var nodes []nodeHead
+	queued := cid.NewSet()
+	for _, h := range heads {
+		nodes = append(nodes, nodeHead{head: h, node: h})
+		queued.Add(h)
+	}
+
+	// For logging
+	var visitedNodes uint64
+	var lastPriority uint64
+	var queuedNodes uint64
+
+	exitLogging := make(chan struct{})
+	defer close(exitLogging)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		for {
+			select {
+			case <-exitLogging:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				store.logger.Infof(
+					"DAG repair in progress. Visited nodes: %d. Last priority: %d. Queued nodes: %d",
+					atomic.LoadUint64(&visitedNodes),
+					atomic.LoadUint64(&lastPriority),
+					atomic.LoadUint64(&queuedNodes),
+				)
+			}
+		}
+	}()
+
+	for {
+		// GetDelta does not seem to respond well to context
+		// cancellations (probably this goes down to the Blockstore
+		// still working with a cancelled context). So we need to put
+		// this here.
+		select {
+		case <-store.ctx.Done():
+			return nil
+		default:
+		}
+
+		if len(nodes) == 0 {
+			break
+		}
+		nh := nodes[0]
+		nodes = nodes[1:]
+		cur := nh.node
+		head := nh.head
+
+		n, delta, err := getter.GetDelta(store.ctx, cur)
+		if err != nil {
+			return errors.Wrapf(err, "error getting node for reprocessing %s", cur)
+		}
+		isProcessed, err := store.isProcessed(cur)
+		if err != nil {
+			return errors.Wrapf(err, "error checking for reprocessed block %s", cur)
+		}
+		if !isProcessed {
+			store.logger.Debugf("reprocessing %s / %d", cur, delta.Priority)
+			// start syncing from here.
+			// do not add children to our queue.
+			err = store.handleBranch(head, cur)
+			if err != nil {
+				return errors.Wrapf(err, "error reprocessing block %s", cur)
+			}
+		}
+		links := n.Links()
+		for _, l := range links {
+			if queued.Visit(l.Cid) {
+				nodes = append(nodes, (nodeHead{head: head, node: l.Cid}))
+			}
+		}
+
+		atomic.StoreUint64(&queuedNodes, uint64(len(nodes)))
+		atomic.AddUint64(&visitedNodes, 1)
+		atomic.StoreUint64(&lastPriority, delta.Priority)
+	}
+
+	// If we are here we have successfully reprocessed the chain until the
+	// bottom.
+	store.markClean()
+	return nil
+}
+
+// Repair triggers a DAG-repair, which tries to re-walk the CRDT-DAG from the
+// current heads until the roots, processing currently unprocessed branches.
+//
+// Calling Repair will walk the full DAG even if the dirty bit is unset, but
+// will mark the store as clean unpon successful completion.
+func (store *Datastore) Repair() error {
+	return store.repairDAG()
 }
 
 // Get retrieves the object `value` named by `key`.
@@ -784,6 +1026,9 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 func (store *Datastore) Close() error {
 	store.cancel()
 	store.wg.Wait()
+	if store.isDirty() {
+		store.logger.Warn("datastore is being closed marked as dirty")
+	}
 	return nil
 }
 
@@ -879,7 +1124,7 @@ func (store *Datastore) putBlock(heads []cid.Cid, height uint64, delta *pb.Delta
 
 	ctx, cancel := context.WithTimeout(store.ctx, store.opts.DAGSyncerTimeout)
 	defer cancel()
-	err = store.dagSyncer.Add(ctx, node)
+	err = store.dagService.Add(ctx, node)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error writing new block %s", node.Cid())
 	}
@@ -919,13 +1164,14 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 	// should be empty
 	store.logger.Debugf("processing generated block %s", nd.Cid())
 	children, err := store.processNode(
-		&crdtNodeGetter{store.dagSyncer},
+		&crdtNodeGetter{store.dagService},
 		nd.Cid(),
 		height,
 		delta,
 		nd,
 	)
 	if err != nil {
+		store.markDirty() // not sure if this will fix much if this happens.
 		return cid.Undef, errors.Wrap(err, "error processing new block")
 	}
 	if len(children) != 0 {
@@ -939,6 +1185,11 @@ func (store *Datastore) broadcast(cids []cid.Cid) error {
 	if store.broadcaster == nil { // offline
 		return nil
 	}
+
+	if len(cids) == 0 { // nothing to rebroadcast
+		return nil
+	}
+
 	store.logger.Debugf("broadcasting %s", cids)
 
 	bcastBytes, err := store.encodeBroadcast(cids)
@@ -994,7 +1245,7 @@ func (store *Datastore) PrintDAG() error {
 		return err
 	}
 
-	ng := &crdtNodeGetter{NodeGetter: store.dagSyncer}
+	ng := &crdtNodeGetter{NodeGetter: store.dagService}
 
 	set := cid.NewSet()
 
@@ -1060,7 +1311,7 @@ func (store *Datastore) DotDAG(w io.Writer) error {
 
 	fmt.Fprintln(w, "digraph CRDTDAG {")
 
-	ng := &crdtNodeGetter{NodeGetter: store.dagSyncer}
+	ng := &crdtNodeGetter{NodeGetter: store.dagService}
 
 	set := cid.NewSet()
 
@@ -1121,7 +1372,7 @@ func (store *Datastore) dotDAGRec(w io.Writer, from cid.Cid, depth uint64, ng *c
 
 type cidSafeSet struct {
 	set map[cid.Cid]struct{}
-	mux sync.Mutex
+	mux sync.RWMutex
 }
 
 func newCidSafeSet() *cidSafeSet {
@@ -1149,4 +1400,13 @@ func (s *cidSafeSet) Remove(c cid.Cid) {
 		delete(s.set, c)
 	}
 	s.mux.Unlock()
+}
+
+func (s *cidSafeSet) Has(c cid.Cid) (ok bool) {
+	s.mux.RLock()
+	{
+		_, ok = s.set[c]
+	}
+	s.mux.RUnlock()
+	return
 }

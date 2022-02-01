@@ -159,54 +159,25 @@ func (mb *mockBroadcaster) Next() ([]byte, error) {
 	}
 }
 
-type mockDAGSync struct {
+type mockDAGSvc struct {
 	ipld.DAGService
-	bs             blockstore.Blockstore
-	knownBlocksMux sync.RWMutex
-	knownBlocks    map[cid.Cid]struct{}
+	bs blockstore.Blockstore
 }
 
-func (mds *mockDAGSync) HasBlock(ctx context.Context, c cid.Cid) (bool, error) {
-	mds.knownBlocksMux.RLock()
-	_, ok := mds.knownBlocks[c]
-	mds.knownBlocksMux.RUnlock()
-	return ok, nil
-}
-
-func (mds *mockDAGSync) Add(ctx context.Context, n ipld.Node) error {
-	mds.knownBlocksMux.Lock()
-	mds.knownBlocks[n.Cid()] = struct{}{}
-	mds.knownBlocksMux.Unlock()
+func (mds *mockDAGSvc) Add(ctx context.Context, n ipld.Node) error {
 	return mds.DAGService.Add(ctx, n)
 }
 
-func (mds *mockDAGSync) Get(ctx context.Context, c cid.Cid) (ipld.Node, error) {
+func (mds *mockDAGSvc) Get(ctx context.Context, c cid.Cid) (ipld.Node, error) {
 	nd, err := mds.DAGService.Get(ctx, c)
 	if err != nil {
 		return nd, err
 	}
-	mds.knownBlocksMux.Lock()
-	mds.knownBlocks[c] = struct{}{}
-	mds.knownBlocksMux.Unlock()
 	return nd, nil
 }
 
-func (mds *mockDAGSync) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipld.NodeOption {
-	ch := make(chan *ipld.NodeOption)
-	go func() {
-		defer close(ch)
-		resp := mds.DAGService.GetMany(ctx, cids)
-		for no := range resp {
-			if no.Err == nil {
-				mds.knownBlocksMux.Lock()
-				mds.knownBlocks[no.Node.Cid()] = struct{}{}
-				mds.knownBlocksMux.Unlock()
-			}
-			ch <- no
-		}
-	}()
-
-	return ch
+func (mds *mockDAGSvc) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipld.NodeOption {
+	return mds.DAGService.GetMany(ctx, cids)
 }
 
 func storeFolder(i int) string {
@@ -268,10 +239,9 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 
 	replicas := make([]*Datastore, n)
 	for i := range replicas {
-		dagsync := &mockDAGSync{
-			DAGService:  dagserv,
-			bs:          bs.Blockstore(),
-			knownBlocks: make(map[cid.Cid]struct{}),
+		dagsync := &mockDAGSvc{
+			DAGService: dagserv,
+			bs:         bs.Blockstore(),
 		}
 
 		var err error
