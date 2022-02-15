@@ -101,6 +101,11 @@ type Options struct {
 	// RepairInterval specifies how often to walk the full DAG until
 	// the root(s) if it has been marked dirty. 0 to disable.
 	RepairInterval time.Duration
+	// MultiHeadProcessing lets several new heads to be processed in
+	// parallel.  This results in more branching in general. More
+	// branching is not necessarily a bad thing and may improve
+	// throughput, but everything depends on usage.
+	MultiHeadProcessing bool
 }
 
 func (opts *Options) verify() error {
@@ -147,8 +152,9 @@ func DefaultOptions() *Options {
 		// always keeping
 		// https://github.com/libp2p/go-libp2p-core/blob/master/network/network.go#L23
 		// in sight
-		MaxBatchDeltaSize: 1 * 1024 * 1024, // 1MB,
-		RepairInterval:    time.Hour,
+		MaxBatchDeltaSize:   1 * 1024 * 1024, // 1MB,
+		RepairInterval:      time.Hour,
+		MultiHeadProcessing: false,
 	}
 }
 
@@ -353,15 +359,24 @@ func (store *Datastore) handleNext() {
 			continue
 		}
 
+		processHead := func(c cid.Cid) {
+			err = store.handleBlock(c) //handleBlock blocks
+			if err != nil {
+				store.logger.Error(err)
+				store.markDirty()
+			}
+		}
+
 		// For each head, we process it.
 		for _, head := range bCastHeads {
-			go func(c cid.Cid) {
-				err = store.handleBlock(c) //handleBlock blocks
-				if err != nil {
-					store.logger.Error(err)
-					store.markDirty()
-				}
-			}(head)
+			// A thing to try here would be to process heads in
+			// the same broadcast in parallel, but do not process
+			// heads from multiple broadcasts in parallel.
+			if store.opts.MultiHeadProcessing {
+				go processHead(head)
+			} else {
+				processHead(head)
+			}
 			store.seenHeadsMux.Lock()
 			store.seenHeads[head] = struct{}{}
 			store.seenHeadsMux.Unlock()
