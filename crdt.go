@@ -1148,6 +1148,10 @@ func (store *Datastore) putBlock(heads []cid.Cid, height uint64, delta *pb.Delta
 }
 
 func (store *Datastore) publish(delta *pb.Delta) error {
+	// curDelta might be nil if nothing has been added to it
+	if delta == nil {
+		return nil
+	}
 	c, err := store.addDAGNode(delta)
 	if err != nil {
 		return err
