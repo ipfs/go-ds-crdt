@@ -367,6 +367,30 @@ func (store *Datastore) handleNext() {
 			}
 		}
 
+		// if we have no heads, make seen-heads heads immediately.  On
+		// a fresh start, this allows us to start building on top of
+		// recent heads, even if we have not fully synced rather than
+		// creating new orphan branches.
+		curHeadCount, err := store.heads.Len()
+		if err != nil {
+			store.logger.Error(err)
+			continue
+		}
+		if curHeadCount == 0 {
+			dg := &crdtNodeGetter{NodeGetter: store.dagService}
+			for _, head := range bCastHeads {
+				prio, err := dg.GetPriority(store.ctx, head)
+				if err != nil {
+					store.logger.Error(err)
+					continue
+				}
+				err = store.heads.Add(store.ctx, head, prio)
+				if err != nil {
+					store.logger.Error(err)
+				}
+			}
+		}
+
 		// For each head, we process it.
 		for _, head := range bCastHeads {
 			// A thing to try here would be to process heads in
