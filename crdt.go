@@ -799,6 +799,11 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			return nil, errors.Wrapf(err, "error checking if %s is head", child)
 		}
 
+		isProcessed, err := store.isProcessed(child)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error checking for known block %s", child)
+		}
+
 		if isHead {
 			// reached one of the current heads. Replace it with
 			// the tip of this branch
@@ -807,7 +812,17 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 				return nil, errors.Wrapf(err, "error replacing head: %s->%s", child, root)
 			}
 			addedAsHead = true
-			continue
+
+			// If this head was already processed, continue this
+			// protects the case when something is a head but was
+			// not processed (potentially could happen during
+			// first sync when heads are set before processing, a
+			// both a node and its child are heads - which I'm not
+			// sure if it can happen at all, but good to safeguard
+			// for it).
+			if isProcessed {
+				continue
+			}
 		}
 
 		// If the child has already been processed or someone else has
@@ -815,10 +830,6 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		// head right away because we are not meant to replace an
 		// existing head. Otherwise, mark it for processing and
 		// keep going down this branch.
-		isProcessed, err := store.isProcessed(child)
-		if err != nil {
-			return nil, errors.Wrapf(err, "error checking for known block %s", child)
-		}
 		if isProcessed || !store.queuedChildren.Visit(child) {
 			if !addedAsHead {
 				err = store.heads.Add(store.ctx, root, rootPrio)
