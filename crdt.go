@@ -923,10 +923,14 @@ func (store *Datastore) repairDAG() error {
 		cur := nh.node
 		head := nh.head
 
-		n, delta, err := getter.GetDelta(store.ctx, cur)
+		ctx, cancel := context.WithTimeout(store.ctx, store.opts.DAGSyncerTimeout)
+		n, delta, err := getter.GetDelta(ctx, cur)
 		if err != nil {
+			cancel()
 			return errors.Wrapf(err, "error getting node for reprocessing %s", cur)
 		}
+		cancel()
+
 		isProcessed, err := store.isProcessed(cur)
 		if err != nil {
 			return errors.Wrapf(err, "error checking for reprocessed block %s", cur)
