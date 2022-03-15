@@ -11,9 +11,20 @@ It satisfies the
 and [`Batching`](https://pkg.go.dev/github.com/ipfs/go-datastore#Batching)
 interfaces from `go-datastore`.
 
+This means that you can create a network of nodes that use this datastore, and 
+that each key-value pair written to it will automatically replicate to every
+other node. Update can be published by any node. Network messages can be dropped, 
+reordered, corrupted or duplicated. It is not necessary to know beforehand
+the number of replicas participating in the system. Replicas can join and leave 
+at will, without informing any other replica. There can be network partitions 
+but they are resolved as soon as connectivity is re-established between replicas.
+
 Internally it uses a delta-CRDT Add-Wins Observed-Removed set. The current
 value for a key is the one with highest priority. Priorities are defined as
 the height of the Merkle-CRDT node in which the key was introduced.
+
+Implementation is independent from Broadcaster and DAG syncer layers, although the 
+easiest is to use out of the box components from the IPFS stack (see below).
 
 ## Usage
 
@@ -28,7 +39,7 @@ the height of the Merkle-CRDT node in which the key was introduced.
     [libp2p PubSub](https://pkg.go.dev/github.com/libp2p/go-libp2p-pubsub) and
     the provided
     [`PubsubBroadcaster`](https://pkg.go.dev/github.com/ipfs/go-ds-crdt?utm_source=godoc#PubSubBroadcaster).
-  * A user-defined "dag syncer" component ([`ipld.DAGService`](https://pkg.go.dev/github.com/ipfs/go-ipld-format?utm_source=godoc#DAGService)) to publish and
+  * A user-defined "DAG syncer" component ([`ipld.DAGService`](https://pkg.go.dev/github.com/ipfs/go-ipld-format?utm_source=godoc#DAGService)) to publish and
     retrieve Merkle DAGs to the network. For example, you can use
     [IPFS-Lite](https://github.com/hsanjuan/ipfs-lite) which casually
     satisfies this interface.
