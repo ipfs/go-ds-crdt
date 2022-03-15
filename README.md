@@ -13,7 +13,7 @@ interfaces from `go-datastore`.
 
 This means that you can create a network of nodes that use this datastore, and 
 that each key-value pair written to it will automatically replicate to every
-other node. Update can be published by any node. Network messages can be dropped, 
+other node. Updates can be published by any node. Network messages can be dropped, 
 reordered, corrupted or duplicated. It is not necessary to know beforehand
 the number of replicas participating in the system. Replicas can join and leave 
 at will, without informing any other replica. There can be network partitions 
