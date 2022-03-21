@@ -9,7 +9,7 @@ require (
 	github.com/ipfs/go-ds-badger v0.3.0
 	github.com/ipfs/go-ipfs-blockstore v1.1.2
 	github.com/ipfs/go-ipfs-ds-help v1.1.0
-	github.com/ipfs/go-ipld-format v0.2.0
+	github.com/ipfs/go-ipld-format v0.3.0
 	github.com/ipfs/go-log/v2 v2.3.0
 	github.com/ipfs/go-merkledag v0.5.1
 	github.com/jbenet/goprocess v0.1.4
