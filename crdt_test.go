@@ -896,3 +896,17 @@ func BenchmarkQueryElements(b *testing.B) {
 	}
 	b.Log(totalSize)
 }
+
+func TestRandomizeInterval(t *testing.T) {
+	prevR := 100 * time.Second
+	for i := 0; i < 1000; i++ {
+		r := randomizeInterval(100 * time.Second)
+		if r < 70*time.Second || r > 130*time.Second {
+			t.Error("r was ", r)
+		}
+		if prevR == r {
+			t.Log("r and prevR were equal")
+		}
+		prevR = r
+	}
+}
