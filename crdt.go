@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +54,10 @@ const (
 var (
 	ErrNoMoreBroadcast = errors.New("receiving blocks aborted since no new blocks will be broadcasted")
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 // A Broadcaster provides a way to send (notify) an opaque payload to
 // all replicas and to retrieve payloads broadcasted.
@@ -451,8 +456,16 @@ func (store *Datastore) encodeBroadcast(heads []cid.Cid) ([]byte, error) {
 	return proto.Marshal(&bcastData)
 }
 
+func randomizeInterval(d time.Duration) time.Duration {
+	// 30% of the configured interval
+	leeway := (d * 30 / 100)
+	// A random number between -leeway|+leeway
+	randomInterval := time.Duration(rand.Int63n(int64(leeway*2))) - leeway
+	return d + randomInterval
+}
+
 func (store *Datastore) rebroadcast() {
-	timer := time.NewTimer(store.opts.RebroadcastInterval)
+	timer := time.NewTimer(randomizeInterval(store.opts.RebroadcastInterval))
 
 	for {
 		select {
@@ -461,18 +474,9 @@ func (store *Datastore) rebroadcast() {
 				<-timer.C
 			}
 			return
-		default:
-		}
-
-		select {
-		case <-store.ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return
 		case <-timer.C:
 			store.rebroadcastHeads()
-			timer.Reset(store.opts.RebroadcastInterval)
+			timer.Reset(randomizeInterval(store.opts.RebroadcastInterval))
 		}
 	}
 }
