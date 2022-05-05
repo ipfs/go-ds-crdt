@@ -1,5 +1,7 @@
 module github.com/ipfs/go-ds-crdt
 
+go 1.18
+
 require (
 	github.com/dgraph-io/badger v1.6.2
 	github.com/golang/protobuf v1.5.2
@@ -67,11 +69,9 @@ require (
 	github.com/whyrusleeping/timecache v0.0.0-20160911033111-cfcb2f1abfee // indirect
 	go.uber.org/atomic v1.7.0 // indirect
 	go.uber.org/zap v1.16.0 // indirect
-	golang.org/x/crypto v0.0.0-20210513164829-c07d793c2f9a // indirect
+	golang.org/x/crypto v0.0.0-20210506145944-38f3c27a63bf // indirect
 	golang.org/x/net v0.0.0-20210428140749-89ef3d95e781 // indirect
-	golang.org/x/sys v0.0.0-20210514084401-e8d321eab015 // indirect
+	golang.org/x/sys v0.0.0-20210511113859-b0526f3d8744 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 )
-
-go 1.18
