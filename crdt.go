@@ -364,8 +364,15 @@ func (store *Datastore) handleNext() {
 		processHead := func(c cid.Cid) {
 			err = store.handleBlock(c) //handleBlock blocks
 			if err != nil {
-				store.logger.Error(err)
-				store.markDirty()
+				store.logger.Errorf("error processing new head: %s", err)
+				// For posterity: do not mark the store as
+				// Dirty if we could not handle a block. If an
+				// error happens here, it means the node could
+				// not be fetched, thus it could not be
+				// processed, thus it did not leave a branch
+				// half-processed and there's nothign to
+				// recover.
+				// disabled: store.markDirty()
 			}
 		}
 
@@ -530,7 +537,7 @@ func (store *Datastore) rebroadcastHeads() {
 	store.seenHeadsMux.RUnlock()
 
 	// Send them out
-	err = store.broadcast(headsToBroadcast)
+	err = store.broadcast(store.ctx, headsToBroadcast)
 	if err != nil {
 		store.logger.Warn("broadcast failed: %v", err)
 	}
@@ -661,11 +668,13 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 
 	goodDeltas := make(map[cid.Cid]struct{})
 
-	// This gets deltas but it is unable to tells us which childrens
-	// failed to be fetched though.
+	var err error
+loop:
 	for deltaOpt := range ng.GetDeltas(ctx, children) {
+		// we abort whenever we a delta comes back in error.
 		if deltaOpt.err != nil {
-			return errors.Wrapf(deltaOpt.err, "error getting delta")
+			err = errors.Wrapf(deltaOpt.err, "error getting delta")
+			break
 		}
 		goodDeltas[deltaOpt.node.Cid()] = struct{}{}
 
@@ -685,18 +694,23 @@ func (store *Datastore) sendNewJobs(session *sync.WaitGroup, ng *crdtNodeGetter,
 			session.Done()
 			// We are in the middle of sending jobs, thus we left
 			// something unprocessed.
-			return store.ctx.Err()
+			err = store.ctx.Err()
+			break loop
 		}
 	}
 
-	// Clear up any children that could not be fetched. The rest will
-	// remove themselves in processNode().
+	// This is a safe-guard in case GetDeltas() returns less deltas than
+	// asked for. It clears up any children that could not be fetched from
+	// the queue. The rest will remove themselves in processNode().
+	// Hector: as far as I know, this should not execute unless errors
+	// happened.
 	for _, child := range children {
 		if _, ok := goodDeltas[child]; !ok {
+			store.logger.Warn("GetDeltas did not include all children")
 			store.queuedChildren.Remove(child)
 		}
 	}
-	return nil
+	return err
 }
 
 // the only purpose of this worker is to be able to orderly shut-down job
@@ -1029,7 +1043,7 @@ func (store *Datastore) Query(ctx context.Context, q query.Query) (query.Results
 // Put stores the object `value` named by `key`.
 func (store *Datastore) Put(ctx context.Context, key ds.Key, value []byte) error {
 	delta := store.set.Add(ctx, key.String(), value)
-	return store.publish(delta)
+	return store.publish(ctx, delta)
 }
 
 // Delete removes the value for given `key`.
@@ -1042,7 +1056,7 @@ func (store *Datastore) Delete(ctx context.Context, key ds.Key) error {
 	if len(delta.Tombstones) == 0 {
 		return nil
 	}
-	return store.publish(delta)
+	return store.publish(ctx, delta)
 }
 
 // Sync ensures that all the data under the given prefix is flushed to disk in
@@ -1170,10 +1184,10 @@ func (store *Datastore) updateDelta(newDelta *pb.Delta) int {
 	return size
 }
 
-func (store *Datastore) publishDelta() error {
+func (store *Datastore) publishDelta(ctx context.Context) error {
 	store.curDeltaMux.Lock()
 	defer store.curDeltaMux.Unlock()
-	err := store.publish(store.curDelta)
+	err := store.publish(ctx, store.curDelta)
 	if err != nil {
 		return err
 	}
@@ -1200,7 +1214,7 @@ func (store *Datastore) putBlock(heads []cid.Cid, height uint64, delta *pb.Delta
 	return node, nil
 }
 
-func (store *Datastore) publish(delta *pb.Delta) error {
+func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 	// curDelta might be nil if nothing has been added to it
 	if delta == nil {
 		return nil
@@ -1209,7 +1223,7 @@ func (store *Datastore) publish(delta *pb.Delta) error {
 	if err != nil {
 		return err
 	}
-	return store.broadcast([]cid.Cid{c})
+	return store.broadcast(ctx, []cid.Cid{c})
 }
 
 func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
@@ -1253,13 +1267,19 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 	return nd.Cid(), nil
 }
 
-func (store *Datastore) broadcast(cids []cid.Cid) error {
+func (store *Datastore) broadcast(ctx context.Context, cids []cid.Cid) error {
 	if store.broadcaster == nil { // offline
 		return nil
 	}
 
 	if len(cids) == 0 { // nothing to rebroadcast
 		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		store.logger.Debugf("skipping broadcast: %s", ctx.Err())
+	default:
 	}
 
 	store.logger.Debugf("broadcasting %s", cids)
@@ -1305,8 +1325,10 @@ func (b *batch) Delete(ctx context.Context, key ds.Key) error {
 	return nil
 }
 
+// Commit writes the current delta as a new DAG node and publishes the new
+// head. The publish step is skipped if the context is cancelled.
 func (b *batch) Commit(ctx context.Context) error {
-	return b.store.publishDelta()
+	return b.store.publishDelta(ctx)
 }
 
 // PrintDAG pretty prints the current Merkle-DAG to stdout in a pretty
