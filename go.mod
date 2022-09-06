@@ -1,6 +1,6 @@
 module github.com/ipfs/go-ds-crdt
 
-go 1.18
+go 1.19
 
 require (
 	github.com/dgraph-io/badger v1.6.2
@@ -13,7 +13,7 @@ require (
 	github.com/ipfs/go-ipfs-ds-help v1.1.0
 	github.com/ipfs/go-ipld-format v0.4.0
 	github.com/ipfs/go-log/v2 v2.5.1
-	github.com/ipfs/go-merkledag v0.6.0
+	github.com/ipfs/go-merkledag v0.7.0
 	github.com/jbenet/goprocess v0.1.4
 	github.com/libp2p/go-libp2p-pubsub v0.8.0
 	github.com/multiformats/go-multihash v0.2.1
@@ -42,8 +42,8 @@ require (
 	github.com/ipfs/go-log v1.0.5 // indirect
 	github.com/ipfs/go-metrics-interface v0.0.1 // indirect
 	github.com/ipfs/go-verifcid v0.0.1 // indirect
-	github.com/ipld/go-codec-dagpb v1.3.0 // indirect
-	github.com/ipld/go-ipld-prime v0.11.0 // indirect
+	github.com/ipld/go-codec-dagpb v1.3.1 // indirect
+	github.com/ipld/go-ipld-prime v0.16.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.1.0 // indirect
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-libp2p v0.22.0 // indirect
