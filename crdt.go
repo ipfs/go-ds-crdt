@@ -750,7 +750,7 @@ func (store *Datastore) dirtyKey() ds.Key {
 
 // MarkDirty marks the Datastore as dirty.
 func (store *Datastore) MarkDirty() {
-	store.logger.Error("marking datastore as dirty")
+	store.logger.Warn("marking datastore as dirty")
 	err := store.store.Put(store.ctx, store.dirtyKey(), nil)
 	if err != nil {
 		store.logger.Errorf("error setting dirty bit: %s", err)
@@ -883,7 +883,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 	return children, nil
 }
 
-// repairDAG is used to walk down the chain until a non-processed node is
+// RepairDAG is used to walk down the chain until a non-processed node is
 // found and at that moment, queues it for processing.
 func (store *Datastore) repairDAG() error {
 	start := time.Now()
