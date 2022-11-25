@@ -15,7 +15,6 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 	dssync "github.com/ipfs/go-datastore/sync"
-	dstest "github.com/ipfs/go-datastore/test"
 	badgerds "github.com/ipfs/go-ds-badger"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	ipld "github.com/ipfs/go-ipld-format"
@@ -37,7 +36,6 @@ var store int = mapStore
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
-	dstest.ElemCount = 10
 }
 
 type testLogger struct {
@@ -709,7 +707,8 @@ func (st *syncedTrackDs) isSynced(k ds.Key) bool {
 	mustBeSynced := []ds.Key{
 		st.set.elemsPrefix(prefixStr),
 		st.set.tombsPrefix(prefixStr),
-		st.set.keyPrefix(keysNs).Child(k),
+		st.set.valueKey(prefixStr),
+		st.set.priorityKey(prefixStr),
 	}
 
 	for k := range st.syncs {

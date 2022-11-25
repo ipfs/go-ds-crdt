@@ -12,6 +12,10 @@ import (
 	dstest "github.com/ipfs/go-datastore/test"
 )
 
+func init() {
+	dstest.ElemCount = 10
+}
+
 func TestDatastoreSuite(t *testing.T) {
 	ctx := context.Background()
 

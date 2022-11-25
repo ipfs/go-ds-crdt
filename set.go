@@ -20,11 +20,10 @@ import (
 )
 
 var (
-	elemsNs        = "s" // /elements namespace /set/s/<key>/<block>
-	tombsNs        = "t" // /tombstones namespace /set/t/<key>/<block>
-	keysNs         = "k" // /keys namespace /set/k/<key>/{v,p}
-	valueSuffix    = "v" // for /keys namespace
-	prioritySuffix = "p"
+	elemsNs      = "s" // /elements namespace /set/s/<key>/<block>
+	tombsNs      = "t" // /tombstones namespace /set/t/<key>/<block>
+	valuesNs     = "v" // values namespace /set/v/<key>
+	prioritiesNs = "p" // priorities namespace /set/p/<key>
 )
 
 // set implements an Add-Wins Observed-Remove Set using delta-CRDTs
@@ -225,16 +224,10 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 	// This makes sure the use of things like "/../" in the query
 	// does not affect our setQuery.
 	srcQueryPrefixKey := ds.NewKey(q.Prefix)
-
-	keyNamespacePrefix := s.keyPrefix(keysNs)
-	keyNamespacePrefixStr := keyNamespacePrefix.String()
-	setQueryPrefix := keyNamespacePrefix.Child(srcQueryPrefixKey).String()
-	vSuffix := "/" + valueSuffix
-
-	// We are going to be reading everything in the /set/ namespace which
-	// will return items in the form:
-	// * /set/<key>/value
-	// * /set<key>/priority (a Uvarint)
+	// values/query/prefix We are going to be reading everything in the
+	// /values/ namespace (when no filter is provided)
+	setQueryPrefix := s.keyPrefix(valuesNs).Child(srcQueryPrefixKey)
+	valuesNamespacePrefixStr := s.keyPrefix(valuesNs).String()
 
 	// It is clear that KeysOnly=true should be used here when the original
 	// query only wants keys.
@@ -254,7 +247,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 	// querying with value. It may be that speed is fully affected by the
 	// current state of table compaction as well.
 	setQuery := query.Query{
-		Prefix:   setQueryPrefix,
+		Prefix:   setQueryPrefix.String(),
 		KeysOnly: false,
 	}
 
@@ -308,19 +301,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 				return
 			}
 
-			// We will be getting keys in the form of
-			// /namespace/keys/<key>/v and /namespace/keys/<key>/p
-			// We discard anything not ending in /v and sanitize
-			// those from:
-			// /namespace/keys/<key>/v -> <key>
-			if !strings.HasSuffix(r.Key, vSuffix) { // "/v"
-				continue
-			}
-
-			key := strings.TrimSuffix(
-				strings.TrimPrefix(r.Key, keyNamespacePrefixStr),
-				"/"+valueSuffix,
-			)
+			key := strings.TrimPrefix(r.Key, valuesNamespacePrefixStr)
 
 			entry.Key = key
 			entry.Value = r.Value
@@ -435,14 +416,14 @@ func (s *set) tombsPrefix(key string) ds.Key {
 	return s.keyPrefix(tombsNs).ChildString(key)
 }
 
-// /namespace/keys/<key>/value
+// /namespace/values/<key>
 func (s *set) valueKey(key string) ds.Key {
-	return s.keyPrefix(keysNs).ChildString(key).ChildString(valueSuffix)
+	return s.keyPrefix(valuesNs).ChildString(key)
 }
 
-// /namespace/keys/<key>/priority
+// /namespace/priorities/<key>
 func (s *set) priorityKey(key string) ds.Key {
-	return s.keyPrefix(keysNs).ChildString(key).ChildString(prioritySuffix)
+	return s.keyPrefix(prioritiesNs).ChildString(key)
 }
 
 func (s *set) getPriority(ctx context.Context, key string) (uint64, error) {
@@ -658,7 +639,8 @@ func (s *set) datastoreSync(ctx context.Context, prefix ds.Key) error {
 	toSync := []ds.Key{
 		s.elemsPrefix(prefixStr),
 		s.tombsPrefix(prefixStr),
-		s.keyPrefix(keysNs).Child(prefix), // covers values and priorities
+		s.valueKey(prefixStr),
+		s.priorityKey(prefixStr),
 	}
 
 	errs := make([]error, len(toSync))
