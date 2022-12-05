@@ -46,8 +46,9 @@ var _ ds.Batching = (*Datastore)(nil)
 const (
 	headsNs           = "h" // heads
 	setNs             = "s" // set
-	processedBlocksNs = "b" // blocks
+	processedBlocksNs = "p" // blocks
 	dirtyBitKey       = "d" // dirty
+	versionKey        = "v" // version
 )
 
 // Common errors.
@@ -312,6 +313,20 @@ func New(
 			dstore.dagWorker()
 		}()
 	}
+
+	v := dstore.Version()
+	if v == 0 {
+		return nil, errors.New("error getting datastore version")
+	}
+
+	if v != Version {
+		dstore.logger.Infof("migration is necessary: version %d to %d", v, Version)
+		err := dstore.migrate(ctx, v, Version)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	dstore.wg.Add(4)
 	go func() {
 		defer dstore.wg.Done()
@@ -748,6 +763,10 @@ func (store *Datastore) dirtyKey() ds.Key {
 	return store.namespace.ChildString(dirtyBitKey)
 }
 
+func (store *Datastore) versionKey() ds.Key {
+	return store.namespace.ChildString(versionKey)
+}
+
 // MarkDirty marks the Datastore as dirty.
 func (store *Datastore) MarkDirty() {
 	store.logger.Warn("marking datastore as dirty")
@@ -773,6 +792,26 @@ func (store *Datastore) MarkClean() {
 	if err != nil {
 		store.logger.Errorf("error clearing dirty bit: %s", err)
 	}
+}
+
+// Version returns the current datastore version.
+func (store *Datastore) Version() uint {
+	data, err := store.store.Get(store.ctx, store.versionKey())
+	if err != nil {
+		if err == ds.ErrNotFound {
+			return 1
+		}
+		store.logger.Errorf("error getting version: %s", err)
+		return 0
+	}
+	return uint(data[0])
+}
+
+// SetVersion writes the datastore version. This should not be normally used!
+func (store *Datastore) SetVersion(v uint) error {
+	store.logger.Infof("setting version to %d")
+
+	return store.store.Put(store.ctx, store.versionKey(), []byte{byte(v)})
 }
 
 // processNode merges the delta in a node and has the logic about what to do
