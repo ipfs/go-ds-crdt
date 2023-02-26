@@ -21,10 +21,10 @@ import (
 	crdt "github.com/ipfs/go-ds-crdt"
 	logging "github.com/ipfs/go-log/v2"
 
-	crypto "github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p-core/host"
-	"github.com/libp2p/go-libp2p-core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	crypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	ipfslite "github.com/hsanjuan/ipfs-lite"
 	"github.com/mitchellh/go-homedir"
@@ -149,7 +149,7 @@ func main() {
 		}
 	}()
 
-	ipfs, err := ipfslite.New(ctx, store, h, dht, nil)
+	ipfs, err := ipfslite.New(ctx, store, nil, h, dht, nil)
 	if err != nil {
 		logger.Fatal(err)
 	}
