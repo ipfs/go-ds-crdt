@@ -11,17 +11,17 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger"
+	blockstore "github.com/ipfs/boxo/blockstore"
+	"github.com/ipfs/boxo/ipld/merkledag"
+	mdutils "github.com/ipfs/boxo/ipld/merkledag/test"
 	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 	dssync "github.com/ipfs/go-datastore/sync"
 	dstest "github.com/ipfs/go-datastore/test"
 	badgerds "github.com/ipfs/go-ds-badger"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
-	"github.com/ipfs/go-merkledag"
-	mdutils "github.com/ipfs/go-merkledag/test"
 	"github.com/multiformats/go-multihash"
 )
 

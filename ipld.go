@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 
+	dag "github.com/ipfs/boxo/ipld/merkledag"
 	cid "github.com/ipfs/go-cid"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
-	dag "github.com/ipfs/go-merkledag"
 	"google.golang.org/protobuf/proto"
 )
 
