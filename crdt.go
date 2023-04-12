@@ -26,8 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 	pb "github.com/ipfs/go-ds-crdt/pb"
-	dshelp "github.com/ipfs/go-ipfs-ds-help"
 	"go.uber.org/multierr"
 	"google.golang.org/protobuf/proto"
 
