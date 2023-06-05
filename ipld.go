@@ -15,10 +15,6 @@ import (
 
 var _ ipld.NodeGetter = (*crdtNodeGetter)(nil)
 
-func init() {
-	ipld.Register(cid.DagProtobuf, dag.DecodeProtobufBlock)
-}
-
 // crdtNodeGetter wraps an ipld.NodeGetter with some additional utility methods
 type crdtNodeGetter struct {
 	ipld.NodeGetter
