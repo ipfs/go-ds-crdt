@@ -154,7 +154,8 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	pubsubBC, err := crdt.NewPubSubBroadcaster(ctx, psub, topicName)
+	psubCtx, psubCancel := context.WithCancel(ctx)
+	pubsubBC, err := crdt.NewPubSubBroadcaster(psubCtx, psub, topicName)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -175,6 +176,7 @@ func main() {
 		logger.Fatal(err)
 	}
 	defer crdt.Close()
+	defer psubCancel()
 
 	fmt.Println("Bootstrapping...")
 
