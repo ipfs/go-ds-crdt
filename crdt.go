@@ -55,9 +55,7 @@ var (
 	ErrNoMoreBroadcast = errors.New("receiving blocks aborted since no new blocks will be broadcasted")
 )
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
+var randGen = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 // A Broadcaster provides a way to send (notify) an opaque payload to
 // all replicas and to retrieve payloads broadcasted.
@@ -467,7 +465,7 @@ func randomizeInterval(d time.Duration) time.Duration {
 	// 30% of the configured interval
 	leeway := (d * 30 / 100)
 	// A random number between -leeway|+leeway
-	randomInterval := time.Duration(rand.Int63n(int64(leeway*2))) - leeway
+	randomInterval := time.Duration(randGen.Int63n(int64(leeway*2))) - leeway
 	return d + randomInterval
 }
 

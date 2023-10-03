@@ -3,7 +3,6 @@ package crdt
 import (
 	"bytes"
 	"context"
-	"math/rand"
 	"reflect"
 	"sort"
 	"testing"
@@ -33,7 +32,7 @@ func newTestHeads(t *testing.T) *heads {
 func newCID(t *testing.T) cid.Cid {
 	t.Helper()
 	var buf [32]byte
-	_, _ = rand.Read(buf[:])
+	_, _ = randGen.Read(buf[:])
 
 	mh, err := multihash.Sum(buf[:], multihash.SHA2_256, -1)
 	if err != nil {
@@ -57,7 +56,7 @@ func TestHeadsBasic(t *testing.T) {
 	cidHeights := make(map[cid.Cid]uint64)
 	numHeads := 5
 	for i := 0; i < numHeads; i++ {
-		c, height := newCID(t), uint64(rand.Int())
+		c, height := newCID(t), uint64(randGen.Int())
 		cidHeights[c] = height
 		err := heads.Add(ctx, c, height)
 		if err != nil {
@@ -68,7 +67,7 @@ func TestHeadsBasic(t *testing.T) {
 	assertHeads(t, heads, cidHeights)
 
 	for c := range cidHeights {
-		newC, newHeight := newCID(t), uint64(rand.Int())
+		newC, newHeight := newCID(t), uint64(randGen.Int())
 		err := heads.Replace(ctx, c, newC, newHeight)
 		if err != nil {
 			t.Fatal(err)
