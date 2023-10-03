@@ -3,6 +3,7 @@ package crdt
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -119,16 +120,20 @@ func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFun
 
 func (mb *mockBroadcaster) Broadcast(data []byte) error {
 	var wg sync.WaitGroup
+
+	randg := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	for i, ch := range mb.chans {
-		n := randGen.Intn(100)
+		n := randg.Intn(100)
 		if n < mb.dropProb {
 			continue
 		}
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
+			randg := rand.New(rand.NewSource(int64(i)))
 			// randomize when we send a little bit
-			if randGen.Intn(100) < 30 {
+			if randg.Intn(100) < 30 {
 				// Sleep for a very small time that will
 				// effectively be pretty random
 				time.Sleep(time.Nanosecond)
@@ -142,7 +147,7 @@ func (mb *mockBroadcaster) Broadcast(data []byte) error {
 			case <-timer.C:
 				mb.t.Errorf("broadcasting to %d timed out", i)
 			}
-		}()
+		}(i)
 		wg.Wait()
 	}
 	return nil
@@ -306,6 +311,7 @@ func TestCRDT(t *testing.T) {
 func TestCRDTReplication(t *testing.T) {
 	ctx := context.Background()
 	nItems := 50
+	randGen := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
