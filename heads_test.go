@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
@@ -15,6 +16,8 @@ import (
 )
 
 var headsTestNS = ds.NewKey("headstest")
+
+var randg = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 // TODO we should also test with a non-batching store
 func newTestHeads(t *testing.T) *heads {
@@ -33,7 +36,7 @@ func newTestHeads(t *testing.T) *heads {
 func newCID(t *testing.T) cid.Cid {
 	t.Helper()
 	var buf [32]byte
-	_, _ = rand.Read(buf[:])
+	_, _ = randg.Read(buf[:])
 
 	mh, err := multihash.Sum(buf[:], multihash.SHA2_256, -1)
 	if err != nil {
@@ -57,7 +60,7 @@ func TestHeadsBasic(t *testing.T) {
 	cidHeights := make(map[cid.Cid]uint64)
 	numHeads := 5
 	for i := 0; i < numHeads; i++ {
-		c, height := newCID(t), uint64(rand.Int())
+		c, height := newCID(t), uint64(randg.Int())
 		cidHeights[c] = height
 		err := heads.Add(ctx, c, height)
 		if err != nil {
@@ -68,7 +71,7 @@ func TestHeadsBasic(t *testing.T) {
 	assertHeads(t, heads, cidHeights)
 
 	for c := range cidHeights {
-		newC, newHeight := newCID(t), uint64(rand.Int())
+		newC, newHeight := newCID(t), uint64(randg.Int())
 		err := heads.Replace(ctx, c, newC, newHeight)
 		if err != nil {
 			t.Fatal(err)

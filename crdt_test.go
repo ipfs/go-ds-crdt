@@ -36,7 +36,6 @@ const (
 var store int = mapStore
 
 func init() {
-	rand.Seed(time.Now().UnixNano())
 	dstest.ElemCount = 10
 }
 
@@ -121,16 +120,20 @@ func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFun
 
 func (mb *mockBroadcaster) Broadcast(data []byte) error {
 	var wg sync.WaitGroup
+
+	randg := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	for i, ch := range mb.chans {
-		n := rand.Intn(100)
+		n := randg.Intn(100)
 		if n < mb.dropProb {
 			continue
 		}
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
+			randg := rand.New(rand.NewSource(int64(i)))
 			// randomize when we send a little bit
-			if rand.Intn(100) < 30 {
+			if randg.Intn(100) < 30 {
 				// Sleep for a very small time that will
 				// effectively be pretty random
 				time.Sleep(time.Nanosecond)
@@ -144,7 +147,7 @@ func (mb *mockBroadcaster) Broadcast(data []byte) error {
 			case <-timer.C:
 				mb.t.Errorf("broadcasting to %d timed out", i)
 			}
-		}()
+		}(i)
 		wg.Wait()
 	}
 	return nil
@@ -308,6 +311,7 @@ func TestCRDT(t *testing.T) {
 func TestCRDTReplication(t *testing.T) {
 	ctx := context.Background()
 	nItems := 50
+	randGen := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	replicas, closeReplicas := makeReplicas(t, nil)
 	defer closeReplicas()
@@ -316,7 +320,7 @@ func TestCRDTReplication(t *testing.T) {
 	for i := 0; i < nItems; i++ {
 		k := ds.RandomKey()
 		v := []byte(fmt.Sprintf("%d", i))
-		n := rand.Intn(len(replicas))
+		n := randGen.Intn(len(replicas))
 		err := replicas[n].Put(ctx, k, v)
 		if err != nil {
 			t.Fatal(err)
@@ -357,7 +361,7 @@ func TestCRDTReplication(t *testing.T) {
 
 	// give a new value for each item
 	for _, r := range rest {
-		n := rand.Intn(len(replicas))
+		n := randGen.Intn(len(replicas))
 		err := replicas[n].Put(ctx, ds.NewKey(r.Key), []byte("hola"))
 		if err != nil {
 			t.Error(err)
