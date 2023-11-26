@@ -77,6 +77,8 @@ type SessionDAGService interface {
 type Options struct {
 	Logger              logging.StandardLogger
 	RebroadcastInterval time.Duration
+	// TODO comment
+	Filter func(*pb.Delta)
 	// The PutHook function is triggered whenever an element
 	// is successfully added to the datastore (either by a local
 	// or remote update), and only when that addition is considered the
@@ -146,6 +148,7 @@ func DefaultOptions() *Options {
 	return &Options{
 		Logger:              logging.Logger("crdt"),
 		RebroadcastInterval: time.Minute,
+		Filter:              nil,
 		PutHook:             nil,
 		DeleteHook:          nil,
 		NumWorkers:          5,
@@ -240,6 +243,13 @@ func New(
 	// <namespace>/heads
 	fullHeadsNs := namespace.ChildString(headsNs)
 
+	setFilter := func(delta *pb.Delta) {
+		if opts.Filter == nil {
+			return
+		}
+		opts.Filter(delta)
+	}
+
 	setPutHook := func(k string, v []byte) {
 		if opts.PutHook == nil {
 			return
@@ -257,7 +267,7 @@ func New(
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	set, err := newCRDTSet(ctx, store, fullSetNs, opts.Logger, setPutHook, setDeleteHook)
+	set, err := newCRDTSet(ctx, store, fullSetNs, opts.Logger, setFilter, setPutHook, setDeleteHook)
 	if err != nil {
 		cancel()
 		return nil, errors.Wrap(err, "error setting up crdt set")
@@ -1218,6 +1228,12 @@ func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 	if delta == nil {
 		return nil
 	}
+
+	if len(delta.Elements) == 0 && len(delta.Tombstones) == 0 {
+		fmt.Printf("skipping empty delta\n")
+		return nil
+	}
+
 	c, err := store.addDAGNode(delta)
 	if err != nil {
 		return err

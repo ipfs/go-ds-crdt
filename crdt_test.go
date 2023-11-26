@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	dssync "github.com/ipfs/go-datastore/sync"
 	dstest "github.com/ipfs/go-datastore/test"
 	badgerds "github.com/ipfs/go-ds-badger"
+	"github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
 	"github.com/multiformats/go-multihash"
@@ -544,6 +546,77 @@ func TestCRDTPrintDAG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCRDTFilter(t *testing.T) {
+	ctx := context.Background()
+
+	opts := DefaultOptions()
+	opts.Filter = func(delta *pb.Delta) {
+		filterElements := func(elems []*pb.Element) []*pb.Element {
+			filteredElems := make([]*pb.Element, 0, len(elems))
+
+			for _, e := range elems {
+				if strings.HasPrefix(e.Key, "/a") {
+					filteredElems = append(filteredElems, e)
+				}
+			}
+
+			fmt.Println("filteredElems", filteredElems)
+
+			return filteredElems
+		}
+
+		// filterTombstones := func(elems []*pb.Element) []*pb.Element {
+		// 	filteredElems := make([]*pb.Element, 0, len(elems))
+		//
+		// 	for _, e := range elems {
+		// 		if strings.HasPrefix(e.Key, "/a") {
+		// 			filteredElems = append(filteredElems, e)
+		// 		}
+		// 	}
+		//
+		// 	return filteredElems
+		// }
+
+		delta.Elements = filterElements(delta.Elements)
+		// delta.Tombstones = filterTombstones(delta.Elements)
+	}
+
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
+	numKeys := 50
+	aKeys := 0
+	aKeyCount := 0
+
+	for i := 0; i < numKeys; i++ {
+		k := ds.RandomKey()
+		if strings.HasPrefix(k.String(), "/a") {
+			aKeys++
+		}
+
+		err := replicas[0].Put(ctx, k, []byte("test"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+		for _, r := range replicas {
+			_, err := r.Get(ctx, k)
+			if err == nil {
+				aKeyCount++
+			}
+		}
+	}
+
+	fmt.Println("aKeys", aKeys)
+	fmt.Println("aKeyCount", aKeyCount)
+
+	if aKeyCount != aKeys*len(replicas) {
+		t.Errorf("expected %d keys, got %d", aKeys*len(replicas), aKeyCount)
+	}
+
 }
 
 func TestCRDTHooks(t *testing.T) {
