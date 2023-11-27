@@ -685,6 +685,11 @@ loop:
 		}
 		goodDeltas[deltaOpt.node.Cid()] = struct{}{}
 
+		// filter the elements and tombstones before passing to the jobs
+		if store.set.filter != nil {
+			store.set.filter(deltaOpt.delta)
+		}
+
 		session.Add(1)
 		job := &dagJob{
 			session:    session,
