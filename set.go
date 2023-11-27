@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -140,10 +139,7 @@ func (s *set) Add(ctx context.Context, key string, value []byte) *pb.Delta {
 	}
 
 	if s.filter != nil {
-		fmt.Printf("filtering delta for %+v\n", d)
 		s.filter(d)
-	} else {
-		fmt.Printf("no filter set")
 	}
 
 	return d
@@ -193,6 +189,11 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 			})
 		}
 	}
+
+	if s.filter != nil {
+		s.filter(delta)
+	}
+
 	return delta, nil
 }
 

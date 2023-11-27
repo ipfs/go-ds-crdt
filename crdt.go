@@ -1225,12 +1225,7 @@ func (store *Datastore) putBlock(heads []cid.Cid, height uint64, delta *pb.Delta
 
 func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 	// curDelta might be nil if nothing has been added to it
-	if delta == nil {
-		return nil
-	}
-
-	if len(delta.Elements) == 0 && len(delta.Tombstones) == 0 {
-		fmt.Printf("skipping empty delta\n")
+	if delta == nil || (len(delta.Elements) == 0 && len(delta.Tombstones) == 0) {
 		return nil
 	}
 

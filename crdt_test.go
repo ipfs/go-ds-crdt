@@ -548,7 +548,7 @@ func TestCRDTPrintDAG(t *testing.T) {
 	}
 }
 
-func TestCRDTFilter(t *testing.T) {
+func TestCRDTFilterElements(t *testing.T) {
 	ctx := context.Background()
 
 	opts := DefaultOptions()
@@ -562,61 +562,110 @@ func TestCRDTFilter(t *testing.T) {
 				}
 			}
 
-			fmt.Println("filteredElems", filteredElems)
-
 			return filteredElems
 		}
 
-		// filterTombstones := func(elems []*pb.Element) []*pb.Element {
-		// 	filteredElems := make([]*pb.Element, 0, len(elems))
-		//
-		// 	for _, e := range elems {
-		// 		if strings.HasPrefix(e.Key, "/a") {
-		// 			filteredElems = append(filteredElems, e)
-		// 		}
-		// 	}
-		//
-		// 	return filteredElems
-		// }
-
 		delta.Elements = filterElements(delta.Elements)
-		// delta.Tombstones = filterTombstones(delta.Elements)
 	}
 
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
-	numKeys := 50
-	aKeys := 0
-	aKeyCount := 0
+	keys := []ds.Key{}
+	keys = append(keys, ds.NewKey("/a1")) // allowed
+	keys = append(keys, ds.NewKey("/b1")) // not allowed
 
-	for i := 0; i < numKeys; i++ {
-		k := ds.RandomKey()
-		if strings.HasPrefix(k.String(), "/a") {
-			aKeys++
-		}
+	allowedKeys := 1
+	allowedKeysCount := 0
 
-		err := replicas[0].Put(ctx, k, []byte("test"))
+	for i := 0; i < len(keys); i++ {
+		err := replicas[0].Put(ctx, keys[i], []byte("test"))
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		time.Sleep(100 * time.Millisecond)
 		for _, r := range replicas {
-			_, err := r.Get(ctx, k)
+			_, err := r.Get(ctx, keys[i])
 			if err == nil {
-				aKeyCount++
+				allowedKeysCount++
 			}
 		}
 	}
 
-	fmt.Println("aKeys", aKeys)
-	fmt.Println("aKeyCount", aKeyCount)
+	if allowedKeysCount != allowedKeys*len(replicas) {
+		t.Errorf("expected %d keys, got %d", allowedKeys*len(replicas), allowedKeysCount)
+	}
+}
 
-	if aKeyCount != aKeys*len(replicas) {
-		t.Errorf("expected %d keys, got %d", aKeys*len(replicas), aKeyCount)
+func TestCRDTFilterTombstones(t *testing.T) {
+	ctx := context.Background()
+
+	opts := DefaultOptions()
+	opts.Filter = func(delta *pb.Delta) {
+		filteredTombstones := func(elems []*pb.Element) []*pb.Element {
+			filteredTombstones := make([]*pb.Element, 0, len(elems))
+
+			for _, e := range elems {
+				// Only allow tombstones for keys starting with "/a"
+				if strings.HasPrefix(e.Key, "/a") {
+					filteredTombstones = append(filteredTombstones, e)
+				}
+			}
+
+			return filteredTombstones
+		}
+
+		delta.Tombstones = filteredTombstones(delta.Tombstones)
 	}
 
+	replicas, closeReplicas := makeReplicas(t, opts)
+	defer closeReplicas()
+
+	keys := []ds.Key{}
+	keys = append(keys, ds.NewKey("/a1"))
+	keys = append(keys, ds.NewKey("/b1"))
+
+	for i := 0; i < len(keys); i++ {
+		err := replicas[0].Put(ctx, keys[i], []byte("test"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+		for _, r := range replicas {
+			_, err := r.Get(ctx, keys[i])
+			if err != nil {
+				t.Errorf("all replicas should have %s", keys[i].String())
+			}
+		}
+	}
+
+	for i := 0; i < len(keys); i++ {
+		err := replicas[0].Delete(ctx, keys[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+		for _, r := range replicas {
+			v, err := r.Get(ctx, keys[i])
+
+			if strings.HasPrefix(keys[i].String(), "/a") {
+				if err != nil && v != nil {
+					t.Errorf("all replicas should have deleted %s", keys[i].String())
+				}
+			}
+
+			if !strings.HasPrefix(keys[i].String(), "/a") {
+				if err != nil {
+					t.Errorf("all replicas should not have deleted %s", keys[i].String())
+				}
+			}
+
+			fmt.Printf("k: %v, v: %+v\n", keys[i].String(), v)
+		}
+	}
 }
 
 func TestCRDTHooks(t *testing.T) {
