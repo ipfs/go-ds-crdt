@@ -1,7 +1,9 @@
 package crdt
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -554,15 +556,15 @@ func TestCRDTFilterElements(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Filter = func(delta *pb.Delta) {
 		filterElements := func(elems []*pb.Element) []*pb.Element {
-			filteredElems := make([]*pb.Element, 0, len(elems))
+			allowedElements := make([]*pb.Element, 0, len(elems))
 
 			for _, e := range elems {
 				if strings.HasPrefix(e.Key, "/a") {
-					filteredElems = append(filteredElems, e)
+					allowedElements = append(allowedElements, e)
 				}
 			}
 
-			return filteredElems
+			return allowedElements
 		}
 
 		delta.Elements = filterElements(delta.Elements)
@@ -603,28 +605,27 @@ func TestCRDTFilterTombstones(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.Filter = func(delta *pb.Delta) {
-		filteredTombstones := func(elems []*pb.Element) []*pb.Element {
-			filteredTombstones := make([]*pb.Element, 0, len(elems))
+		filterTombstones := func(elems []*pb.Element) []*pb.Element {
+			allowedTombstones := make([]*pb.Element, 0, len(elems))
 
 			for _, e := range elems {
-				// Only allow tombstones for keys starting with "/a"
 				if strings.HasPrefix(e.Key, "/a") {
-					filteredTombstones = append(filteredTombstones, e)
+					allowedTombstones = append(allowedTombstones, e)
 				}
 			}
 
-			return filteredTombstones
+			return allowedTombstones
 		}
 
-		delta.Tombstones = filteredTombstones(delta.Tombstones)
+		delta.Tombstones = filterTombstones(delta.Tombstones)
 	}
 
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
 	keys := []ds.Key{}
-	keys = append(keys, ds.NewKey("/a1"))
-	keys = append(keys, ds.NewKey("/b1"))
+	keys = append(keys, ds.NewKey("/a1")) // allowed
+	keys = append(keys, ds.NewKey("/b1")) // not allowed
 
 	for i := 0; i < len(keys); i++ {
 		err := replicas[0].Put(ctx, keys[i], []byte("test"))
@@ -662,8 +663,65 @@ func TestCRDTFilterTombstones(t *testing.T) {
 					t.Errorf("all replicas should not have deleted %s", keys[i].String())
 				}
 			}
+		}
+	}
+}
 
-			fmt.Printf("k: %v, v: %+v\n", keys[i].String(), v)
+func TestCRDTFilterIgnoreBadElements(t *testing.T) {
+	ctx := context.Background()
+
+	optsWithFilter := DefaultOptions()
+	optsWithFilter.Filter = func(delta *pb.Delta) {
+		filterElements := func(elems []*pb.Element) []*pb.Element {
+			allowedElements := make([]*pb.Element, 0, len(elems))
+
+			for _, e := range elems {
+				if json.Valid(e.Value) {
+					allowedElements = append(allowedElements, e)
+				}
+			}
+
+			return allowedElements
+		}
+
+		delta.Elements = filterElements(delta.Tombstones)
+	}
+
+	replicasWithFilter, closeReplicasWithFilter := makeNReplicas(t, 5, optsWithFilter)
+	defer closeReplicasWithFilter()
+
+	optsWithoutFilter := DefaultOptions()
+
+	replicasWithoutFilter, closeReplicasWithoutFilter := makeNReplicas(t, 1, optsWithoutFilter)
+	defer closeReplicasWithoutFilter()
+
+	keys := []ds.Key{}
+	keys = append(keys, ds.NewKey("/test"))
+
+	notJson := []byte("{{NOT JSON}}")
+
+	for i := 0; i < len(keys); i++ {
+		// replica without filter should accept invalid json
+		err := replicasWithoutFilter[0].Put(ctx, keys[i], notJson)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		v, err := replicasWithoutFilter[0].Get(ctx, keys[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Equal(notJson, v) {
+			t.Fatal("should have returned the same value")
+		}
+
+		time.Sleep(100 * time.Millisecond)
+		for _, r := range replicasWithFilter {
+			_, err := r.Get(ctx, keys[i])
+			if err == nil {
+				t.Errorf("all replicas should not have %s", keys[i].String())
+			}
 		}
 	}
 }
