@@ -210,7 +210,7 @@ type dagJob struct {
 // ipfs-lite (https://github.com/hsanjuan/ipfs-lite) as a DAG Service and the
 // included libp2p PubSubBroadcaster as a Broadcaster.
 //
-// The given Datastatore is used to back all CRDT-datastore contents and
+// The given Datastore is used to back all CRDT-datastore contents and
 // accounting information. When using an asynchronous datastore, the user is
 // in charge of calling Sync() regularly. Sync() will persist paths related to
 // the given prefix, but note that if other replicas are modifying the
