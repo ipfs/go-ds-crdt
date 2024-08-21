@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -33,7 +34,6 @@ import (
 
 var (
 	logger    = logging.Logger("globaldb")
-	listen, _ = multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/0")
 	topicName = "globaldb-example"
 	netTopic  = "globaldb-example-net"
 	config    = "globaldb-example"
@@ -42,7 +42,16 @@ var (
 func main() {
 	daemonMode := flag.Bool("daemon", false, "Run in daemon mode")
 	dataDir := flag.String("datadir", "", "Use a custom data directory")
+	port := flag.String("port", "0", "Specify the TCP port to listen on")
+
 	flag.Parse()
+
+	if *port != "" {
+		parsedPort, err := strconv.ParseUint(*port, 10, 32)
+		if err != nil || parsedPort > 65535 {
+			logger.Fatal("Specify a valid TCP port")
+		}
+	}
 
 	// Bootstrappers are using 1024 keys. See:
 	// https://github.com/ipfs/infra/issues/378
@@ -112,6 +121,8 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
+
+	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/" + *port)
 
 	h, dht, err := ipfslite.SetupLibp2p(
 		ctx,
