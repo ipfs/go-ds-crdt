@@ -255,8 +255,10 @@ Ready!
 > (l)ist                      -> list items in the store
 > (g)get <key>                -> get value for a key
 > (p)ut <key> <value>         -> store value on a key
+> (d)elete <key>              -> delete a key
 > (c)onnect <multiaddr>       -> connect a multiaddr
-> (d)ebug <on/off/peers/subs> -> enable/disable debug logging
+> print                       -> Print DAG
+> debug <on/off/peers/subs>   -> enable/disable debug logging
                                  show connected peers
                                  show pubsub subscribers
 > exit                        -> quit
@@ -284,7 +286,7 @@ Ready!
 			fmt.Printf("%s", commands)
 			fmt.Printf("> ")
 			continue
-		case "d", "debug":
+		case "debug":
 			if len(fields) < 2 {
 				fmt.Println("debug <on/off/peers/subs>")
 				fmt.Println("> ")
@@ -351,6 +353,18 @@ Ready!
 				printErr(err)
 				continue
 			}
+		case "d", "delete":
+			if len(fields) < 2 {
+				fmt.Println("delete <key>")
+				fmt.Printf("> ")
+				continue
+			}
+			k := ds.NewKey(fields[1])
+			err := crdt.Delete(ctx, k)
+			if err != nil {
+				printErr(err)
+				continue
+			}
 		case "c", "connect":
 			if len(fields) < 2 {
 				fmt.Println("connect <mulitaddr>")
@@ -373,6 +387,8 @@ Ready!
 				printErr(err)
 				continue
 			}
+		case "print":
+			crdt.PrintDAG()
 		}
 		fmt.Printf("> ")
 	}
