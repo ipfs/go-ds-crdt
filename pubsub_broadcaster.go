@@ -48,22 +48,24 @@ func NewPubSubBroadcaster(ctx context.Context, psub *pubsub.PubSub, topic string
 }
 
 // Broadcast publishes some data.
-func (pbc *PubSubBroadcaster) Broadcast(data []byte) error {
-	return pbc.topic.Publish(pbc.ctx, data)
+func (pbc *PubSubBroadcaster) Broadcast(ctx context.Context, data []byte) error {
+	return pbc.topic.Publish(ctx, data)
 }
 
 // Next returns published data.
-func (pbc *PubSubBroadcaster) Next() ([]byte, error) {
+func (pbc *PubSubBroadcaster) Next(ctx context.Context) ([]byte, error) {
 	var msg *pubsub.Message
 	var err error
 
 	select {
 	case <-pbc.ctx.Done():
 		return nil, ErrNoMoreBroadcast
+	case <-ctx.Done():
+		return nil, ErrNoMoreBroadcast
 	default:
 	}
 
-	msg, err = pbc.subs.Next(pbc.ctx)
+	msg, err = pbc.subs.Next(ctx)
 	if err != nil {
 		if strings.Contains(err.Error(), "subscription cancelled") ||
 			strings.Contains(err.Error(), "context") {
