@@ -401,7 +401,7 @@ func TestCRDTReplication(t *testing.T) {
 	}
 
 	for _, r := range replicas {
-		list, _, err := r.heads.List()
+		list, _, err := r.heads.List(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -542,7 +542,7 @@ func TestCRDTPrintDAG(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	err := replicas[0].PrintDAG()
+	err := replicas[0].PrintDAG(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -785,6 +785,7 @@ func TestCRDTSync(t *testing.T) {
 }
 
 func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
+	ctx := context.Background()
 	mh, err := multihash.Sum([]byte("emacs is best"), multihash.SHA2_256, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -795,7 +796,7 @@ func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
-	cids, err := replicas[0].decodeBroadcast(cidV0.Bytes())
+	cids, err := replicas[0].decodeBroadcast(ctx, cidV0.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -804,12 +805,12 @@ func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
 		t.Error("should have returned a single cidV0", cids)
 	}
 
-	data, err := replicas[0].encodeBroadcast(cids)
+	data, err := replicas[0].encodeBroadcast(ctx, cids)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cids2, err := replicas[0].decodeBroadcast(data)
+	cids2, err := replicas[0].decodeBroadcast(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -922,10 +923,10 @@ func TestCRDTPutPutDelete(t *testing.T) {
 	if string(r0Res) != string(r1Res) {
 		fmt.Printf("r0Res: %s\nr1Res: %s\n", string(r0Res), string(r1Res))
 		t.Log("r0 dag")
-		replicas[0].PrintDAG()
+		replicas[0].PrintDAG(ctx)
 
 		t.Log("r1 dag")
-		replicas[1].PrintDAG()
+		replicas[1].PrintDAG(ctx)
 
 		t.Fatal("r0 and r1 should have the same value")
 	}
