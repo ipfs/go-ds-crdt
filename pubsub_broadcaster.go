@@ -7,6 +7,8 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
 
+var _ Broadcaster = (*PubSubBroadcaster)(nil)
+
 // PubSubBroadcaster implements a Broadcaster using libp2p PubSub.
 type PubSubBroadcaster struct {
 	ctx   context.Context

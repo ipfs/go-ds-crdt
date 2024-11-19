@@ -120,7 +120,7 @@ func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFun
 	return broadcasters, cancel
 }
 
-func (mb *mockBroadcaster) Broadcast(data []byte) error {
+func (mb *mockBroadcaster) Broadcast(ctx context.Context, data []byte) error {
 	var wg sync.WaitGroup
 
 	randg := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -155,10 +155,12 @@ func (mb *mockBroadcaster) Broadcast(data []byte) error {
 	return nil
 }
 
-func (mb *mockBroadcaster) Next() ([]byte, error) {
+func (mb *mockBroadcaster) Next(ctx context.Context) ([]byte, error) {
 	select {
 	case data := <-mb.myChan:
 		return data, nil
+	case <-ctx.Done():
+		return nil, ErrNoMoreBroadcast
 	case <-mb.ctx.Done():
 		return nil, ErrNoMoreBroadcast
 	}

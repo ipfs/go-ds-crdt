@@ -60,9 +60,9 @@ var (
 // all replicas and to retrieve payloads broadcasted.
 type Broadcaster interface {
 	// Send payload to other replicas.
-	Broadcast([]byte) error
+	Broadcast(context.Context, []byte) error
 	// Obtain the next payload received from the network.
-	Next() ([]byte, error)
+	Next(context.Context) ([]byte, error)
 }
 
 // A SessionDAGService is a Sessions-enabled DAGService. This type of DAG-Service
@@ -351,7 +351,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 		default:
 		}
 
-		data, err := store.broadcaster.Next()
+		data, err := store.broadcaster.Next(ctx)
 		if err != nil {
 			if err == ErrNoMoreBroadcast || ctx.Err() != nil {
 				return
@@ -1301,7 +1301,7 @@ func (store *Datastore) broadcast(ctx context.Context, cids []cid.Cid) error {
 		return err
 	}
 
-	err = store.broadcaster.Broadcast(bcastBytes)
+	err = store.broadcaster.Broadcast(ctx, bcastBytes)
 	if err != nil {
 		return errors.Wrapf(err, "error broadcasting %s", cids)
 	}
