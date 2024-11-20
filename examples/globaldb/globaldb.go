@@ -388,7 +388,7 @@ Ready!
 				continue
 			}
 		case "print":
-			crdt.PrintDAG()
+			crdt.PrintDAG(ctx)
 		}
 		fmt.Printf("> ")
 	}
