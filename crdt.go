@@ -18,16 +18,24 @@
 package crdt
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ipfs/boxo/blockservice"
+	"github.com/ipfs/boxo/blockstore"
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
+	"github.com/ipfs/boxo/exchange/offline"
+	dag "github.com/ipfs/boxo/ipld/merkledag"
+	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	pb "github.com/ipfs/go-ds-crdt/pb"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"go.uber.org/multierr"
 	"google.golang.org/protobuf/proto"
 
@@ -44,11 +52,13 @@ var _ ds.Batching = (*Datastore)(nil)
 
 // datastore namespace keys. Short keys save space and memory.
 const (
-	headsNs           = "h" // heads
+	headsNs           = "h" // state
+	membersNs         = "m" // member
 	setNs             = "s" // set
 	processedBlocksNs = "b" // blocks
 	dirtyBitKey       = "d" // dirty
 	versionKey        = "crdt_version"
+	snapshotKey       = "g"
 )
 
 // Common errors.
@@ -103,11 +113,19 @@ type Options struct {
 	// RepairInterval specifies how often to walk the full DAG until
 	// the root(s) if it has been marked dirty. 0 to disable.
 	RepairInterval time.Duration
-	// MultiHeadProcessing lets several new heads to be processed in
+	// MultiHeadProcessing lets several new state to be processed in
 	// parallel.  This results in more branching in general. More
 	// branching is not necessarily a bad thing and may improve
 	// throughput, but everything depends on usage.
 	MultiHeadProcessing bool
+
+	// CompactInterval specifies how often to attempt to compact the DAG.
+	CompactInterval time.Duration
+
+	//CompactDagSize the height of the dag which would trigger a compaction.
+	CompactDagSize uint64
+	// CompactRetainNodes defines how many recent nodes should remain after DAG compaction
+	CompactRetainNodes uint64
 }
 
 func (opts *Options) verify() error {
@@ -174,12 +192,16 @@ type Datastore struct {
 	namespace ds.Key
 	set       *set
 	heads     *heads
+	state     *StateManager
 
 	dagService  ipld.DAGService
+	bs          blockstore.Blockstore
 	broadcaster Broadcaster
 
 	seenHeadsMux sync.RWMutex
 	seenHeads    map[cid.Cid]struct{}
+
+	compactMux sync.Mutex
 
 	curDeltaMux sync.Mutex
 	curDelta    *pb.Delta // current, unpublished delta
@@ -191,6 +213,9 @@ type Datastore struct {
 	// keep track of children to be fetched so only one job does every
 	// child
 	queuedChildren *cidSafeSet
+	h              Peer
+	// old snapshot cid is the snapshot cid seen before the "current" one
+	oldProcessedCID []byte
 }
 
 type dagJob struct {
@@ -202,6 +227,10 @@ type dagJob struct {
 	delta      *pb.Delta       // the current delta
 	node       ipld.Node       // the current ipld Node
 
+}
+
+type Peer interface {
+	ID() peer.ID
 }
 
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
@@ -222,13 +251,7 @@ type dagJob struct {
 // datastore that persists things directly on write.
 //
 // The CRDT-Datastore should call Close() before the given store is closed.
-func New(
-	store ds.Datastore,
-	namespace ds.Key,
-	dagSyncer ipld.DAGService,
-	bcast Broadcaster,
-	opts *Options,
-) (*Datastore, error) {
+func New(h Peer, store ds.Datastore, bs blockstore.Blockstore, namespace ds.Key, dagSyncer ipld.DAGService, bcast Broadcaster, opts *Options) (*Datastore, error) {
 	if opts == nil {
 		opts = DefaultOptions()
 	}
@@ -241,6 +264,9 @@ func New(
 	fullSetNs := namespace.ChildString(setNs)
 	// <namespace>/heads
 	fullHeadsNs := namespace.ChildString(headsNs)
+
+	// <namespace>/state
+	stateNs := namespace.ChildString(membersNs)
 
 	setPutHook := func(k string, v []byte) {
 		if opts.PutHook == nil {
@@ -270,15 +296,25 @@ func New(
 		return nil, errors.Wrap(err, "error building heads")
 	}
 
+	// load the state
+	sm, err := NewStateManager(ctx, store, stateNs, time.Hour*24*7)
+	if err != nil {
+		cancel()
+		return nil, errors.Wrap(err, "error building statemanager")
+	}
+
 	dstore := &Datastore{
+		h:              h,
 		ctx:            ctx,
 		cancel:         cancel,
 		opts:           opts,
 		logger:         opts.Logger,
 		store:          store,
+		bs:             bs,
 		namespace:      namespace,
 		set:            set,
 		heads:          heads,
+		state:          sm,
 		dagService:     dagSyncer,
 		broadcaster:    bcast,
 		seenHeads:      make(map[cid.Cid]struct{}),
@@ -299,7 +335,7 @@ func New(
 		return nil, err
 	}
 	dstore.logger.Infof(
-		"crdt Datastore created. Number of heads: %d. Current max-height: %d. Dirty: %t",
+		"crdt Datastore created. Number of state: %d. Current max-height: %d. Dirty: %t",
 		len(headList),
 		maxHeight,
 		dstore.IsDirty(ctx),
@@ -317,7 +353,7 @@ func New(
 			dstore.dagWorker()
 		}()
 	}
-	dstore.wg.Add(4)
+	dstore.wg.Add(6)
 	go func() {
 		defer dstore.wg.Done()
 		dstore.handleNext(ctx)
@@ -335,6 +371,15 @@ func New(
 	go func() {
 		defer dstore.wg.Done()
 		dstore.logStats(ctx)
+	}()
+
+	go func() {
+		defer dstore.wg.Done()
+		dstore.compact()
+	}()
+
+	go func() {
+		defer dstore.wg.Done()
 	}()
 
 	return dstore, nil
@@ -360,7 +405,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			continue
 		}
 
-		bCastHeads, err := store.decodeBroadcast(ctx, data)
+		broadcast, err := store.decodeBroadcast(ctx, data)
 		if err != nil {
 			store.logger.Error(err)
 			continue
@@ -381,24 +426,103 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			}
 		}
 
-		// if we have no heads, make seen-heads heads immediately.  On
+		// merge the state with our state
+		if err := store.state.MergeMembers(store.ctx, broadcast); err != nil {
+			// TODO log and continue
+			store.logger.Errorf("failed to merge broadcast: %v", err)
+			continue
+		}
+		state := store.state.GetState()
+
+		if !store.state.IsNew() && broadcast.Snapshot != nil &&
+			broadcast.Snapshot.DagHead != state.Snapshot.DagHead &&
+			!bytes.Equal(broadcast.Snapshot.DagHead.Cid, store.oldProcessedCID) {
+
+			start, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
+			if err != nil {
+				store.logger.Errorf("failed to parse broadcast snapshot cid: %v", err)
+				continue
+
+			}
+			end, err := cid.Cast(state.Snapshot.DagHead.Cid)
+			if err != nil {
+				store.logger.Errorf("failed to parse state snapshot cid: %v", err)
+				continue
+			}
+			store.compactMux.Lock()
+			newSS, err := store.compactAndTruncate(store.ctx, start, end)
+			if err != nil {
+				store.logger.Errorf("failed to compact the dag: %v", err)
+				store.compactMux.Unlock()
+				continue
+			}
+			store.compactMux.Unlock()
+
+			store.oldProcessedCID = state.Snapshot.DagHead.Cid
+			err = store.state.SetSnapshot(store.ctx, newSS, start, broadcast.Snapshot.Height)
+			if err != nil {
+				store.logger.Errorf("failed to set the snapshot: %v", err)
+				continue
+			}
+			err = store.broadcast(store.ctx)
+			if err != nil {
+				store.logger.Errorf("failed to broadcast: %v", err)
+				continue
+			}
+		}
+
+		// if we have no snapshot head then we're probably a fresh database or node
+		// we should process the snapshot before doing anything else
+		if store.state.IsNew() && broadcast.Snapshot != nil {
+			c, err := cid.Cast(broadcast.Snapshot.SnapshotKey.Cid)
+			if err != nil {
+				store.logger.Errorf("failed to parse broadcasat snapshot cid: %v", err)
+				continue
+			}
+			if c != cid.Undef {
+				dc, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
+				if err != nil {
+					store.logger.Errorf("failed to parse broadcast dag head cid: %v", err)
+					continue
+				}
+				err = store.restoreSnapshot(store.dagService, c, dc, broadcast.Snapshot.Height)
+				if err != nil {
+					store.logger.Errorf("failed to restore snapshot: %v", err)
+					continue
+				}
+			}
+		}
+
+		// if we have no state, make seen-state state immediately.  On
 		// a fresh start, this allows us to start building on top of
-		// recent heads, even if we have not fully synced rather than
+		// recent state, even if we have not fully synced rather than
 		// creating new orphan branches.
 		curHeadCount, err := store.heads.Len(ctx)
 		if err != nil {
 			store.logger.Error(err)
 			continue
 		}
+
+		bcastHeads := map[cid.Cid]cid.Cid{}
+
+		for _, member := range broadcast.Members {
+			for _, h := range member.DagHeads {
+				c, err := cid.Cast(h.Cid)
+				if err == nil && c != cid.Undef {
+					bcastHeads[c] = c
+				}
+			}
+		}
+
 		if curHeadCount == 0 {
 			dg := &crdtNodeGetter{NodeGetter: store.dagService}
-			for _, head := range bCastHeads {
-				prio, err := dg.GetPriority(ctx, head)
+			for _, bCastHead := range bcastHeads {
+				prio, err := dg.GetPriority(ctx, bCastHead)
 				if err != nil {
 					store.logger.Error(err)
 					continue
 				}
-				err = store.heads.Add(ctx, head, prio)
+				err = store.heads.Add(ctx, bCastHead, head{height: prio})
 				if err != nil {
 					store.logger.Error(err)
 				}
@@ -406,10 +530,10 @@ func (store *Datastore) handleNext(ctx context.Context) {
 		}
 
 		// For each head, we process it.
-		for _, head := range bCastHeads {
-			// A thing to try here would be to process heads in
+		for _, head := range bcastHeads {
+			// A thing to try here would be to process state in
 			// the same broadcast in parallel, but do not process
-			// heads from multiple broadcasts in parallel.
+			// state from multiple broadcasts in parallel.
 			if store.opts.MultiHeadProcessing {
 				go processHead(ctx, head)
 			} else {
@@ -428,9 +552,9 @@ func (store *Datastore) handleNext(ctx context.Context) {
 	}
 }
 
-func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) ([]cid.Cid, error) {
-	// Make a list of heads we received
-	bcastData := pb.CRDTBroadcast{}
+func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) (*pb.StateBroadcast, error) {
+	// Make a list of state we received
+	bcastData := pb.StateBroadcast{}
 	err := proto.Unmarshal(data, &bcastData)
 	if err != nil {
 		return nil, err
@@ -445,27 +569,14 @@ func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) ([]cid
 			return nil, err
 		}
 		store.logger.Debugf("a legacy CID broadcast was received for: %s", c)
-		return []cid.Cid{c}, nil
+		return &bcastData, nil
 	}
 
-	bCastHeads := make([]cid.Cid, len(bcastData.Heads))
-	for i, protoHead := range bcastData.Heads {
-		c, err := cid.Cast(protoHead.Cid)
-		if err != nil {
-			return bCastHeads, err
-		}
-		bCastHeads[i] = c
-	}
-	return bCastHeads, nil
+	return &bcastData, nil
 }
 
-func (store *Datastore) encodeBroadcast(ctx context.Context, heads []cid.Cid) ([]byte, error) {
-	bcastData := pb.CRDTBroadcast{}
-	for _, c := range heads {
-		bcastData.Heads = append(bcastData.Heads, &pb.Head{Cid: c.Bytes()})
-	}
-
-	return proto.Marshal(&bcastData)
+func (store *Datastore) encodeBroadcast(ctx context.Context, state *pb.StateBroadcast) ([]byte, error) {
+	return proto.Marshal(state)
 }
 
 func randomizeInterval(d time.Duration) time.Duration {
@@ -521,9 +632,9 @@ func (store *Datastore) repair(ctx context.Context) {
 	}
 }
 
-// regularly send out a list of heads that we have not recently seen
+// regularly send out a list of state that we have not recently seen
 func (store *Datastore) rebroadcastHeads(ctx context.Context) {
-	// Get our current list of heads
+	// Get our current list of state
 	heads, _, err := store.heads.List(ctx)
 	if err != nil {
 		store.logger.Error(err)
@@ -541,11 +652,19 @@ func (store *Datastore) rebroadcastHeads(ctx context.Context) {
 		}
 	}
 	store.seenHeadsMux.RUnlock()
+	store.logger.Debugf("rebroadcastHeads %d", len(headsToBroadcast))
 
-	// Send them out
-	err = store.broadcast(ctx, headsToBroadcast)
-	if err != nil {
-		store.logger.Warn("broadcast failed: %v", err)
+	if len(headsToBroadcast) > 0 {
+		err = store.state.UpdateHeads(store.ctx, store.h.ID(), headsToBroadcast, true)
+		if err != nil {
+			store.logger.Warn("broadcast failed: %v", err)
+		}
+
+		// Send them out
+		err = store.broadcast(ctx)
+		if err != nil {
+			store.logger.Warn("broadcast failed: %v", err)
+		}
 	}
 
 	// Reset the map
@@ -562,11 +681,11 @@ func (store *Datastore) logStats(ctx context.Context) {
 		case <-ticker.C:
 			heads, height, err := store.heads.List(ctx)
 			if err != nil {
-				store.logger.Errorf("error listing heads: %s", err)
+				store.logger.Errorf("error listing state: %s", err)
 			}
 
 			store.logger.Infof(
-				"Number of heads: %d. Current max height: %d. Queued jobs: %d. Dirty: %t",
+				"Number of state: %d. Current max height: %d. Queued jobs: %d. Dirty: %t",
 				len(heads),
 				height,
 				len(store.jobQueue),
@@ -818,7 +937,7 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 
 	// We reached the bottom. Our head must become a new head.
 	if len(links) == 0 {
-		err := store.heads.Add(ctx, root, rootPrio)
+		err := store.heads.Add(ctx, root, head{height: rootPrio})
 		if err != nil {
 			return nil, errors.Wrapf(err, "error adding head %s", root)
 		}
@@ -845,9 +964,9 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 		}
 
 		if isHead {
-			// reached one of the current heads. Replace it with
+			// reached one of the current state. Replace it with
 			// the tip of this branch
-			err := store.heads.Replace(ctx, child, root, rootPrio)
+			err := store.heads.Replace(ctx, child, root, head{height: rootPrio})
 			if err != nil {
 				return nil, errors.Wrapf(err, "error replacing head: %s->%s", child, root)
 			}
@@ -856,8 +975,8 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 			// If this head was already processed, continue this
 			// protects the case when something is a head but was
 			// not processed (potentially could happen during
-			// first sync when heads are set before processing, a
-			// both a node and its child are heads - which I'm not
+			// first sync when state are set before processing, a
+			// both a node and its child are state - which I'm not
 			// sure if it can happen at all, but good to safeguard
 			// for it).
 			if isProcessed {
@@ -872,7 +991,7 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 		// keep going down this branch.
 		if isProcessed || !store.queuedChildren.Visit(child) {
 			if !addedAsHead {
-				err = store.heads.Add(ctx, root, rootPrio)
+				err = store.heads.Add(ctx, root, head{height: rootPrio})
 				if err != nil {
 					// Don't let this failure prevent us
 					// from processing the other links.
@@ -904,7 +1023,7 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 
 	heads, _, err := store.heads.List(ctx)
 	if err != nil {
-		return errors.Wrapf(err, "error listing heads")
+		return errors.Wrapf(err, "error listing state")
 	}
 
 	type nodeHead struct {
@@ -1003,7 +1122,7 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 }
 
 // Repair triggers a DAG-repair, which tries to re-walk the CRDT-DAG from the
-// current heads until the roots, processing currently unprocessed branches.
+// current state until the roots, processing currently unprocessed branches.
 //
 // Calling Repair will walk the full DAG even if the dirty bit is unset, but
 // will mark the store as clean unpon successful completion.
@@ -1080,14 +1199,14 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 	// When a key is added:
 	// - a new delta is made
 	// - Delta is marshalled and a DAG-node is created with the bytes,
-	//   pointing to previous heads. DAG-node is added to DAGService.
+	//   pointing to previous state. DAG-node is added to DAGService.
 	// - Heads are replaced with new CID.
 	// - New CID is broadcasted to everyone
 	// - The new CID is processed (up until now the delta had not
 	//   taken effect). Implementation detail: it is processed before
 	//   broadcast actually.
 	// - processNode() starts processing that branch from that CID
-	// - it calls set.Merge()
+	// - it calls set.MergeMembers()
 	// - that calls putElems() and putTombs()
 	// - that may make a batch for all the elems which is later committed
 	// - each element has a datastore entry /setNamespace/elemsNamespace/<key>/<block_id>
@@ -1108,7 +1227,7 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 		return store.store.Sync(ctx, store.namespace)
 	}
 
-	// attempt to be intelligent and sync only all heads and the
+	// attempt to be intelligent and sync only all state and the
 	// set entries related to the given prefix.
 	err := store.set.datastoreSync(ctx, prefix)
 	err2 := store.store.Sync(ctx, store.heads.namespace)
@@ -1234,21 +1353,23 @@ func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 	if err != nil {
 		return err
 	}
-	return store.broadcast(ctx, []cid.Cid{c})
+	headsToBroadcast := []cid.Cid{c}
+	err = store.state.UpdateHeads(store.ctx, store.h.ID(), headsToBroadcast, true)
+	if err != nil {
+		store.logger.Warn("broadcast failed: %v", err)
+	}
+
+	return store.broadcast(ctx)
 }
 
 func (store *Datastore) addDAGNode(ctx context.Context, delta *pb.Delta) (cid.Cid, error) {
 	heads, height, err := store.heads.List(ctx)
 	if err != nil {
-		return cid.Undef, errors.Wrap(err, "error listing heads")
+		return cid.Undef, errors.Wrap(err, "error listing state")
 	}
 	height = height + 1 // This implies our minimum height is 1
 
 	delta.Priority = height
-
-	// for _, e := range delta.GetElements() {
-	// 	e.Value = append(e.GetValue(), []byte(fmt.Sprintf(" height: %d", height))...)
-	// }
 
 	nd, err := store.putBlock(ctx, heads, height, delta)
 	if err != nil {
@@ -1257,7 +1378,7 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta *pb.Delta) (cid.Ci
 
 	// Process new block. This makes that every operation applied
 	// to this store take effect (delta is merged) before
-	// returning. Since our block references current heads, children
+	// returning. Since our block references current state, children
 	// should be empty
 	store.logger.Debugf("processing generated block %s", nd.Cid())
 	children, err := store.processNode(
@@ -1279,12 +1400,8 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta *pb.Delta) (cid.Ci
 	return nd.Cid(), nil
 }
 
-func (store *Datastore) broadcast(ctx context.Context, cids []cid.Cid) error {
+func (store *Datastore) broadcast(ctx context.Context) error {
 	if store.broadcaster == nil { // offline
-		return nil
-	}
-
-	if len(cids) == 0 { // nothing to rebroadcast
 		return nil
 	}
 
@@ -1294,16 +1411,16 @@ func (store *Datastore) broadcast(ctx context.Context, cids []cid.Cid) error {
 	default:
 	}
 
-	store.logger.Debugf("broadcasting %s", cids)
+	store.logger.Debugf("broadcasting state")
 
-	bcastBytes, err := store.encodeBroadcast(ctx, cids)
+	bcastBytes, err := store.encodeBroadcast(ctx, store.state.GetState())
 	if err != nil {
 		return err
 	}
 
 	err = store.broadcaster.Broadcast(ctx, bcastBytes)
 	if err != nil {
-		return errors.Wrapf(err, "error broadcasting %s", cids)
+		return errors.Wrap(err, "error broadcasting state")
 	}
 	return nil
 }
@@ -1343,37 +1460,22 @@ func (b *batch) Commit(ctx context.Context) error {
 	return b.store.publishDelta(ctx)
 }
 
-// PrintDAG pretty prints the current Merkle-DAG to stdout in a pretty
-// fashion. Only use for small DAGs. DotDAG is an alternative for larger DAGs.
-func (store *Datastore) PrintDAG(ctx context.Context) error {
-	heads, _, err := store.heads.List(ctx)
-	if err != nil {
-		return err
-	}
+type DAGCallback func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error
 
+func (store *Datastore) WalkDAG(heads []cid.Cid, callback DAGCallback) error {
 	ng := &crdtNodeGetter{NodeGetter: store.dagService}
-
 	set := cid.NewSet()
 
 	for _, h := range heads {
-		err := store.printDAGRec(ctx, h, 0, ng, set)
-		if err != nil {
+		if err := store.walkDAGRec(h, 0, ng, set, callback); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (store *Datastore) printDAGRec(ctx context.Context, from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set) error {
-	line := ""
-	for i := uint64(0); i < depth; i++ {
-		line += " "
-	}
-
-	ok := set.Visit(from)
-	if !ok {
-		line += "..."
-		fmt.Println(line)
+func (store *Datastore) walkDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set, callback DAGCallback) error {
+	if !set.Visit(from) {
 		return nil
 	}
 
@@ -1383,113 +1485,81 @@ func (store *Datastore) printDAGRec(ctx context.Context, from cid.Cid, depth uin
 	if err != nil {
 		return err
 	}
-	cidStr := nd.Cid().String()
-	cidStr = cidStr[len(cidStr)-4:]
-	line += fmt.Sprintf("- %d | %s: ", delta.GetPriority(), cidStr)
-	line += "Add: {"
-	for _, e := range delta.GetElements() {
-		line += fmt.Sprintf("%s:%s,", e.GetKey(), e.GetValue())
-	}
-	line += "}. Rmv: {"
-	for _, e := range delta.GetTombstones() {
-		line += fmt.Sprintf("%s,", e.GetKey())
-	}
-	line += "}. Links: {"
-	for _, l := range nd.Links() {
-		cidStr := l.Cid.String()
-		cidStr = cidStr[len(cidStr)-4:]
-		line += fmt.Sprintf("%s,", cidStr)
-	}
-	line += "}"
 
-	processed, err := store.isProcessed(ctx, nd.Cid())
-	if err != nil {
+	if err := callback(from, depth, nd, delta); err != nil {
 		return err
 	}
 
-	if !processed {
-		line += " Unprocessed!"
-	}
-
-	line += ":"
-
-	fmt.Println(line)
 	for _, l := range nd.Links() {
-		store.printDAGRec(ctx, l.Cid, depth+1, ng, set)
+		if err := store.walkDAGRec(l.Cid, depth+1, ng, set, callback); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// DotDAG writes a dot-format representation of the CRDT DAG to the given
-// writer. It can be converted to image format and visualized with graphviz
-// tooling.
+func (store *Datastore) PrintDAG() error {
+	heads, _, err := store.heads.List()
+	if err != nil {
+		return err
+	}
+
+	return store.WalkDAG(heads, func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error {
+		line := ""
+		for i := uint64(0); i < depth; i++ {
+			line += " "
+		}
+
+		cidStr := from.String()
+		cidStr = cidStr[len(cidStr)-4:]
+		line += fmt.Sprintf("- %d | %s: ", delta.GetPriority(), cidStr)
+		line += "Add: {"
+		for _, e := range delta.GetElements() {
+			line += fmt.Sprintf("%s:%s,", e.GetKey(), e.GetValue())
+		}
+		line += "}. Rmv: {"
+		for _, e := range delta.GetTombstones() {
+			line += fmt.Sprintf("%s,", e.GetKey())
+		}
+		line += "}. Links: {"
+		for _, l := range nd.Links() {
+			cidStr := l.Cid.String()
+			cidStr = cidStr[len(cidStr)-4:]
+			line += fmt.Sprintf("%s,", cidStr)
+		}
+		line += "}"
+		fmt.Println(line)
+		return nil
+	})
+}
+
 func (store *Datastore) DotDAG(ctx context.Context, w io.Writer) error {
 	heads, _, err := store.heads.List(ctx)
 	if err != nil {
 		return err
 	}
 
-	fmt.Fprintln(w, "digraph CRDTDAG {")
-
-	ng := &crdtNodeGetter{NodeGetter: store.dagService}
-
-	set := cid.NewSet()
-
-	fmt.Fprintln(w, "subgraph heads {")
+	_, _ = fmt.Fprintln(w, "digraph CRDTDAG {")
+	_, _ = fmt.Fprintln(w, "subgraph state {")
 	for _, h := range heads {
-		fmt.Fprintln(w, h)
+		_, _ = fmt.Fprintln(w, h)
 	}
-	fmt.Fprintln(w, "}")
+	_, _ = fmt.Fprintln(w, "}")
 
-	for _, h := range heads {
-		err := store.dotDAGRec(ctx, w, h, 0, ng, set)
-		if err != nil {
-			return err
+	err = store.WalkDAG(heads, func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error {
+		cidStr := from.String()
+		_, _ = fmt.Fprintf(w, "%s [label=\"%d | %s: +%d -%d\"]\n",
+			cidStr, delta.GetPriority(), cidStr[len(cidStr)-4:], len(delta.GetElements()), len(delta.GetTombstones()))
+		_, _ = fmt.Fprintf(w, "%s -> {", cidStr)
+		for _, l := range nd.Links() {
+			_, _ = fmt.Fprintf(w, "%s ", l.Cid)
 		}
-	}
-	fmt.Fprintln(w, "}")
-	return nil
-}
-
-func (store *Datastore) dotDAGRec(ctx context.Context, w io.Writer, from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set) error {
-	cidLong := from.String()
-	cidShort := cidLong[len(cidLong)-4:]
-
-	ok := set.Visit(from)
-	if !ok {
+		_, _ = fmt.Fprintln(w, "}")
 		return nil
-	}
+	})
 
-	cctx, cancel := context.WithTimeout(ctx, store.opts.DAGSyncerTimeout)
-	defer cancel()
-	nd, delta, err := ng.GetDelta(cctx, from)
-	if err != nil {
-		return err
-	}
-
-	fmt.Fprintf(w, "%s [label=\"%d | %s: +%d -%d\"]\n",
-		cidLong,
-		delta.GetPriority(),
-		cidShort,
-		len(delta.GetElements()),
-		len(delta.GetTombstones()),
-	)
-	fmt.Fprintf(w, "%s -> {", cidLong)
-	for _, l := range nd.Links() {
-		fmt.Fprintf(w, "%s ", l.Cid)
-	}
-	fmt.Fprintln(w, "}")
-
-	fmt.Fprintf(w, "subgraph sg_%s {\n", cidLong)
-	for _, l := range nd.Links() {
-		fmt.Fprintln(w, l.Cid)
-	}
-	fmt.Fprintln(w, "}")
-
-	for _, l := range nd.Links() {
-		store.dotDAGRec(ctx, w, l.Cid, depth+1, ng, set)
-	}
-	return nil
+	_, _ = fmt.Fprintln(w, "}")
+	return err
 }
 
 // Stats wraps internal information about the datastore.
@@ -1498,18 +1568,65 @@ type Stats struct {
 	Heads      []cid.Cid
 	MaxHeight  uint64
 	QueuedJobs int
+	State      *pb.StateBroadcast
 }
 
-// InternalStats returns internal datastore information like the current heads
+// InternalStats returns internal datastore information like the current state
 // and max height.
 func (store *Datastore) InternalStats(ctx context.Context) Stats {
 	heads, height, _ := store.heads.List(ctx)
 
 	return Stats{
+		State:      store.state.GetState(),
 		Heads:      heads,
 		MaxHeight:  height,
 		QueuedJobs: len(store.jobQueue),
 	}
+}
+
+func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid, dagHeight uint64) error {
+	hamtNode, err := getter.Get(store.ctx, snapshotRoot)
+	if err != nil {
+		return fmt.Errorf("getting root node: %w", err)
+	}
+
+	// Load the root HAMT shard
+	rootShard, err := hamt.NewHamtFromDag(getter, hamtNode) // Adjust bit width as necessary
+	if err != nil {
+		return fmt.Errorf("failed to load HAMT root shard: %w", err)
+	}
+
+	// Process each link in the current shard
+	err = rootShard.ForEachLink(store.ctx, func(link *ipld.Link) error {
+		node, err := link.GetNode(store.ctx, getter)
+		if err != nil {
+			return fmt.Errorf("failed to retrieve node %s: %w", link.Cid.String(), err)
+		}
+
+		protoNode, ok := node.(*dag.ProtoNode)
+		if !ok {
+			return fmt.Errorf("unexpected node type '%t'", node)
+		}
+		delta := &pb.Delta{
+			Elements: []*pb.Element{{Key: strings.TrimPrefix(link.Name, "/"), Value: protoNode.Data()}},
+		}
+		id := dshelp.MultihashToDsKey(link.Cid.Hash()).String()
+		if err := store.set.Merge(store.ctx, delta, id); err != nil {
+			return fmt.Errorf("failed to merge delta: %w", err)
+
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("error processing shard: %w", err)
+	}
+
+	err = store.state.SetSnapshot(store.ctx, snapshotRoot, dagHead, dagHeight)
+	if err != nil {
+		return fmt.Errorf("setting snapshot: %w", err)
+	}
+	return nil
 }
 
 type cidSafeSet struct {
@@ -1551,4 +1668,276 @@ func (s *cidSafeSet) Has(c cid.Cid) (ok bool) {
 	}
 	s.mux.RUnlock()
 	return
+}
+
+// DAGNodeInfo holds the additions and tombstones of a DAG node.
+type DAGNodeInfo struct {
+	Additions  map[string][]byte // key -> value
+	Tombstones []string          // keys marked for deletion
+}
+
+// ExtractDAGContent walks through the DAG starting from the given heads
+// and collects the additions and tombstones for each node.
+func (store *Datastore) ExtractDAGContent(blockstore blockstore.Blockstore) (map[uint64]DAGNodeInfo, error) {
+	heads, _, err := store.heads.List()
+	if err != nil {
+		return nil, err
+	}
+
+	offlineDAG := dag.NewDAGService(blockservice.New(blockstore, offline.Exchange(blockstore)))
+	ng := &crdtNodeGetter{NodeGetter: offlineDAG}
+
+	set := cid.NewSet()
+
+	result := map[uint64]DAGNodeInfo{}
+
+	for _, h := range heads {
+		err := store.extractDAGContent(h, 0, ng, set, result)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func (store *Datastore) extractDAGContent(from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set, result map[uint64]DAGNodeInfo) error {
+	ok := set.Visit(from)
+	if !ok {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(store.ctx, store.opts.DAGSyncerTimeout)
+	defer cancel()
+	nd, delta, err := ng.GetDelta(ctx, from)
+	if err != nil {
+		return err
+	}
+	info := DAGNodeInfo{
+		Additions: map[string][]byte{},
+	}
+	for _, e := range delta.GetElements() {
+		info.Additions[e.GetKey()] = e.GetValue()
+	}
+	for _, e := range delta.GetTombstones() {
+		info.Tombstones = append(info.Tombstones, e.GetKey())
+	}
+	result[delta.GetPriority()] = info
+
+	for _, l := range nd.Links() {
+		_ = store.extractDAGContent(l.Cid, depth+1, ng, set, result)
+	}
+	return nil
+}
+
+func (store *Datastore) compact() {
+	if store.opts.CompactInterval == 0 {
+		return
+	}
+	timer := time.NewTimer(0) // fire immediately on start
+	for {
+		select {
+		case <-store.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+			err := store.triggerCompactionIfNeeded()
+			if err != nil {
+				//todo
+			}
+		}
+		timer.Reset(store.opts.CompactInterval)
+	}
+
+}
+
+// triggerCompactionIfNeeded handles compaction logic directly within the datastore
+func (store *Datastore) triggerCompactionIfNeeded() error {
+	// Ensure all members agree on the DAG head before compacting
+	commonCid, height, err := store.getHighestCommonCid()
+	if err != nil {
+		return err
+	}
+
+	if height == 0 {
+		return nil
+	}
+
+	state := store.state.GetState()
+	snapshotHeight := uint64(0)
+	if state.Snapshot != nil {
+		snapshotHeight = state.Snapshot.Height
+	}
+
+	dagSize := height - snapshotHeight
+
+	// Check if DAG size exceeds the threshold for compaction
+	if dagSize < store.opts.CompactDagSize {
+		return nil
+	}
+
+	store.compactMux.Lock()
+	defer store.compactMux.Unlock()
+	// Extract DAG content and walk back CompactRetainNodes steps to determine the target CID
+	startCID, height, err := store.walkBackDAG(commonCid, store.opts.CompactRetainNodes)
+	if err != nil {
+		return fmt.Errorf("failed to determine target CID for compaction: %w", err)
+	}
+
+	var lastSnapshotCid cid.Cid
+
+	if state.Snapshot != nil {
+		lastSnapshotCid, err = cid.Cast(state.Snapshot.DagHead.Cid)
+		if err != nil {
+			return fmt.Errorf("parsing last snapshot cid: %w", err)
+		}
+	}
+
+	// Run compaction from start CID
+	compactCID, err := store.compactAndTruncate(store.ctx, startCID, lastSnapshotCid)
+	if err != nil {
+		return fmt.Errorf("error during DAG compaction: %w", err)
+	}
+
+	// Update the snapshot if compaction changes the state
+	if err := store.state.SetSnapshot(store.ctx, compactCID, startCID, height); err != nil {
+		return fmt.Errorf("failed to update snapshot after compaction: %w", err)
+	}
+
+	return store.broadcast(store.ctx)
+}
+
+// getHighestCommonCid gets the highest common cid of all members
+func (store *Datastore) getHighestCommonCid() (cid.Cid, uint64, error) {
+	heads := store.getAllMemberCommonHeads()
+	var (
+		c cid.Cid
+		h uint64
+	)
+
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
+	ng := &crdtNodeGetter{NodeGetter: offlineDAG}
+	for _, head := range heads {
+		p, err := ng.GetPriority(store.ctx, head)
+		if err != nil {
+			return c, h, fmt.Errorf("getting head: %w", err)
+		}
+		if p > h {
+			c = head
+			h = p
+		}
+	}
+	return c, h, nil
+}
+
+// getAllMemberCommonHeads retrieves the DAG heads from all peers
+func (store *Datastore) getAllMemberCommonHeads() []cid.Cid {
+	var cids []cid.Cid
+	cidCount := map[cid.Cid]int{}
+	var members int
+
+	for _, v := range store.state.GetState().Members {
+		members++
+		for _, c := range v.DagHeads {
+			id, err := cid.Cast(c.Cid)
+			if err != nil {
+				// TODO
+			}
+			cidCount[id]++
+		}
+	}
+
+	for k, v := range cidCount {
+		if v == members {
+			cids = append(cids, k)
+		}
+	}
+
+	return cids
+}
+
+// walkBackDAG traverses the DAG and selects a stable head to compact from thats retainNodes behind the given startCID
+func (store *Datastore) walkBackDAG(startCID cid.Cid, retainNodes uint64) (cid.Cid, uint64, error) {
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
+	ng := crdtNodeGetter{NodeGetter: offlineDAG}
+	visited := cid.NewSet()
+
+	var (
+		targetCID cid.Cid
+		height    uint64
+		steps     uint64
+	)
+
+	var walk func(currentCID cid.Cid) error
+	walk = func(currentCID cid.Cid) error {
+		if steps >= retainNodes {
+			targetCID = currentCID
+			_, delta, err := ng.GetDelta(store.ctx, currentCID)
+			if err != nil {
+				return fmt.Errorf("getting delta: %w", err)
+			}
+			height = delta.GetPriority()
+			return nil
+		}
+		if !visited.Visit(currentCID) {
+			return nil
+		}
+
+		node, _, err := ng.GetDelta(store.ctx, currentCID)
+		if err != nil {
+			return err
+		}
+
+		links := node.Links()
+		if len(links) == 1 {
+			// Linear path, continue walking
+			steps++
+			return walk(links[0].Cid)
+		} else if len(links) > 1 {
+			// Select the most stable branch (e.g., by priority)
+			stableChild, err := store.selectStableChild(links)
+			if err != nil {
+				return err
+			}
+			steps++
+			return walk(stableChild)
+		}
+
+		return nil
+	}
+
+	if err := walk(startCID); err != nil {
+		return cid.Undef, 0, err
+	}
+	return targetCID, height, nil
+}
+
+// selectStableChild selects the most stable child node from multiple links
+func (store *Datastore) selectStableChild(links []*ipld.Link) (cid.Cid, error) {
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
+	ng := crdtNodeGetter{NodeGetter: offlineDAG}
+
+	var (
+		bestCID         cid.Cid
+		highestPriority uint64
+	)
+
+	for _, link := range links {
+		_, delta, err := ng.GetDelta(store.ctx, link.Cid)
+		if err != nil {
+			continue // Skip if priority can't be determined
+		}
+
+		priority := delta.GetPriority()
+		if priority > highestPriority {
+			bestCID = link.Cid
+			highestPriority = priority
+		}
+	}
+
+	if bestCID.Defined() {
+		return bestCID, nil
+	}
+	return cid.Undef, fmt.Errorf("no stable child found among branches")
 }
