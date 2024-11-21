@@ -62,7 +62,7 @@ func TestHeadsBasic(t *testing.T) {
 	for i := 0; i < numHeads; i++ {
 		c, height := newCID(t), uint64(randg.Int())
 		cidHeights[c] = height
-		err := heads.Add(ctx, c, height)
+		err := heads.Add(ctx, c, head{height: height})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +72,7 @@ func TestHeadsBasic(t *testing.T) {
 
 	for c := range cidHeights {
 		newC, newHeight := newCID(t), uint64(randg.Int())
-		err := heads.Replace(ctx, c, newC, newHeight)
+		err := heads.Replace(ctx, c, newC, head{height: newHeight})
 		if err != nil {
 			t.Fatal(err)
 		}

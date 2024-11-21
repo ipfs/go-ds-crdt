@@ -393,13 +393,13 @@ func (store *Datastore) handleNext() {
 		}
 		if curHeadCount == 0 {
 			dg := &crdtNodeGetter{NodeGetter: store.dagService}
-			for _, head := range bCastHeads {
-				prio, err := dg.GetPriority(store.ctx, head)
+			for _, bCastHead := range bCastHeads {
+				prio, err := dg.GetPriority(store.ctx, bCastHead)
 				if err != nil {
 					store.logger.Error(err)
 					continue
 				}
-				err = store.heads.Add(store.ctx, head, prio)
+				err = store.heads.Add(store.ctx, bCastHead, head{height: prio})
 				if err != nil {
 					store.logger.Error(err)
 				}
@@ -816,7 +816,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 
 	// We reached the bottom. Our head must become a new head.
 	if len(links) == 0 {
-		err := store.heads.Add(store.ctx, root, rootPrio)
+		err := store.heads.Add(store.ctx, root, head{height: rootPrio})
 		if err != nil {
 			return nil, errors.Wrapf(err, "error adding head %s", root)
 		}
@@ -845,7 +845,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		if isHead {
 			// reached one of the current heads. Replace it with
 			// the tip of this branch
-			err := store.heads.Replace(store.ctx, child, root, rootPrio)
+			err := store.heads.Replace(store.ctx, child, root, head{height: rootPrio})
 			if err != nil {
 				return nil, errors.Wrapf(err, "error replacing head: %s->%s", child, root)
 			}
@@ -870,7 +870,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		// keep going down this branch.
 		if isProcessed || !store.queuedChildren.Visit(child) {
 			if !addedAsHead {
-				err = store.heads.Add(store.ctx, root, rootPrio)
+				err = store.heads.Add(store.ctx, root, head{height: rootPrio})
 				if err != nil {
 					// Don't let this failure prevent us
 					// from processing the other links.
