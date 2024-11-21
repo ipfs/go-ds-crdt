@@ -191,6 +191,8 @@ type Datastore struct {
 	// keep track of children to be fetched so only one job does every
 	// child
 	queuedChildren *cidSafeSet
+
+	startNewHead atomic.Bool
 }
 
 type dagJob struct {
@@ -1241,6 +1243,11 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 	height = height + 1 // This implies our minimum height is 1
 
 	delta.Priority = height
+
+	//check to see if we should start a new head
+	if store.startNewHead.Swap(false) {
+		heads = []cid.Cid{}
+	}
 
 	// for _, e := range delta.GetElements() {
 	// 	e.Value = append(e.GetValue(), []byte(fmt.Sprintf(" height: %d", height))...)
