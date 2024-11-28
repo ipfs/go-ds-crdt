@@ -66,7 +66,7 @@ func (store *Datastore) applyMigrations(ctx context.Context) error {
 		fallthrough
 
 	case version:
-		store.logger.Infof("CRDT database format v%d")
+		store.logger.Infof("CRDT database format v%d", version)
 		return nil
 	}
 	return nil
