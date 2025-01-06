@@ -3,10 +3,16 @@ package crdt.pb;
 
 option go_package=".;pb";
 
-message CRDTBroadcast {
-  repeated Head Heads = 1; // A list of heads
+message StateBroadcast {
+  Head Snapshot = 2;  // latest HAMT snapshot head
+  map<string,Participant>  Members = 1; // Map of participants
+}
+
+message Participant {
+  uint64 BestBefore = 1;        // Timestamp for garbage collection
+  repeated Head DagHeads = 2;   // List of DAG heads
 }
 
 message Head {
-  bytes Cid = 1;
+  bytes Cid = 1; // CID representing a head
 }

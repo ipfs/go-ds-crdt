@@ -23,7 +23,6 @@ import (
 	badgerds "github.com/ipfs/go-ds-badger"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
-	"github.com/multiformats/go-multihash"
 )
 
 var numReplicas = 15
@@ -250,17 +249,7 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 		}
 
 		var err error
-		replicas[i], err = New(
-			makeStore(t, i),
-			// ds.NewLogDatastore(
-			// 	makeStore(t, i),
-			// 	fmt.Sprintf("crdt-test-%d", i),
-			// ),
-			ds.NewKey("crdttest"),
-			dagsync,
-			bcasts[i],
-			replicaOpts[i],
-		)
+		replicas[i], err = New(nil, makeStore(t, i), ds.NewKey("crdttest"), dagsync, bcasts[i], replicaOpts[i])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -781,41 +770,6 @@ func TestCRDTSync(t *testing.T) {
 
 	if syncedDs.isSynced(k3) {
 		t.Error("k3 should have not been synced")
-	}
-}
-
-func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
-	mh, err := multihash.Sum([]byte("emacs is best"), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cidV0 := cid.NewCidV0(mh)
-
-	opts := DefaultOptions()
-	replicas, closeReplicas := makeReplicas(t, opts)
-	defer closeReplicas()
-
-	cids, err := replicas[0].decodeBroadcast(cidV0.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(cids) != 1 || !cids[0].Equals(cidV0) {
-		t.Error("should have returned a single cidV0", cids)
-	}
-
-	data, err := replicas[0].encodeBroadcast(cids)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cids2, err := replicas[0].decodeBroadcast(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(cids2) != 1 || !cids[0].Equals(cidV0) {
-		t.Error("should have reparsed cid0", cids2)
 	}
 }
 

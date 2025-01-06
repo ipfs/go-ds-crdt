@@ -27,7 +27,9 @@ import (
 	"time"
 
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
+	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	pb "github.com/ipfs/go-ds-crdt/pb"
+	"github.com/libp2p/go-libp2p/core/host"
 	"go.uber.org/multierr"
 	"google.golang.org/protobuf/proto"
 
@@ -44,11 +46,13 @@ var _ ds.Batching = (*Datastore)(nil)
 
 // datastore namespace keys. Short keys save space and memory.
 const (
-	headsNs           = "h" // heads
+	headsNs           = "h" // state
+	membersNs         = "m" // member
 	setNs             = "s" // set
 	processedBlocksNs = "b" // blocks
 	dirtyBitKey       = "d" // dirty
 	versionKey        = "crdt_version"
+	snapshotKey       = "g"
 )
 
 // Common errors.
@@ -103,7 +107,7 @@ type Options struct {
 	// RepairInterval specifies how often to walk the full DAG until
 	// the root(s) if it has been marked dirty. 0 to disable.
 	RepairInterval time.Duration
-	// MultiHeadProcessing lets several new heads to be processed in
+	// MultiHeadProcessing lets several new state to be processed in
 	// parallel.  This results in more branching in general. More
 	// branching is not necessarily a bad thing and may improve
 	// throughput, but everything depends on usage.
@@ -174,6 +178,7 @@ type Datastore struct {
 	namespace ds.Key
 	set       *set
 	heads     *heads
+	state     *StateManager
 
 	dagService  ipld.DAGService
 	broadcaster Broadcaster
@@ -191,8 +196,7 @@ type Datastore struct {
 	// keep track of children to be fetched so only one job does every
 	// child
 	queuedChildren *cidSafeSet
-
-	startNewHead atomic.Bool
+	h              host.Host
 }
 
 type dagJob struct {
@@ -223,13 +227,7 @@ type dagJob struct {
 // datastore that persists things directly on write.
 //
 // The CRDT-Datastore should call Close() before the given store is closed.
-func New(
-	store ds.Datastore,
-	namespace ds.Key,
-	dagSyncer ipld.DAGService,
-	bcast Broadcaster,
-	opts *Options,
-) (*Datastore, error) {
+func New(h host.Host, store ds.Datastore, namespace ds.Key, dagSyncer ipld.DAGService, bcast Broadcaster, opts *Options) (*Datastore, error) {
 	if opts == nil {
 		opts = DefaultOptions()
 	}
@@ -242,6 +240,9 @@ func New(
 	fullSetNs := namespace.ChildString(setNs)
 	// <namespace>/heads
 	fullHeadsNs := namespace.ChildString(headsNs)
+
+	// <namespace>/state
+	stateNs := namespace.ChildString(membersNs)
 
 	setPutHook := func(k string, v []byte) {
 		if opts.PutHook == nil {
@@ -271,7 +272,15 @@ func New(
 		return nil, errors.Wrap(err, "error building heads")
 	}
 
+	// load the state
+	sm, err := NewStateManager(ctx, store, stateNs, time.Hour*24*7)
+	if err != nil {
+		cancel()
+		return nil, errors.Wrap(err, "error building statemanager")
+	}
+
 	dstore := &Datastore{
+		h:              h,
 		ctx:            ctx,
 		cancel:         cancel,
 		opts:           opts,
@@ -280,6 +289,7 @@ func New(
 		namespace:      namespace,
 		set:            set,
 		heads:          heads,
+		state:          sm,
 		dagService:     dagSyncer,
 		broadcaster:    bcast,
 		seenHeads:      make(map[cid.Cid]struct{}),
@@ -300,7 +310,7 @@ func New(
 		return nil, err
 	}
 	dstore.logger.Infof(
-		"crdt Datastore created. Number of heads: %d. Current max-height: %d. Dirty: %t",
+		"crdt Datastore created. Number of state: %d. Current max-height: %d. Dirty: %t",
 		len(headList),
 		maxHeight,
 		dstore.IsDirty(),
@@ -361,7 +371,7 @@ func (store *Datastore) handleNext() {
 			continue
 		}
 
-		bCastHeads, err := store.decodeBroadcast(data)
+		broadcast, err := store.decodeBroadcast(data)
 		if err != nil {
 			store.logger.Error(err)
 			continue
@@ -382,18 +392,43 @@ func (store *Datastore) handleNext() {
 			}
 		}
 
-		// if we have no heads, make seen-heads heads immediately.  On
+		// if we have no snapshot head then we're probably a fresh database or node
+		// we should process the snapshot before doing anything else
+		if store.state.IsNew() && broadcast.Snapshot != nil {
+			c, err := cid.Cast(broadcast.Snapshot.Cid)
+			if err != nil {
+				// the snapshot may be an undefined in the case there's not been any snapshot yet.
+			}
+			err = store.RestoreSnapshot(store.dagService, c)
+			if err != nil {
+
+			}
+		}
+
+		// if we have no state, make seen-state state immediately.  On
 		// a fresh start, this allows us to start building on top of
-		// recent heads, even if we have not fully synced rather than
+		// recent state, even if we have not fully synced rather than
 		// creating new orphan branches.
 		curHeadCount, err := store.heads.Len()
 		if err != nil {
 			store.logger.Error(err)
 			continue
 		}
+
+		bcastHeads := map[cid.Cid]cid.Cid{}
+
+		for _, member := range broadcast.Members {
+			for _, h := range member.DagHeads {
+				c, err := cid.Cast(h.Cid)
+				if err != nil {
+					bcastHeads[c] = c
+				}
+			}
+		}
+
 		if curHeadCount == 0 {
 			dg := &crdtNodeGetter{NodeGetter: store.dagService}
-			for _, bCastHead := range bCastHeads {
+			for _, bCastHead := range bcastHeads {
 				prio, err := dg.GetPriority(store.ctx, bCastHead)
 				if err != nil {
 					store.logger.Error(err)
@@ -407,10 +442,10 @@ func (store *Datastore) handleNext() {
 		}
 
 		// For each head, we process it.
-		for _, head := range bCastHeads {
-			// A thing to try here would be to process heads in
+		for _, head := range bcastHeads {
+			// A thing to try here would be to process state in
 			// the same broadcast in parallel, but do not process
-			// heads from multiple broadcasts in parallel.
+			// state from multiple broadcasts in parallel.
 			if store.opts.MultiHeadProcessing {
 				go processHead(head)
 			} else {
@@ -429,9 +464,9 @@ func (store *Datastore) handleNext() {
 	}
 }
 
-func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
-	// Make a list of heads we received
-	bcastData := pb.CRDTBroadcast{}
+func (store *Datastore) decodeBroadcast(data []byte) (*pb.StateBroadcast, error) {
+	// Make a list of state we received
+	bcastData := pb.StateBroadcast{}
 	err := proto.Unmarshal(data, &bcastData)
 	if err != nil {
 		return nil, err
@@ -446,27 +481,14 @@ func (store *Datastore) decodeBroadcast(data []byte) ([]cid.Cid, error) {
 			return nil, err
 		}
 		store.logger.Debugf("a legacy CID broadcast was received for: %s", c)
-		return []cid.Cid{c}, nil
+		return &bcastData, nil
 	}
 
-	bCastHeads := make([]cid.Cid, len(bcastData.Heads))
-	for i, protoHead := range bcastData.Heads {
-		c, err := cid.Cast(protoHead.Cid)
-		if err != nil {
-			return bCastHeads, err
-		}
-		bCastHeads[i] = c
-	}
-	return bCastHeads, nil
+	return &bcastData, nil
 }
 
-func (store *Datastore) encodeBroadcast(heads []cid.Cid) ([]byte, error) {
-	bcastData := pb.CRDTBroadcast{}
-	for _, c := range heads {
-		bcastData.Heads = append(bcastData.Heads, &pb.Head{Cid: c.Bytes()})
-	}
-
-	return proto.Marshal(&bcastData)
+func (store *Datastore) encodeBroadcast(state *pb.StateBroadcast) ([]byte, error) {
+	return proto.Marshal(state)
 }
 
 func randomizeInterval(d time.Duration) time.Duration {
@@ -522,9 +544,9 @@ func (store *Datastore) repair() {
 	}
 }
 
-// regularly send out a list of heads that we have not recently seen
+// regularly send out a list of state that we have not recently seen
 func (store *Datastore) rebroadcastHeads() {
-	// Get our current list of heads
+	// Get our current list of state
 	heads, _, err := store.heads.List()
 	if err != nil {
 		store.logger.Error(err)
@@ -543,8 +565,13 @@ func (store *Datastore) rebroadcastHeads() {
 	}
 	store.seenHeadsMux.RUnlock()
 
+	err = store.state.UpdateHeads(store.ctx, store.h.ID(), headsToBroadcast, true)
+	if err != nil {
+		store.logger.Warn("broadcast failed: %v", err)
+	}
+
 	// Send them out
-	err = store.broadcast(store.ctx, headsToBroadcast)
+	err = store.broadcast(store.ctx)
 	if err != nil {
 		store.logger.Warn("broadcast failed: %v", err)
 	}
@@ -563,11 +590,11 @@ func (store *Datastore) logStats() {
 		case <-ticker.C:
 			heads, height, err := store.heads.List()
 			if err != nil {
-				store.logger.Errorf("error listing heads: %s", err)
+				store.logger.Errorf("error listing state: %s", err)
 			}
 
 			store.logger.Infof(
-				"Number of heads: %d. Current max height: %d. Queued jobs: %d. Dirty: %t",
+				"Number of state: %d. Current max height: %d. Queued jobs: %d. Dirty: %t",
 				len(heads),
 				height,
 				len(store.jobQueue),
@@ -843,7 +870,7 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 		}
 
 		if isHead {
-			// reached one of the current heads. Replace it with
+			// reached one of the current state. Replace it with
 			// the tip of this branch
 			err := store.heads.Replace(store.ctx, child, root, head{height: rootPrio})
 			if err != nil {
@@ -854,8 +881,8 @@ func (store *Datastore) processNode(ng *crdtNodeGetter, root cid.Cid, rootPrio u
 			// If this head was already processed, continue this
 			// protects the case when something is a head but was
 			// not processed (potentially could happen during
-			// first sync when heads are set before processing, a
-			// both a node and its child are heads - which I'm not
+			// first sync when state are set before processing, a
+			// both a node and its child are state - which I'm not
 			// sure if it can happen at all, but good to safeguard
 			// for it).
 			if isProcessed {
@@ -902,7 +929,7 @@ func (store *Datastore) repairDAG() error {
 
 	heads, _, err := store.heads.List()
 	if err != nil {
-		return errors.Wrapf(err, "error listing heads")
+		return errors.Wrapf(err, "error listing state")
 	}
 
 	type nodeHead struct {
@@ -1001,7 +1028,7 @@ func (store *Datastore) repairDAG() error {
 }
 
 // Repair triggers a DAG-repair, which tries to re-walk the CRDT-DAG from the
-// current heads until the roots, processing currently unprocessed branches.
+// current state until the roots, processing currently unprocessed branches.
 //
 // Calling Repair will walk the full DAG even if the dirty bit is unset, but
 // will mark the store as clean unpon successful completion.
@@ -1078,7 +1105,7 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 	// When a key is added:
 	// - a new delta is made
 	// - Delta is marshalled and a DAG-node is created with the bytes,
-	//   pointing to previous heads. DAG-node is added to DAGService.
+	//   pointing to previous state. DAG-node is added to DAGService.
 	// - Heads are replaced with new CID.
 	// - New CID is broadcasted to everyone
 	// - The new CID is processed (up until now the delta had not
@@ -1106,7 +1133,7 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 		return store.store.Sync(ctx, store.namespace)
 	}
 
-	// attempt to be intelligent and sync only all heads and the
+	// attempt to be intelligent and sync only all state and the
 	// set entries related to the given prefix.
 	err := store.set.datastoreSync(ctx, prefix)
 	err2 := store.store.Sync(ctx, store.heads.namespace)
@@ -1232,26 +1259,23 @@ func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 	if err != nil {
 		return err
 	}
-	return store.broadcast(ctx, []cid.Cid{c})
+	headsToBroadcast := []cid.Cid{c}
+	err = store.state.UpdateHeads(store.ctx, store.h.ID(), headsToBroadcast, true)
+	if err != nil {
+		store.logger.Warn("broadcast failed: %v", err)
+	}
+
+	return store.broadcast(ctx)
 }
 
 func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 	heads, height, err := store.heads.List()
 	if err != nil {
-		return cid.Undef, errors.Wrap(err, "error listing heads")
+		return cid.Undef, errors.Wrap(err, "error listing state")
 	}
 	height = height + 1 // This implies our minimum height is 1
 
 	delta.Priority = height
-
-	//check to see if we should start a new head
-	if store.startNewHead.Swap(false) {
-		heads = []cid.Cid{}
-	}
-
-	// for _, e := range delta.GetElements() {
-	// 	e.Value = append(e.GetValue(), []byte(fmt.Sprintf(" height: %d", height))...)
-	// }
 
 	nd, err := store.putBlock(heads, height, delta)
 	if err != nil {
@@ -1260,7 +1284,7 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 
 	// Process new block. This makes that every operation applied
 	// to this store take effect (delta is merged) before
-	// returning. Since our block references current heads, children
+	// returning. Since our block references current state, children
 	// should be empty
 	store.logger.Debugf("processing generated block %s", nd.Cid())
 	children, err := store.processNode(
@@ -1281,12 +1305,8 @@ func (store *Datastore) addDAGNode(delta *pb.Delta) (cid.Cid, error) {
 	return nd.Cid(), nil
 }
 
-func (store *Datastore) broadcast(ctx context.Context, cids []cid.Cid) error {
+func (store *Datastore) broadcast(ctx context.Context) error {
 	if store.broadcaster == nil { // offline
-		return nil
-	}
-
-	if len(cids) == 0 { // nothing to rebroadcast
 		return nil
 	}
 
@@ -1296,16 +1316,16 @@ func (store *Datastore) broadcast(ctx context.Context, cids []cid.Cid) error {
 	default:
 	}
 
-	store.logger.Debugf("broadcasting %s", cids)
+	store.logger.Debugf("broadcasting state")
 
-	bcastBytes, err := store.encodeBroadcast(cids)
+	bcastBytes, err := store.encodeBroadcast(store.state.GetState())
 	if err != nil {
 		return err
 	}
 
 	err = store.broadcaster.Broadcast(bcastBytes)
 	if err != nil {
-		return errors.Wrapf(err, "error broadcasting %s", cids)
+		return errors.Wrap(err, "error broadcasting state")
 	}
 	return nil
 }
@@ -1437,7 +1457,7 @@ func (store *Datastore) DotDAG(w io.Writer) error {
 
 	set := cid.NewSet()
 
-	fmt.Fprintln(w, "subgraph heads {")
+	fmt.Fprintln(w, "subgraph state {")
 	for _, h := range heads {
 		fmt.Fprintln(w, h)
 	}
@@ -1502,7 +1522,7 @@ type Stats struct {
 	QueuedJobs int
 }
 
-// InternalStats returns internal datastore information like the current heads
+// InternalStats returns internal datastore information like the current state
 // and max height.
 func (store *Datastore) InternalStats() Stats {
 	heads, height, _ := store.heads.List()
@@ -1512,6 +1532,63 @@ func (store *Datastore) InternalStats() Stats {
 		MaxHeight:  height,
 		QueuedJobs: len(store.jobQueue),
 	}
+}
+
+func (store *Datastore) RestoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid) error {
+	hamtNode, err := getter.Get(store.ctx, snapshotRoot)
+	if err != nil {
+		return fmt.Errorf("getting root node: %w", err)
+	}
+
+	// Load the root HAMT shard
+	rootShard, err := hamt.NewHamtFromDag(getter, hamtNode) // Adjust bit width as necessary
+	if err != nil {
+		return fmt.Errorf("failed to load HAMT root shard: %w", err)
+	}
+
+	// Initialize a queue for iterative traversal
+	queue := []*hamt.Shard{rootShard}
+
+	// Traverse and process HAMT shards
+	for len(queue) > 0 {
+		// Dequeue the first shard
+		currentShard := queue[0]
+		queue = queue[1:]
+
+		// Process each link in the current shard
+		err := currentShard.ForEachLink(store.ctx, func(link *ipld.Link) error {
+			node, err := link.GetNode(store.ctx, getter)
+			if err != nil {
+				return fmt.Errorf("failed to retrieve node %s: %w", link.Cid.String(), err)
+			}
+
+			/*
+				// Attempt to load the node as a HAMT shard
+				subShard, err := hamt.LoadShard(ctx, getter, link.Cid, hamt.UseTreeBitWidth(8))
+				if err == nil {
+					// If successful, enqueue the sub-shard for further traversal
+					queue = append(queue, subShard)
+					return nil
+				}
+			*/
+
+			delta := &pb.Delta{
+				Elements: []*pb.Element{{Key: link.Name, Value: node.RawData()}},
+			}
+			id := dshelp.MultihashToDsKey(link.Cid.Hash()).String()
+			if err := store.set.Merge(store.ctx, delta, id); err != nil {
+				return fmt.Errorf("failed to merge delta: %w", err)
+
+			}
+
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("error processing shard: %w", err)
+		}
+	}
+
+	return nil
 }
 
 type cidSafeSet struct {
