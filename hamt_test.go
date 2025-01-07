@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"testing"
 
 	ipfslite "github.com/hsanjuan/ipfs-lite"
@@ -17,6 +18,7 @@ import (
 	format "github.com/ipfs/go-ipld-format"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/stretchr/testify/require"
 
 	"github.com/libp2p/go-libp2p-pubsub"
 )
@@ -73,11 +75,12 @@ func Test(t *testing.T) {
 	}
 
 	// Populate the CRDT Datastore with key-value pairs
+	const numKeys = 5000 // A large number to ensure shard splitting
 	const batchSize = 100
 	var (
 		b ds.Batch
 	)
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < numKeys; i++ {
 		k := fmt.Sprintf("key-%d", i)
 		v := fmt.Sprintf("value-%d", i)
 		if i%batchSize == 0 {
@@ -124,10 +127,24 @@ func Test(t *testing.T) {
 		log.Fatalf("Error loading HAMT shard: %v", err)
 	}
 
-	PrintShardContent(ctx, hamtShard, dagService)
+	r, err := PrintShardContent(ctx, hamtShard, dagService)
+	require.NoError(t, err)
+
+	for i := 0; i < numKeys; i++ {
+		k := fmt.Sprintf("/key-%d", i)
+		v := fmt.Sprintf("value-%d", i)
+
+		mv, ok := r[k]
+		require.True(t, ok)
+		require.Equal(t, v, mv)
+	}
+
 }
 
-func PrintShardContent(ctx context.Context, shard *hamt.Shard, getter format.NodeGetter) {
+func PrintShardContent(ctx context.Context, shard *hamt.Shard, getter format.NodeGetter) (map[string]string, error) {
+	result := map[string]string{}
+	var mu sync.Mutex
+
 	err := shard.ForEachLink(ctx, func(link *format.Link) error {
 		fmt.Printf("Name: %s, Cid: %s, Size: %d\n", link.Name, link.Cid.String(), link.Size)
 
@@ -138,13 +155,21 @@ func PrintShardContent(ctx context.Context, shard *hamt.Shard, getter format.Nod
 			return nil
 		}
 
-		// Print the raw data if it's a value node
-		fmt.Printf("Data: %s\n", string(node.RawData()))
+		pn, ok := node.(*dag.ProtoNode)
+		if !ok {
+			return fmt.Errorf("unknown node type '%T'", node)
+		}
+
+		// Safely update the result map
+		mu.Lock()
+		result[link.Name] = string(pn.Data())
+		mu.Unlock()
 
 		return nil
 	})
 
 	if err != nil {
-		log.Fatalf("Error traversing shard: %v", err)
+		return nil, fmt.Errorf("error traversing shard: %w", err)
 	}
+	return result, nil
 }
