@@ -82,7 +82,7 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 		m.state.Members[id.String()] = member
 	}
 
-	member.DagHeads = make([]*pb.Head, len(heads))
+	member.DagHeads = make([]*pb.Head, 0, len(heads))
 	for _, h := range heads {
 		member.DagHeads = append(member.DagHeads, &pb.Head{Cid: h.Bytes()})
 	}
@@ -91,5 +91,16 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 		member.BestBefore = uint64(m.clock.Now().Add(m.ttl).Unix())
 	}
 
+	return m.Save(ctx)
+}
+
+func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroadcast) error {
+	for k, v := range broadcast.Members {
+		// if our state is missing this member or the update is newer than the one we have
+		// take there's
+		if ov, ok := m.state.Members[k]; !ok || ov.BestBefore > ov.BestBefore {
+			m.state.Members[k] = v
+		}
+	}
 	return m.Save(ctx)
 }

@@ -22,11 +22,13 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
+	dag "github.com/ipfs/boxo/ipld/merkledag"
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -392,17 +394,31 @@ func (store *Datastore) handleNext() {
 			}
 		}
 
+		// merge the state with our state
+		if err := store.state.MergeMembers(store.ctx, broadcast); err != nil {
+			// TODO log and continue
+		}
+
+		// TODO what happens if theres a snapshot and it doesn't match our snapshot!?
+		// i think what we would do is perform a compaction ourselves
+		// 1 of 2 things would happen
+		// 1. we determine the same head to compact from and end up with the same cid
+		// 2. we determine a later head and broadcast that as the latest snapshot cid, we will eventually all generate
+		// and agree the same cid this way
+
 		// if we have no snapshot head then we're probably a fresh database or node
 		// we should process the snapshot before doing anything else
 		if store.state.IsNew() && broadcast.Snapshot != nil {
 			c, err := cid.Cast(broadcast.Snapshot.Cid)
-			if err != nil {
-				// the snapshot may be an undefined in the case there's not been any snapshot yet.
+			if err == nil && c != cid.Undef {
+				err = store.restoreSnapshot(store.dagService, c)
+				if err != nil {
+					// an issue occurring during a restore means we should try again.
+					// TODO log it
+					return
+				}
 			}
-			err = store.RestoreSnapshot(store.dagService, c)
-			if err != nil {
-
-			}
+			// no snapshot or it was invalid continue
 		}
 
 		// if we have no state, make seen-state state immediately.  On
@@ -420,7 +436,7 @@ func (store *Datastore) handleNext() {
 		for _, member := range broadcast.Members {
 			for _, h := range member.DagHeads {
 				c, err := cid.Cast(h.Cid)
-				if err != nil {
+				if err == nil && c != cid.Undef {
 					bcastHeads[c] = c
 				}
 			}
@@ -1112,7 +1128,7 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 	//   taken effect). Implementation detail: it is processed before
 	//   broadcast actually.
 	// - processNode() starts processing that branch from that CID
-	// - it calls set.Merge()
+	// - it calls set.MergeMembers()
 	// - that calls putElems() and putTombs()
 	// - that may make a batch for all the elems which is later committed
 	// - each element has a datastore entry /setNamespace/elemsNamespace/<key>/<block_id>
@@ -1437,7 +1453,7 @@ func (store *Datastore) printDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGett
 
 	fmt.Println(line)
 	for _, l := range nd.Links() {
-		store.printDAGRec(l.Cid, depth+1, ng, set)
+		_ = store.printDAGRec(l.Cid, depth+1, ng, set)
 	}
 	return nil
 }
@@ -1451,17 +1467,17 @@ func (store *Datastore) DotDAG(w io.Writer) error {
 		return err
 	}
 
-	fmt.Fprintln(w, "digraph CRDTDAG {")
+	_, _ = fmt.Fprintln(w, "digraph CRDTDAG {")
 
 	ng := &crdtNodeGetter{NodeGetter: store.dagService}
 
 	set := cid.NewSet()
 
-	fmt.Fprintln(w, "subgraph state {")
+	_, _ = fmt.Fprintln(w, "subgraph state {")
 	for _, h := range heads {
-		fmt.Fprintln(w, h)
+		_, _ = fmt.Fprintln(w, h)
 	}
-	fmt.Fprintln(w, "}")
+	_, _ = fmt.Fprintln(w, "}")
 
 	for _, h := range heads {
 		err := store.dotDAGRec(w, h, 0, ng, set)
@@ -1469,7 +1485,7 @@ func (store *Datastore) DotDAG(w io.Writer) error {
 			return err
 		}
 	}
-	fmt.Fprintln(w, "}")
+	_, _ = fmt.Fprintln(w, "}")
 	return nil
 }
 
@@ -1489,27 +1505,29 @@ func (store *Datastore) dotDAGRec(w io.Writer, from cid.Cid, depth uint64, ng *c
 		return err
 	}
 
-	fmt.Fprintf(w, "%s [label=\"%d | %s: +%d -%d\"]\n",
+	_, _ = fmt.Fprintf(w, "%s [label=\"%d | %s: +%d -%d\"]\n",
 		cidLong,
 		delta.GetPriority(),
 		cidShort,
 		len(delta.GetElements()),
 		len(delta.GetTombstones()),
 	)
-	fmt.Fprintf(w, "%s -> {", cidLong)
+	_, _ = fmt.Fprintf(w, "%s -> {", cidLong)
 	for _, l := range nd.Links() {
-		fmt.Fprintf(w, "%s ", l.Cid)
+		_, _ = fmt.Fprintf(w, "%s ", l.Cid)
 	}
-	fmt.Fprintln(w, "}")
+	_, _ = fmt.Fprintln(w, "}")
 
-	fmt.Fprintf(w, "subgraph sg_%s {\n", cidLong)
+	_, _ = fmt.Fprintf(w, "subgraph sg_%s {\n", cidLong)
 	for _, l := range nd.Links() {
-		fmt.Fprintln(w, l.Cid)
+		_, _ = fmt.Fprintln(w, l.Cid)
 	}
-	fmt.Fprintln(w, "}")
+	_, _ = fmt.Fprintln(w, "}")
 
 	for _, l := range nd.Links() {
-		store.dotDAGRec(w, l.Cid, depth+1, ng, set)
+		if err := store.dotDAGRec(w, l.Cid, depth+1, ng, set); err != nil {
+			return fmt.Errorf("error processing child %s: %w", l.Cid, err)
+		}
 	}
 	return nil
 }
@@ -1534,7 +1552,7 @@ func (store *Datastore) InternalStats() Stats {
 	}
 }
 
-func (store *Datastore) RestoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid) error {
+func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid) error {
 	hamtNode, err := getter.Get(store.ctx, snapshotRoot)
 	if err != nil {
 		return fmt.Errorf("getting root node: %w", err)
@@ -1546,46 +1564,30 @@ func (store *Datastore) RestoreSnapshot(getter ipld.DAGService, snapshotRoot cid
 		return fmt.Errorf("failed to load HAMT root shard: %w", err)
 	}
 
-	// Initialize a queue for iterative traversal
-	queue := []*hamt.Shard{rootShard}
-
-	// Traverse and process HAMT shards
-	for len(queue) > 0 {
-		// Dequeue the first shard
-		currentShard := queue[0]
-		queue = queue[1:]
-
-		// Process each link in the current shard
-		err := currentShard.ForEachLink(store.ctx, func(link *ipld.Link) error {
-			node, err := link.GetNode(store.ctx, getter)
-			if err != nil {
-				return fmt.Errorf("failed to retrieve node %s: %w", link.Cid.String(), err)
-			}
-
-			/*
-				// Attempt to load the node as a HAMT shard
-				subShard, err := hamt.LoadShard(ctx, getter, link.Cid, hamt.UseTreeBitWidth(8))
-				if err == nil {
-					// If successful, enqueue the sub-shard for further traversal
-					queue = append(queue, subShard)
-					return nil
-				}
-			*/
-
-			delta := &pb.Delta{
-				Elements: []*pb.Element{{Key: link.Name, Value: node.RawData()}},
-			}
-			id := dshelp.MultihashToDsKey(link.Cid.Hash()).String()
-			if err := store.set.Merge(store.ctx, delta, id); err != nil {
-				return fmt.Errorf("failed to merge delta: %w", err)
-
-			}
-
-			return nil
-		})
+	// Process each link in the current shard
+	err = rootShard.ForEachLink(store.ctx, func(link *ipld.Link) error {
+		node, err := link.GetNode(store.ctx, getter)
 		if err != nil {
-			return fmt.Errorf("error processing shard: %w", err)
+			return fmt.Errorf("failed to retrieve node %s: %w", link.Cid.String(), err)
 		}
+
+		protoNode, ok := node.(*dag.ProtoNode)
+		if !ok {
+			return fmt.Errorf("unexpected node type '%t'", node)
+		}
+		delta := &pb.Delta{
+			Elements: []*pb.Element{{Key: strings.TrimPrefix(link.Name, "/"), Value: protoNode.Data()}},
+		}
+		id := dshelp.MultihashToDsKey(link.Cid.Hash()).String()
+		if err := store.set.Merge(store.ctx, delta, id); err != nil {
+			return fmt.Errorf("failed to merge delta: %w", err)
+
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("error processing shard: %w", err)
 	}
 
 	return nil
