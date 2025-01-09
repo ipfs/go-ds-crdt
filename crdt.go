@@ -1590,6 +1590,10 @@ func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid
 		return fmt.Errorf("error processing shard: %w", err)
 	}
 
+	err = store.state.SetSnapshot(store.ctx, snapshotRoot)
+	if err != nil {
+		return fmt.Errorf("setting snapshot: %w", err)
+	}
 	return nil
 }
 
@@ -1632,4 +1636,59 @@ func (s *cidSafeSet) Has(c cid.Cid) (ok bool) {
 	}
 	s.mux.RUnlock()
 	return
+}
+
+// State gets the state for testing only
+func (store *Datastore) State() *StateManager {
+	return store.state
+}
+
+func (store *Datastore) RemoveDeltaDAG(ctx context.Context, startCID cid.Cid) error {
+	// Initialize a queue for breadth-first traversal
+	queue := []cid.Cid{startCID}
+	visited := make(map[cid.Cid]struct{})
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		// Skip already visited nodes
+		if _, ok := visited[current]; ok {
+			continue
+		}
+		visited[current] = struct{}{}
+
+		// Retrieve the node from the DAG service
+		node, err := store.dagService.Get(ctx, current)
+		if err != nil {
+			return fmt.Errorf("failed to retrieve node %s: %w", current, err)
+		}
+
+		// Queue child nodes for traversal
+		for _, link := range node.Links() {
+			queue = append(queue, link.Cid)
+		}
+
+		// Remove the node from the datastore
+		err = store.store.Delete(ctx, store.processedBlockKey(current))
+		if err != nil {
+			return fmt.Errorf("failed to delete node %s: %w", current, err)
+		}
+
+		err = store.dagService.Remove(ctx, current)
+		if err != nil {
+			return fmt.Errorf("failed to delete node %s: %w", current, err)
+		}
+		// Remove from the "heads" if it's a head
+		isHead, _, _ := store.heads.IsHead(current)
+		if isHead {
+			err := store.heads.delete(ctx, store.store, current)
+			if err != nil {
+				return fmt.Errorf("failed to remove head %s: %w", current, err)
+			}
+		}
+
+	}
+
+	return nil
 }
