@@ -27,11 +27,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ipfs/boxo/blockstore"
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	pb "github.com/ipfs/go-ds-crdt/pb"
-	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"go.uber.org/multierr"
 	"google.golang.org/protobuf/proto"
 
@@ -198,7 +199,7 @@ type Datastore struct {
 	// keep track of children to be fetched so only one job does every
 	// child
 	queuedChildren *cidSafeSet
-	h              host.Host
+	h              Peer
 }
 
 type dagJob struct {
@@ -209,6 +210,10 @@ type dagJob struct {
 	delta      *pb.Delta       // the current delta
 	node       ipld.Node       // the current ipld Node
 
+}
+
+type Peer interface {
+	ID() peer.ID
 }
 
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
@@ -229,7 +234,7 @@ type dagJob struct {
 // datastore that persists things directly on write.
 //
 // The CRDT-Datastore should call Close() before the given store is closed.
-func New(h host.Host, store ds.Datastore, namespace ds.Key, dagSyncer ipld.DAGService, bcast Broadcaster, opts *Options) (*Datastore, error) {
+func New(h Peer, store ds.Datastore, namespace ds.Key, dagSyncer ipld.DAGService, bcast Broadcaster, opts *Options) (*Datastore, error) {
 	if opts == nil {
 		opts = DefaultOptions()
 	}
@@ -1538,6 +1543,7 @@ type Stats struct {
 	Heads      []cid.Cid
 	MaxHeight  uint64
 	QueuedJobs int
+	State      *pb.StateBroadcast
 }
 
 // InternalStats returns internal datastore information like the current state
@@ -1546,6 +1552,7 @@ func (store *Datastore) InternalStats() Stats {
 	heads, height, _ := store.heads.List()
 
 	return Stats{
+		State:      store.state.GetState(),
 		Heads:      heads,
 		MaxHeight:  height,
 		QueuedJobs: len(store.jobQueue),
@@ -1638,15 +1645,12 @@ func (s *cidSafeSet) Has(c cid.Cid) (ok bool) {
 	return
 }
 
-// State gets the state for testing only
-func (store *Datastore) State() *StateManager {
-	return store.state
-}
-
-func (store *Datastore) RemoveDeltaDAG(ctx context.Context, startCID cid.Cid) error {
+func (store *Datastore) RemoveDeltaDAG(ctx context.Context, blockstore blockstore.Blockstore, startCID cid.Cid) error {
 	// Initialize a queue for breadth-first traversal
 	queue := []cid.Cid{startCID}
 	visited := make(map[cid.Cid]struct{})
+
+	ld := dag.GetLinksDirect(store.dagService)
 
 	for len(queue) > 0 {
 		current := queue[0]
@@ -1658,14 +1662,28 @@ func (store *Datastore) RemoveDeltaDAG(ctx context.Context, startCID cid.Cid) er
 		}
 		visited[current] = struct{}{}
 
-		// Retrieve the node from the DAG service
-		node, err := store.dagService.Get(ctx, current)
+		// Retrieve the block
+		_, err := blockstore.Get(ctx, current)
 		if err != nil {
+			if ipld.IsNotFound(err) {
+				// nothing to do we don't have this block (its probably been previously truncated)
+				return nil
+			}
 			return fmt.Errorf("failed to retrieve node %s: %w", current, err)
 		}
 
 		// Queue child nodes for traversal
-		for _, link := range node.Links() {
+		links, err := ld(ctx, current)
+		if err != nil {
+			if ipld.IsNotFound(err) {
+				// nothing to do we don't have this block
+				// this shouldn't be possible as we would have been stopped by the block service check above
+				return nil
+			}
+			return fmt.Errorf("failed to retrieve nodes links %s: %w", current, err)
+		}
+
+		for _, link := range links {
 			queue = append(queue, link.Cid)
 		}
 
@@ -1687,7 +1705,6 @@ func (store *Datastore) RemoveDeltaDAG(ctx context.Context, startCID cid.Cid) er
 				return fmt.Errorf("failed to remove head %s: %w", current, err)
 			}
 		}
-
 	}
 
 	return nil

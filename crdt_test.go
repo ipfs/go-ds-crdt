@@ -2,6 +2,8 @@ package crdt
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha512"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -23,6 +25,8 @@ import (
 	badgerds "github.com/ipfs/go-ds-badger"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 var numReplicas = 15
@@ -184,6 +188,37 @@ func (mds *mockDAGSvc) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipld
 	return mds.DAGService.GetMany(ctx, cids)
 }
 
+type mockPeer struct {
+	id peer.ID
+}
+
+func newMockPeer(id string) Peer {
+	pk := generateEd25519Key(id)
+	pid, err := peer.IDFromPublicKey(pk.GetPublic())
+	if err != nil {
+		panic(err)
+	}
+	return &mockPeer{pid}
+}
+
+func (m *mockPeer) ID() peer.ID {
+	return m.id
+}
+
+func generateEd25519Key(seed string) crypto.PrivKey {
+	// Hash the seed string to generate a 32-byte seed
+	hash := sha512.Sum512([]byte(seed))
+	seedBytes := hash[:32] // Take the first 32 bytes
+
+	// Generate an Ed25519 private key from the seed
+	pk, err := crypto.UnmarshalEd25519PrivateKey(ed25519.NewKeyFromSeed(seedBytes))
+	if err != nil {
+		panic(err)
+	}
+
+	return pk
+}
+
 func storeFolder(i int) string {
 	return fmt.Sprintf("test-badger-%d", i)
 }
@@ -220,6 +255,7 @@ func makeStore(t testing.TB, i int) ds.Datastore {
 
 func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 	bcasts, bcastCancel := newBroadcasters(t, n)
+
 	bs := mdutils.Bserv()
 	dagserv := merkledag.NewDAGService(bs)
 
@@ -248,8 +284,9 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 			bs:         bs.Blockstore(),
 		}
 
+		h := newMockPeer(fmt.Sprintf("peer-%d", i))
 		var err error
-		replicas[i], err = New(nil, makeStore(t, i), ds.NewKey("crdttest"), dagsync, bcasts[i], replicaOpts[i])
+		replicas[i], err = New(h, makeStore(t, i), ds.NewKey("crdttest"), dagsync, bcasts[i], replicaOpts[i])
 		if err != nil {
 			t.Fatal(err)
 		}

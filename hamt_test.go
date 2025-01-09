@@ -18,133 +18,161 @@ import (
 	dssync "github.com/ipfs/go-datastore/sync"
 	crdt "github.com/ipfs/go-ds-crdt"
 	format "github.com/ipfs/go-ipld-format"
+	"github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
-
-	"github.com/libp2p/go-libp2p-pubsub"
 )
 
-func TestCompactToHAMT(t *testing.T) {
-	// Context for the operations
-	ctx := context.Background()
+func setupTestEnv(ctx context.Context, t *testing.T) (*crdt.Datastore, host.Host, blockstore.Blockstore, format.DAGService, func()) {
+	t.Helper()
 
-	// In-memory datastore for testing
-	memStore := ds.NewMapDatastore()
-
+	memStore := dssync.MutexWrap(ds.NewMapDatastore())
 	bs := blockstore.NewBlockstore(memStore)
 	ex := offline.Exchange(bs)
 	bserv := bserv.New(bs, ex)
-
-	// Mock DAG service
 	dagService := dag.NewDAGService(bserv)
 
 	pk, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 1)
-	if err != nil {
-		log.Fatal(err)
-	}
+	require.NoError(t, err, "failed to generate key pair")
 
 	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/45000")
-
-	h, dht, err := ipfslite.SetupLibp2p(
-		ctx,
-		pk,
-		nil,
-		[]multiaddr.Multiaddr{listen},
-		nil,
-		ipfslite.Libp2pOptionsExtra...,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer h.Close()
-	defer dht.Close()
+	h, dht, err := ipfslite.SetupLibp2p(ctx, pk, nil, []multiaddr.Multiaddr{listen}, nil, ipfslite.Libp2pOptionsExtra...)
+	require.NoError(t, err, "failed to set up libp2p")
 
 	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		log.Fatal(err)
-	}
+	require.NoError(t, err, "failed to create pubsub")
+
 	broadcaster, _ := crdt.NewPubSubBroadcaster(ctx, ps, "test-topic")
 
-	// Options for the CRDT datastore
 	opts := crdt.DefaultOptions()
+	store, err := crdt.New(h, memStore, ds.NewKey("/test"), dagService, broadcaster, opts)
+	require.NoError(t, err, "failed to create CRDT datastore")
 
-	// Initialize the CRDT Datastore
-	namespace := ds.NewKey("/test")
-	store, err := crdt.New(h, memStore, namespace, dagService, broadcaster, opts)
-	if err != nil {
-		log.Fatalf("Error initializing CRDT datastore: %v", err)
+	cleanup := func() {
+		h.Close()
+		dht.Close()
 	}
 
-	// Populate the CRDT Datastore with key-value pairs
-	const numKeys = 5000 // A large number to ensure shard splitting
+	return store, h, bs, dagService, cleanup
+}
+
+func TestCompactToHAMT(t *testing.T) {
+	ctx := context.Background()
+	store, _, _, dagService, cleanup := setupTestEnv(ctx, t)
+	defer cleanup()
+
+	const numKeys = 5000
 	const batchSize = 100
-	var (
-		b ds.Batch
-	)
+
+	var b ds.Batch
 	for i := 0; i < numKeys; i++ {
 		k := fmt.Sprintf("key-%d", i)
 		v := fmt.Sprintf("value-%d", i)
 		if i%batchSize == 0 {
 			if b != nil {
-				err := b.Commit(ctx)
-				if err != nil {
-					log.Fatal(err)
-				}
+				require.NoError(t, b.Commit(ctx), "batch commit failed")
 			}
-			b, err = store.Batch(ctx)
-			if err != nil {
-				log.Fatal(err)
-			}
+			b, _ = store.Batch(ctx)
 		}
-		err = b.Put(ctx, ds.NewKey(k), []byte(v))
-		if err != nil {
-			log.Fatalf("Error adding key %s: %v", k, err)
-		}
+		require.NoError(t, b.Put(ctx, ds.NewKey(k), []byte(v)), "failed to put key-value")
 	}
-	err = b.Commit(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
+	require.NoError(t, b.Commit(ctx), "final batch commit failed")
 
-	// Trigger compaction
 	rootCID, err := store.CompactToHAMT(ctx)
-	if err != nil {
-		log.Fatalf("Error during compaction: %v", err)
-	}
+	require.NoError(t, err, "compaction failed")
 
 	r := PrintSnapshot(ctx, dagService, rootCID)
-	require.NoError(t, err)
-
 	for i := 0; i < numKeys; i++ {
 		k := fmt.Sprintf("/key-%d", i)
 		v := fmt.Sprintf("value-%d", i)
+		require.Equal(t, v, r[k], fmt.Sprintf("key %s has incorrect value", k))
+	}
+}
 
-		mv, ok := r[k]
-		require.True(t, ok)
-		require.Equal(t, v, mv)
+func TestRemoveDeltaDAG(t *testing.T) {
+	ctx := context.Background()
+	store, h, bs, _, cleanup := setupTestEnv(ctx, t)
+	defer cleanup()
+
+	const numDeltas = 10
+	var (
+		rootCID cid.Cid
+		err     error
+	)
+
+	for i := 0; i < numDeltas; i++ {
+		k := fmt.Sprintf("key-%d", i)
+		v := fmt.Sprintf("value-%d", i)
+		require.NoError(t, store.Put(ctx, ds.NewKey(k), []byte(v)), "failed to put key-value")
+
+		if i == 4 {
+			m, ok := store.InternalStats().State.Members[h.ID().String()]
+			require.True(t, ok, "our peerid should exist in the state")
+			lastHead := m.DagHeads[len(m.DagHeads)-1]
+			_, rootCID, err = cid.CidFromBytes(lastHead.Cid)
+			require.NoError(t, err, "failed to parse CID")
+		}
 	}
 
+	require.NotNil(t, rootCID, "rootCID should not be nil")
+	require.NoError(t, store.RemoveDeltaDAG(ctx, bs, rootCID), "failed to remove deltas")
+}
+
+func TestCompactToHAMTAndTruncateDeltaDag(t *testing.T) {
+	ctx := context.Background()
+	store, h, bs, dagService, cleanup := setupTestEnv(ctx, t)
+	defer cleanup()
+
+	const numKeys = 502
+	const compactEvery = 100
+	var maxID int
+	var ss cid.Cid
+
+	for i := 1; i < numKeys; i++ {
+		k := fmt.Sprintf("key-%d", i)
+		v := fmt.Sprintf("value-%d", i)
+		require.NoError(t, store.Put(ctx, ds.NewKey(k), []byte(v)), "failed to put key-value")
+		if i%compactEvery == 0 {
+			m, ok := store.InternalStats().State.Members[h.ID().String()]
+			require.True(t, ok, "our peerid should exist in the state")
+			lastHead := m.DagHeads[len(m.DagHeads)-1]
+			_, hcid, err := cid.CidFromBytes(lastHead.Cid)
+			require.NoError(t, err, "failed to parse CID")
+
+			ss, err = store.CompactToHAMT(ctx)
+			require.NoError(t, err, "compaction failed")
+			err = store.RemoveDeltaDAG(ctx, bs, hcid)
+			if err != nil {
+				require.NoError(t, err, "failed to truncate delta DAG")
+			}
+
+			maxID = i
+		}
+	}
+
+	store.PrintDAG()
+	r := PrintSnapshot(ctx, dagService, ss)
+	for i := 1; i <= maxID; i++ {
+		k := fmt.Sprintf("/key-%d", i)
+		v := fmt.Sprintf("value-%d", i)
+		require.Equal(t, v, r[k], fmt.Sprintf("key %s has incorrect value", k))
+	}
 }
 
 func PrintSnapshot(ctx context.Context, dagService format.DAGService, rootCID cid.Cid) map[string]string {
-	// Fetch the HAMT snapshot and verify its contents
-	hamtNode, err := dagService.Get(ctx, rootCID)
+	hamNode, err := dagService.Get(ctx, rootCID)
 	if err != nil {
-		log.Fatalf("Error retrieving HAMT node: %v", err)
+		log.Fatalf("failed to get HAMT node: %v", err)
 	}
 
-	fmt.Printf("HAMT Root CID: %s\n", rootCID)
-	fmt.Printf("HAMT Node: %+v\n", hamtNode)
-
-	// TODO: Add detailed verification of the HAMT contents
-	// Traverse and print HAMT contents
-	hamtShard, err := hamt.NewHamtFromDag(dagService, hamtNode)
+	hamShard, err := hamt.NewHamtFromDag(dagService, hamNode)
 	if err != nil {
-		log.Fatalf("Error loading HAMT shard: %v", err)
+		log.Fatalf("failed to load HAMT shard: %v", err)
 	}
 
-	r, err := PrintShardContent(ctx, hamtShard, dagService)
+	r, _ := PrintShardContent(ctx, hamShard, dagService)
 	return r
 }
 
@@ -153,13 +181,9 @@ func PrintShardContent(ctx context.Context, shard *hamt.Shard, getter format.Nod
 	var mu sync.Mutex
 
 	err := shard.ForEachLink(ctx, func(link *format.Link) error {
-		fmt.Printf("Name: %s, Cid: %s, Size: %d\n", link.Name, link.Cid.String(), link.Size)
-
-		// Check if this is a sub-shard or a value node
 		node, err := link.GetNode(ctx, getter)
 		if err != nil {
-			log.Printf("Error retrieving node %s: %v", link.Cid.String(), err)
-			return nil
+			return fmt.Errorf("failed to retrieve node %s: %w", link.Cid, err)
 		}
 
 		pn, ok := node.(*dag.ProtoNode)
@@ -167,303 +191,10 @@ func PrintShardContent(ctx context.Context, shard *hamt.Shard, getter format.Nod
 			return fmt.Errorf("unknown node type '%T'", node)
 		}
 
-		// Safely update the result map
 		mu.Lock()
 		result[link.Name] = string(pn.Data())
 		mu.Unlock()
-
 		return nil
 	})
-
-	if err != nil {
-		return nil, fmt.Errorf("error traversing shard: %w", err)
-	}
-	return result, nil
-}
-
-func TestRemoveDeltaDAG(t *testing.T) {
-	// Context for the operations
-	ctx := context.Background()
-
-	// In-memory datastore for testing
-	memStore := dssync.MutexWrap(ds.NewMapDatastore())
-
-	bs := blockstore.NewBlockstore(memStore)
-	ex := offline.Exchange(bs)
-	bserv := bserv.New(bs, ex)
-
-	// Mock DAG service
-	dagService := dag.NewDAGService(bserv)
-
-	pk, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 1)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/45000")
-
-	h, dht, err := ipfslite.SetupLibp2p(
-		ctx,
-		pk,
-		nil,
-		[]multiaddr.Multiaddr{listen},
-		nil,
-		ipfslite.Libp2pOptionsExtra...,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer h.Close()
-	defer dht.Close()
-
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		log.Fatal(err)
-	}
-	broadcaster, _ := crdt.NewPubSubBroadcaster(ctx, ps, "test-topic")
-
-	// Options for the CRDT datastore
-	opts := crdt.DefaultOptions()
-
-	// Initialize the CRDT Datastore
-	namespace := ds.NewKey("/test")
-	store, err := crdt.New(h, memStore, namespace, dagService, broadcaster, opts)
-	if err != nil {
-		log.Fatalf("Error initializing CRDT datastore: %v", err)
-	}
-
-	// Build a delta DAG 10 transactions deep
-	var heads []cid.Cid
-	var rootCID cid.Cid
-
-	for i := 0; i < 10; i++ {
-		k := fmt.Sprintf("key-%d", i)
-		v := fmt.Sprintf("value-%d", i)
-		// Create a new delta
-		err = store.Put(ctx, ds.NewKey(k), []byte(v))
-
-		// Update the heads
-		for _, h := range store.State().GetState().Members[h.ID().String()].DagHeads {
-			_, c, err := cid.CidFromBytes(h.Cid)
-			require.NoError(t, err)
-			heads = append(heads, c)
-		}
-
-		if i == 4 {
-			rootCID = heads[len(heads)-1] // Save the CID of the 5th transaction
-		}
-	}
-
-	require.NotNil(t, rootCID, "5th transaction CID should not be nil")
-
-	// Verify all nodes exist in the DAG
-	for i, head := range heads {
-		_, err := dagService.Get(ctx, head)
-		require.NoError(t, err, "node %d should exist in the DAG", i)
-	}
-
-	// Perform cleanup from the 5th transaction to the start
-	err = store.RemoveDeltaDAG(ctx, rootCID)
-	require.NoError(t, err)
-
-	// Verify nodes from the 5th transaction to the start are removed
-	for i := 0; i <= 4; i++ {
-		_, err := dagService.Get(ctx, heads[i])
-		require.Error(t, err, "node %d should be removed from the DAG", i)
-	}
-
-	// Verify nodes from the 6th transaction onward still exist
-	for i := 5; i < 10; i++ {
-		_, err := dagService.Get(ctx, heads[i])
-		require.NoError(t, err, "node %d should still exist in the DAG", i)
-	}
-}
-
-func TestRemoveEntireDeltaDAG(t *testing.T) {
-	// Context for the operations
-	ctx := context.Background()
-
-	// In-memory datastore for testing
-
-	memStore := dssync.MutexWrap(ds.NewMapDatastore())
-
-	bs := blockstore.NewBlockstore(memStore)
-	ex := offline.Exchange(bs)
-	bserv := bserv.New(bs, ex)
-
-	// Mock DAG service
-	dagService := dag.NewDAGService(bserv)
-
-	pk, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 1)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/45000")
-
-	h, dht, err := ipfslite.SetupLibp2p(
-		ctx,
-		pk,
-		nil,
-		[]multiaddr.Multiaddr{listen},
-		nil,
-		ipfslite.Libp2pOptionsExtra...,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer h.Close()
-	defer dht.Close()
-
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		log.Fatal(err)
-	}
-	broadcaster, _ := crdt.NewPubSubBroadcaster(ctx, ps, "test-topic")
-
-	// Options for the CRDT datastore
-	opts := crdt.DefaultOptions()
-
-	// Initialize the CRDT Datastore
-	namespace := ds.NewKey("/test")
-	store, err := crdt.New(h, memStore, namespace, dagService, broadcaster, opts)
-	if err != nil {
-		log.Fatalf("Error initializing CRDT datastore: %v", err)
-	}
-
-	// Build a delta DAG 10 transactions deep
-	var heads []cid.Cid
-	var rootCID cid.Cid
-
-	for i := 0; i < 10; i++ {
-		k := fmt.Sprintf("key-%d", i)
-		v := fmt.Sprintf("value-%d", i)
-		// Create a new delta
-		err = store.Put(ctx, ds.NewKey(k), []byte(v))
-
-		// Update the heads
-		for _, h := range store.State().GetState().Members[h.ID().String()].DagHeads {
-			_, c, err := cid.CidFromBytes(h.Cid)
-			require.NoError(t, err)
-			heads = append(heads, c)
-		}
-	}
-
-	rootCID = heads[len(heads)-1] // Save the CID of the last transaction
-
-	require.NotNil(t, rootCID, "5th transaction CID should not be nil")
-
-	// Verify all nodes exist in the DAG
-	for i, head := range heads {
-		_, err := dagService.Get(ctx, head)
-		require.NoError(t, err, "node %d should exist in the DAG", i)
-	}
-
-	// Perform cleanup from the 5th transaction to the start
-	err = store.RemoveDeltaDAG(ctx, rootCID)
-	require.NoError(t, err)
-
-	// Verify all nodes are removed
-	for i := 0; i < 10; i++ {
-		_, err := dagService.Get(ctx, heads[i])
-		require.Error(t, err, "node %d should be removed from the DAG", i)
-	}
-	_ = memStore
-	///test/s/s/key-3/CIQHVXP46D6XGS7NQLCBEBBFGPX4E5EOFCIYX4ALKUMZFEYJ3Q35OSA
-}
-
-func TestCompactToHAMTAndTruncateDeltaDag(t *testing.T) {
-	// Context for the operations
-	ctx := context.Background()
-
-	// In-memory datastore for testing
-	memStore := dssync.MutexWrap(ds.NewMapDatastore())
-
-	bs := blockstore.NewBlockstore(memStore)
-	ex := offline.Exchange(bs)
-	bserv := bserv.New(bs, ex)
-
-	// Mock DAG service
-	dagService := dag.NewDAGService(bserv)
-
-	pk, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 1)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/45000")
-
-	h, dht, err := ipfslite.SetupLibp2p(
-		ctx,
-		pk,
-		nil,
-		[]multiaddr.Multiaddr{listen},
-		nil,
-		ipfslite.Libp2pOptionsExtra...,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer h.Close()
-	defer dht.Close()
-
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		log.Fatal(err)
-	}
-	broadcaster, _ := crdt.NewPubSubBroadcaster(ctx, ps, "test-topic")
-
-	// Options for the CRDT datastore
-	opts := crdt.DefaultOptions()
-
-	// Initialize the CRDT Datastore
-	namespace := ds.NewKey("/test")
-	store, err := crdt.New(h, memStore, namespace, dagService, broadcaster, opts)
-	if err != nil {
-		log.Fatalf("Error initializing CRDT datastore: %v", err)
-	}
-
-	// Populate the CRDT Datastore with key-value pairs
-	const numKeys = 502
-	const compactEvery = 100
-	var maxId int
-
-	var ss cid.Cid
-
-	for i := 0; i < numKeys; i++ {
-		k := fmt.Sprintf("key-%d", i)
-		v := fmt.Sprintf("value-%d", i)
-		if i%compactEvery == 0 {
-			// get the current head
-			m, ok := store.State().GetState().Members[h.ID().String()]
-			if ok {
-				heads := m.DagHeads
-				head := heads[len(heads)-1]
-				_, hcid, err := cid.CidFromBytes(head.Cid)
-				require.NoError(t, err)
-				ss, err = store.CompactToHAMT(ctx)
-				require.NoError(t, err)
-				err = store.RemoveDeltaDAG(ctx, hcid)
-				maxId = i
-			}
-		}
-		err = store.Put(ctx, ds.NewKey(k), []byte(v))
-		if err != nil {
-			log.Fatalf("Error adding key %s: %v", k, err)
-		}
-	}
-
-	store.PrintDAG()
-
-	r := PrintSnapshot(ctx, dagService, ss)
-	require.NoError(t, err)
-
-	for i := 0; i < maxId; i++ {
-		k := fmt.Sprintf("/key-%d", i)
-		v := fmt.Sprintf("value-%d", i)
-
-		mv, ok := r[k]
-		require.True(t, ok, fmt.Sprintf("key %s should exist", k))
-		require.Equal(t, v, mv)
-	}
+	return result, err
 }
