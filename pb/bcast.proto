@@ -4,8 +4,8 @@ package crdt.pb;
 option go_package=".;pb";
 
 message StateBroadcast {
-  Head Snapshot = 2;  // latest HAMT snapshot head
-  map<string,Participant>  Members = 1; // Map of participants
+  Snapshot Snapshot = 1;  // latest HAMT snapshot head
+  map<string,Participant>  Members = 2; // Map of participants
 }
 
 message Participant {
@@ -15,4 +15,9 @@ message Participant {
 
 message Head {
   bytes Cid = 1; // CID representing a head
+}
+
+message Snapshot {
+  Head SnapshotKey = 1;  // latest HAMT snapshot head
+  Head DagHead = 2; // the cid that was compacted
 }

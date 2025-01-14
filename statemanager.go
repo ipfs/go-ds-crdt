@@ -105,7 +105,10 @@ func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroa
 	return m.Save(ctx)
 }
 
-func (m *StateManager) SetSnapshot(ctx context.Context, root cid.Cid) error {
-	m.state.Snapshot = &pb.Head{Cid: root.Bytes()}
+func (m *StateManager) SetSnapshot(ctx context.Context, root cid.Cid, dagHead cid.Cid) error {
+	m.state.Snapshot = &pb.Snapshot{
+		SnapshotKey: &pb.Head{Cid: root.Bytes()},
+		DagHead:     &pb.Head{Cid: dagHead.Bytes()},
+	}
 	return m.Save(ctx)
 }

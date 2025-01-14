@@ -414,9 +414,12 @@ func (store *Datastore) handleNext() {
 		// if we have no snapshot head then we're probably a fresh database or node
 		// we should process the snapshot before doing anything else
 		if store.state.IsNew() && broadcast.Snapshot != nil {
-			c, err := cid.Cast(broadcast.Snapshot.Cid)
+			c, err := cid.Cast(broadcast.Snapshot.SnapshotKey.Cid)
 			if err == nil && c != cid.Undef {
-				err = store.restoreSnapshot(store.dagService, c)
+				dc, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
+				if err == nil {
+					err = store.restoreSnapshot(store.dagService, c, dc)
+				}
 				if err != nil {
 					// an issue occurring during a restore means we should try again.
 					// TODO log it
@@ -1559,7 +1562,7 @@ func (store *Datastore) InternalStats() Stats {
 	}
 }
 
-func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid) error {
+func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid) error {
 	hamtNode, err := getter.Get(store.ctx, snapshotRoot)
 	if err != nil {
 		return fmt.Errorf("getting root node: %w", err)
@@ -1597,7 +1600,7 @@ func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid
 		return fmt.Errorf("error processing shard: %w", err)
 	}
 
-	err = store.state.SetSnapshot(store.ctx, snapshotRoot)
+	err = store.state.SetSnapshot(store.ctx, snapshotRoot, dagHead)
 	if err != nil {
 		return fmt.Errorf("setting snapshot: %w", err)
 	}
