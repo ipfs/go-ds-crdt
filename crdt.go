@@ -27,8 +27,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ipfs/boxo/blockservice"
 	"github.com/ipfs/boxo/blockstore"
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
+	"github.com/ipfs/boxo/exchange/offline"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	pb "github.com/ipfs/go-ds-crdt/pb"
@@ -1648,67 +1650,62 @@ func (s *cidSafeSet) Has(c cid.Cid) (ok bool) {
 	return
 }
 
-func (store *Datastore) RemoveDeltaDAG(ctx context.Context, blockstore blockstore.Blockstore, startCID cid.Cid) error {
-	// Initialize a queue for breadth-first traversal
-	queue := []cid.Cid{startCID}
-	visited := make(map[cid.Cid]struct{})
+// DAGNodeInfo holds the additions and tombstones of a DAG node.
+type DAGNodeInfo struct {
+	Additions  map[string][]byte // key -> value
+	Tombstones []string          // keys marked for deletion
+}
 
-	ld := dag.GetLinksDirect(store.dagService)
-
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-
-		// Skip already visited nodes
-		if _, ok := visited[current]; ok {
-			continue
-		}
-		visited[current] = struct{}{}
-
-		// Retrieve the block
-		_, err := blockstore.Get(ctx, current)
-		if err != nil {
-			if ipld.IsNotFound(err) {
-				// nothing to do we don't have this block (its probably been previously truncated)
-				return nil
-			}
-			return fmt.Errorf("failed to retrieve node %s: %w", current, err)
-		}
-
-		// Queue child nodes for traversal
-		links, err := ld(ctx, current)
-		if err != nil {
-			if ipld.IsNotFound(err) {
-				// nothing to do we don't have this block
-				// this shouldn't be possible as we would have been stopped by the block service check above
-				return nil
-			}
-			return fmt.Errorf("failed to retrieve nodes links %s: %w", current, err)
-		}
-
-		for _, link := range links {
-			queue = append(queue, link.Cid)
-		}
-
-		// Remove the node from the datastore
-		err = store.store.Delete(ctx, store.processedBlockKey(current))
-		if err != nil {
-			return fmt.Errorf("failed to delete node %s: %w", current, err)
-		}
-
-		err = store.dagService.Remove(ctx, current)
-		if err != nil {
-			return fmt.Errorf("failed to delete node %s: %w", current, err)
-		}
-		// Remove from the "heads" if it's a head
-		isHead, _, _ := store.heads.IsHead(current)
-		if isHead {
-			err := store.heads.delete(ctx, store.store, current)
-			if err != nil {
-				return fmt.Errorf("failed to remove head %s: %w", current, err)
-			}
-		}
+// ExtractDAGContent walks through the DAG starting from the given heads
+// and collects the additions and tombstones for each node.
+func (store *Datastore) ExtractDAGContent(blockstore blockstore.Blockstore) (map[uint64]DAGNodeInfo, error) {
+	heads, _, err := store.heads.List()
+	if err != nil {
+		return nil, err
 	}
 
+	offlineDAG := dag.NewDAGService(blockservice.New(blockstore, offline.Exchange(blockstore)))
+	ng := &crdtNodeGetter{NodeGetter: offlineDAG}
+
+	set := cid.NewSet()
+
+	result := map[uint64]DAGNodeInfo{}
+
+	for _, h := range heads {
+		err := store.extractDAGContent(h, 0, ng, set, result)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func (store *Datastore) extractDAGContent(from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set, result map[uint64]DAGNodeInfo) error {
+	ok := set.Visit(from)
+	if !ok {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(store.ctx, store.opts.DAGSyncerTimeout)
+	defer cancel()
+	nd, delta, err := ng.GetDelta(ctx, from)
+	if err != nil {
+		return err
+	}
+	info := DAGNodeInfo{
+		Additions: map[string][]byte{},
+	}
+	result[delta.GetPriority()] = info
+
+	for _, e := range delta.GetElements() {
+		info.Additions[e.GetKey()] = e.GetValue()
+	}
+	for _, e := range delta.GetTombstones() {
+		info.Tombstones = append(info.Tombstones, e.GetKey())
+	}
+
+	for _, l := range nd.Links() {
+		_ = store.extractDAGContent(l.Cid, depth+1, ng, set, result)
+	}
 	return nil
 }

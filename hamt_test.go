@@ -58,110 +58,81 @@ func setupTestEnv(ctx context.Context, t *testing.T) (*crdt.Datastore, host.Host
 	return store, h, bs, dagService, cleanup
 }
 
-func TestCompactToHAMT(t *testing.T) {
-	ctx := context.Background()
-	store, _, _, dagService, cleanup := setupTestEnv(ctx, t)
-	defer cleanup()
-
-	const numKeys = 5000
-	const batchSize = 100
-
-	var b ds.Batch
-	for i := 0; i < numKeys; i++ {
-		k := fmt.Sprintf("key-%d", i)
-		v := fmt.Sprintf("value-%d", i)
-		if i%batchSize == 0 {
-			if b != nil {
-				require.NoError(t, b.Commit(ctx), "batch commit failed")
-			}
-			b, _ = store.Batch(ctx)
-		}
-		require.NoError(t, b.Put(ctx, ds.NewKey(k), []byte(v)), "failed to put key-value")
-	}
-	require.NoError(t, b.Commit(ctx), "final batch commit failed")
-
-	rootCID, err := store.CompactToHAMT(ctx)
-	require.NoError(t, err, "compaction failed")
-
-	r := PrintSnapshot(ctx, dagService, rootCID)
-	for i := 0; i < numKeys; i++ {
-		k := fmt.Sprintf("/key-%d", i)
-		v := fmt.Sprintf("value-%d", i)
-		require.Equal(t, v, r[k], fmt.Sprintf("key %s has incorrect value", k))
-	}
-}
-
-func TestRemoveDeltaDAG(t *testing.T) {
-	ctx := context.Background()
-	store, h, bs, _, cleanup := setupTestEnv(ctx, t)
-	defer cleanup()
-
-	const numDeltas = 10
-	var (
-		rootCID cid.Cid
-		err     error
-	)
-
-	for i := 0; i < numDeltas; i++ {
-		k := fmt.Sprintf("key-%d", i)
-		v := fmt.Sprintf("value-%d", i)
-		require.NoError(t, store.Put(ctx, ds.NewKey(k), []byte(v)), "failed to put key-value")
-
-		if i == 4 {
-			m, ok := store.InternalStats().State.Members[h.ID().String()]
-			require.True(t, ok, "our peerid should exist in the state")
-			lastHead := m.DagHeads[len(m.DagHeads)-1]
-			_, rootCID, err = cid.CidFromBytes(lastHead.Cid)
-			require.NoError(t, err, "failed to parse CID")
-		}
-	}
-
-	require.NotNil(t, rootCID, "rootCID should not be nil")
-	require.NoError(t, store.RemoveDeltaDAG(ctx, bs, rootCID), "failed to remove deltas")
-}
-
-func TestCompactToHAMTAndTruncateDeltaDag(t *testing.T) {
+func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 	ctx := context.Background()
 	store, h, bs, dagService, cleanup := setupTestEnv(ctx, t)
 	defer cleanup()
 
-	const numKeys = 502
-	const compactEvery = 100
-	var maxID int
-	var ss cid.Cid
-
-	for i := 1; i < numKeys; i++ {
+	const (
+		numKeys      = 502
+		compactEvery = 100
+	)
+	var (
+		maxID            int
+		snapshotCID      cid.Cid
+		lastCompactedCid cid.Cid
+	)
+	for i := 1; i <= numKeys; i++ {
 		k := fmt.Sprintf("key-%d", i)
 		v := fmt.Sprintf("value-%d", i)
 		require.NoError(t, store.Put(ctx, ds.NewKey(k), []byte(v)), "failed to put key-value")
+
 		if i%compactEvery == 0 {
 			m, ok := store.InternalStats().State.Members[h.ID().String()]
 			require.True(t, ok, "our peerid should exist in the state")
 			lastHead := m.DagHeads[len(m.DagHeads)-1]
-			_, hcid, err := cid.CidFromBytes(lastHead.Cid)
+			_, headCID, err := cid.CidFromBytes(lastHead.Cid)
 			require.NoError(t, err, "failed to parse CID")
 
-			ss, err = store.CompactToHAMT(ctx)
-			require.NoError(t, err, "compaction failed")
-			err = store.RemoveDeltaDAG(ctx, bs, hcid)
-			if err != nil {
-				require.NoError(t, err, "failed to truncate delta DAG")
-			}
+			// Perform compaction and truncation in one step
+			snapshotCID, err = store.CompactAndTruncate(ctx, bs, headCID, lastCompactedCid)
+			require.NoError(t, err, "compaction and truncation failed")
 
 			maxID = i
+			lastCompactedCid = headCID
 		}
 	}
 
-	store.PrintDAG()
-	r := PrintSnapshot(ctx, dagService, ss)
+	// Verify the snapshot in the HAMT
+	r := ExtractSnapshot(ctx, dagService, snapshotCID)
 	for i := 1; i <= maxID; i++ {
 		k := fmt.Sprintf("/key-%d", i)
 		v := fmt.Sprintf("value-%d", i)
 		require.Equal(t, v, r[k], fmt.Sprintf("key %s has incorrect value", k))
 	}
+
+	// Ensure that the head walks back and only contains the expected keys
+	//m, ok := store.InternalStats().State.Members[h.ID().String()]
+	//require.True(t, ok, "our peerid should exist in the state")
+	//lastHead := m.DagHeads[len(m.DagHeads)-1]
+
+	// Step 2: Perform compaction and truncation
+	heads := store.InternalStats().Heads
+	require.NotEmpty(t, heads, "DAG heads should not be empty")
+
+	// Step 3: Extract DAG content after compaction
+	dagContent, err := store.ExtractDAGContent(bs)
+	require.NoError(t, err, "failed to extract DAG content")
+
+	// Step 4: Validate DAG has been truncated (only 1 or 2 nodes should remain)
+	require.Len(t, dagContent, 2, "DAG should contain only the snapshot and latest delta")
+
+	// Step 5: Validate the remaining deltas
+	require.Equal(t, crdt.DAGNodeInfo{
+		Additions: map[string][]byte{
+			"/key-502": []byte("value-502"),
+		},
+		Tombstones: nil,
+	}, dagContent[502])
+	require.Equal(t, crdt.DAGNodeInfo{
+		Additions: map[string][]byte{
+			"/key-501": []byte("value-501"),
+		},
+		Tombstones: nil,
+	}, dagContent[501])
 }
 
-func PrintSnapshot(ctx context.Context, dagService format.DAGService, rootCID cid.Cid) map[string]string {
+func ExtractSnapshot(ctx context.Context, dagService format.DAGService, rootCID cid.Cid) map[string]string {
 	hamNode, err := dagService.Get(ctx, rootCID)
 	if err != nil {
 		log.Fatalf("failed to get HAMT node: %v", err)
@@ -172,11 +143,11 @@ func PrintSnapshot(ctx context.Context, dagService format.DAGService, rootCID ci
 		log.Fatalf("failed to load HAMT shard: %v", err)
 	}
 
-	r, _ := PrintShardContent(ctx, hamShard, dagService)
+	r, _ := ExtractShardData(ctx, hamShard, dagService)
 	return r
 }
 
-func PrintShardContent(ctx context.Context, shard *hamt.Shard, getter format.NodeGetter) (map[string]string, error) {
+func ExtractShardData(ctx context.Context, shard *hamt.Shard, getter format.NodeGetter) (map[string]string, error) {
 	result := map[string]string{}
 	var mu sync.Mutex
 

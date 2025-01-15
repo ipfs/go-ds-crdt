@@ -97,7 +97,7 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroadcast) error {
 	for k, v := range broadcast.Members {
 		// if our state is missing this member or the update is newer than the one we have
-		// take there's
+		// take theirs
 		if ov, ok := m.state.Members[k]; !ok || ov.BestBefore > ov.BestBefore {
 			m.state.Members[k] = v
 		}
