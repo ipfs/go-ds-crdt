@@ -1,4 +1,4 @@
-package crdt_test
+package crdt
 
 import (
 	"context"
@@ -7,60 +7,46 @@ import (
 	"sync"
 	"testing"
 
-	ipfslite "github.com/hsanjuan/ipfs-lite"
-	bserv "github.com/ipfs/boxo/blockservice"
 	"github.com/ipfs/boxo/blockstore"
-	"github.com/ipfs/boxo/exchange/offline"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
+	mdutils "github.com/ipfs/boxo/ipld/merkledag/test"
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
-	dssync "github.com/ipfs/go-datastore/sync"
-	crdt "github.com/ipfs/go-ds-crdt"
 	format "github.com/ipfs/go-ipld-format"
-	"github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestEnv(ctx context.Context, t *testing.T) (*crdt.Datastore, host.Host, blockstore.Blockstore, format.DAGService, func()) {
+func setupTestEnv(t *testing.T) (*Datastore, Peer, blockstore.Blockstore, format.DAGService, func()) {
 	t.Helper()
+	memStore := makeStore(t, 0)
+	bs := mdutils.Bserv()
+	dagserv := dag.NewDAGService(bs)
+	dagService := &mockDAGSvc{DAGService: dagserv, bs: bs.Blockstore()}
+	broadcasters, cancel := newBroadcasters(t, 1)
+	broadcaster := broadcasters[0]
+	h := newMockPeer("test-peer")
 
-	memStore := dssync.MutexWrap(ds.NewMapDatastore())
-	bs := blockstore.NewBlockstore(memStore)
-	ex := offline.Exchange(bs)
-	bserv := bserv.New(bs, ex)
-	dagService := dag.NewDAGService(bserv)
-
-	pk, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 1)
-	require.NoError(t, err, "failed to generate key pair")
-
-	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/45000")
-	h, dht, err := ipfslite.SetupLibp2p(ctx, pk, nil, []multiaddr.Multiaddr{listen}, nil, ipfslite.Libp2pOptionsExtra...)
-	require.NoError(t, err, "failed to set up libp2p")
-
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	require.NoError(t, err, "failed to create pubsub")
-
-	broadcaster, _ := crdt.NewPubSubBroadcaster(ctx, ps, "test-topic")
-
-	opts := crdt.DefaultOptions()
-	store, err := crdt.New(h, memStore, ds.NewKey("/test"), dagService, broadcaster, opts)
-	require.NoError(t, err, "failed to create CRDT datastore")
+	opts := DefaultOptions()
+	opts.Logger =
+		&testLogger{
+			name: fmt.Sprintf("r#%d: ", 0),
+			l:    DefaultOptions().Logger,
+		}
+	opts.Logger = &testLogger{name: t.Name(),
+		l: DefaultOptions().Logger}
+	store, err := New(h, memStore, ds.NewKey("/test"), dagService, broadcaster, opts)
+	require.NoError(t, err)
 
 	cleanup := func() {
-		h.Close()
-		dht.Close()
+		cancel()
 	}
-
-	return store, h, bs, dagService, cleanup
+	return store, h, bs.Blockstore(), dagserv, cleanup
 }
 
 func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 	ctx := context.Background()
-	store, h, bs, dagService, cleanup := setupTestEnv(ctx, t)
+	store, h, bs, dagService, cleanup := setupTestEnv(t)
 	defer cleanup()
 
 	const (
@@ -118,13 +104,13 @@ func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 	require.Len(t, dagContent, 2, "DAG should contain only the snapshot and latest delta")
 
 	// Step 5: Validate the remaining deltas
-	require.Equal(t, crdt.DAGNodeInfo{
+	require.Equal(t, DAGNodeInfo{
 		Additions: map[string][]byte{
 			"/key-502": []byte("value-502"),
 		},
 		Tombstones: nil,
 	}, dagContent[502])
-	require.Equal(t, crdt.DAGNodeInfo{
+	require.Equal(t, DAGNodeInfo{
 		Additions: map[string][]byte{
 			"/key-501": []byte("value-501"),
 		},
