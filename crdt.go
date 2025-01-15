@@ -18,6 +18,7 @@
 package crdt
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -117,6 +118,12 @@ type Options struct {
 	// branching is not necessarily a bad thing and may improve
 	// throughput, but everything depends on usage.
 	MultiHeadProcessing bool
+
+	// RepairInterval specifies how often to attempt to compact the DAG.
+	CompactInterval time.Duration
+
+	//CompactDagSize the height of the dag which would trigger a compaction.
+	CompactDagSize uint64
 }
 
 func (opts *Options) verify() error {
@@ -186,6 +193,7 @@ type Datastore struct {
 	state     *StateManager
 
 	dagService  ipld.DAGService
+	bs          blockstore.Blockstore
 	broadcaster Broadcaster
 
 	seenHeadsMux sync.RWMutex
@@ -202,6 +210,8 @@ type Datastore struct {
 	// child
 	queuedChildren *cidSafeSet
 	h              Peer
+	// old snapshot cid is the snapshot cid seen before the "current" one
+	oldProcessedCID []byte
 }
 
 type dagJob struct {
@@ -236,7 +246,7 @@ type Peer interface {
 // datastore that persists things directly on write.
 //
 // The CRDT-Datastore should call Close() before the given store is closed.
-func New(h Peer, store ds.Datastore, namespace ds.Key, dagSyncer ipld.DAGService, bcast Broadcaster, opts *Options) (*Datastore, error) {
+func New(h Peer, store ds.Datastore, bs blockstore.Blockstore, namespace ds.Key, dagSyncer ipld.DAGService, bcast Broadcaster, opts *Options) (*Datastore, error) {
 	if opts == nil {
 		opts = DefaultOptions()
 	}
@@ -295,6 +305,7 @@ func New(h Peer, store ds.Datastore, namespace ds.Key, dagSyncer ipld.DAGService
 		opts:           opts,
 		logger:         opts.Logger,
 		store:          store,
+		bs:             bs,
 		namespace:      namespace,
 		set:            set,
 		heads:          heads,
@@ -337,7 +348,7 @@ func New(h Peer, store ds.Datastore, namespace ds.Key, dagSyncer ipld.DAGService
 			dstore.dagWorker()
 		}()
 	}
-	dstore.wg.Add(4)
+	dstore.wg.Add(5)
 	go func() {
 		defer dstore.wg.Done()
 		dstore.handleNext()
@@ -350,6 +361,11 @@ func New(h Peer, store ds.Datastore, namespace ds.Key, dagSyncer ipld.DAGService
 	go func() {
 		defer dstore.wg.Done()
 		dstore.repair()
+	}()
+
+	go func() {
+		defer dstore.wg.Done()
+		dstore.compact()
 	}()
 
 	go func() {
@@ -406,12 +422,29 @@ func (store *Datastore) handleNext() {
 			// TODO log and continue
 		}
 
-		// TODO what happens if theres a snapshot and it doesn't match our snapshot!?
-		// i think what we would do is perform a compaction ourselves
-		// 1 of 2 things would happen
-		// 1. we determine the same head to compact from and end up with the same cid
-		// 2. we determine a later head and broadcast that as the latest snapshot cid, we will eventually all generate
-		// and agree the same cid this way
+		if !store.state.IsNew() && broadcast.Snapshot != nil &&
+			broadcast.Snapshot.DagHead != store.state.state.Snapshot.DagHead &&
+			!bytes.Equal(broadcast.Snapshot.DagHead.Cid, store.oldProcessedCID) {
+
+			start, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
+			if err != nil {
+				// todo
+			}
+			end, err := cid.Cast(store.state.state.Snapshot.DagHead.Cid)
+			if err != nil {
+				// todo
+			}
+			newSS, err := store.CompactAndTruncate(store.ctx, start, end)
+			store.oldProcessedCID = store.state.state.Snapshot.DagHead.Cid
+			err = store.state.SetSnapshot(store.ctx, newSS, start, broadcast.Snapshot.Height)
+			if err != nil {
+				// todo process this error
+			}
+			err = store.broadcast(store.ctx)
+			if err != nil {
+				// todo process this error
+			}
+		}
 
 		// if we have no snapshot head then we're probably a fresh database or node
 		// we should process the snapshot before doing anything else
@@ -420,7 +453,7 @@ func (store *Datastore) handleNext() {
 			if err == nil && c != cid.Undef {
 				dc, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
 				if err == nil {
-					err = store.restoreSnapshot(store.dagService, c, dc)
+					err = store.restoreSnapshot(store.dagService, c, dc, broadcast.Snapshot.Height)
 				}
 				if err != nil {
 					// an issue occurring during a restore means we should try again.
@@ -1564,7 +1597,7 @@ func (store *Datastore) InternalStats() Stats {
 	}
 }
 
-func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid) error {
+func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid, dagHeight uint64) error {
 	hamtNode, err := getter.Get(store.ctx, snapshotRoot)
 	if err != nil {
 		return fmt.Errorf("getting root node: %w", err)
@@ -1602,7 +1635,7 @@ func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid
 		return fmt.Errorf("error processing shard: %w", err)
 	}
 
-	err = store.state.SetSnapshot(store.ctx, snapshotRoot, dagHead)
+	err = store.state.SetSnapshot(store.ctx, snapshotRoot, dagHead, dagHeight)
 	if err != nil {
 		return fmt.Errorf("setting snapshot: %w", err)
 	}
@@ -1706,6 +1739,59 @@ func (store *Datastore) extractDAGContent(from cid.Cid, depth uint64, ng *crdtNo
 
 	for _, l := range nd.Links() {
 		_ = store.extractDAGContent(l.Cid, depth+1, ng, set, result)
+	}
+	return nil
+}
+
+func (store *Datastore) compact() {
+	if store.opts.CompactInterval == 0 {
+		return
+	}
+	timer := time.NewTimer(0) // fire immediately on start
+	for {
+		select {
+		case <-store.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+			store.triggerCompaction()
+		}
+		timer.Reset(store.opts.CompactInterval)
+	}
+
+}
+
+func (store *Datastore) triggerCompaction() error {
+	if store.IsDirty() {
+		return nil
+	}
+	s := store.InternalStats()
+	var (
+		snapshotHeight uint64
+		snapshotCid    cid.Cid
+		err            error
+	)
+	if s.State.Snapshot != nil {
+		snapshotHeight = s.State.Snapshot.Height
+		snapshotCid, err = cid.Cast(s.State.Snapshot.DagHead.Cid)
+		if err != nil {
+			return fmt.Errorf("parsing snapshot dag: %w", err)
+		}
+	}
+
+	dagSize := s.MaxHeight - snapshotHeight
+	snapshotHead := s.Heads[0]
+	if dagSize > store.opts.CompactDagSize {
+		compactCid, err := store.CompactAndTruncate(store.ctx, store.bs, snapshotHead, snapshotCid)
+		if err != nil {
+			return fmt.Errorf("compacting DAG: %w", err)
+		}
+		if err := store.state.SetSnapshot(store.ctx, compactCid, snapshotHead, s.MaxHeight); err != nil {
+			return fmt.Errorf("updating snapshot: %w", err)
+		}
+		return store.broadcast(store.ctx)
 	}
 	return nil
 }

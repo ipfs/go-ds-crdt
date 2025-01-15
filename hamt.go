@@ -42,9 +42,9 @@ func valueToNode(ctx context.Context, dagService ipld.DAGService, value []byte) 
 	return node, nil
 }
 
-func (store *Datastore) CompactAndTruncate(ctx context.Context, blockstore blockstore.Blockstore, startCID, endCID cid.Cid) (cid.Cid, error) {
+func (store *Datastore) CompactAndTruncate(ctx context.Context, startCID, endCID cid.Cid) (cid.Cid, error) {
 	// Step 1: Set up a DAG service with offline exchange
-	offlineDAG := dag.NewDAGService(blockservice.New(blockstore, offline.Exchange(blockstore)))
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
 
 	// Step 2: Collect all deltas using the offline DAG service
 	var allDeltas []*pb.Delta
