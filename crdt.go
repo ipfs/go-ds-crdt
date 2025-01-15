@@ -124,6 +124,8 @@ type Options struct {
 
 	//CompactDagSize the height of the dag which would trigger a compaction.
 	CompactDagSize uint64
+	// CompactRetainNodes defines how many recent nodes should remain after DAG compaction
+	CompactRetainNodes uint64
 }
 
 func (opts *Options) verify() error {
@@ -1756,42 +1758,187 @@ func (store *Datastore) compact() {
 			}
 			return
 		case <-timer.C:
-			store.triggerCompaction()
+			err := store.TriggerCompactionIfNeeded()
+			if err != nil {
+				//todo
+			}
 		}
 		timer.Reset(store.opts.CompactInterval)
 	}
 
 }
 
-func (store *Datastore) triggerCompaction() error {
-	if store.IsDirty() {
+// DatastoreCompaction handles compaction logic directly within the datastore
+func (store *Datastore) TriggerCompactionIfNeeded() error {
+	// Ensure all members agree on the DAG head before compacting
+	commonCid, height, err := store.getHighestCommonCid()
+	if err != nil {
+		return err
+	}
+
+	state := store.state.GetState()
+	dagSize := height - state.Snapshot.Height
+
+	// Check if DAG size exceeds the threshold for compaction
+	if dagSize < store.opts.CompactDagSize {
 		return nil
 	}
-	s := store.InternalStats()
+
+	// Extract DAG content and walk back CompactRetainNodes steps to determine the target CID
+	startCID, height, err := store.walkBackDAG(commonCid, store.opts.CompactRetainNodes)
+	if err != nil {
+		return fmt.Errorf("failed to determine target CID for compaction: %w", err)
+	}
+
+	lastSnapshotCid, err := cid.Cast(state.Snapshot.DagHead.Cid)
+	if err != nil {
+		return fmt.Errorf("parsing last snapshot cid: %w", err)
+	}
+
+	// Run compaction from start CID
+	compactCID, err := store.CompactAndTruncate(store.ctx, startCID, lastSnapshotCid)
+	if err != nil {
+		return fmt.Errorf("error during DAG compaction: %w", err)
+	}
+
+	// Update the snapshot if compaction changes the state
+	if err := store.state.SetSnapshot(store.ctx, compactCID, compactCID, height); err != nil {
+		return fmt.Errorf("failed to update snapshot after compaction: %w", err)
+	}
+
+	return store.broadcast(store.ctx)
+}
+
+// getHighestCommonCid gets the highest common cid of all members
+func (store *Datastore) getHighestCommonCid() (cid.Cid, uint64, error) {
+	heads := store.GetAllMemberCommonHeads()
 	var (
-		snapshotHeight uint64
-		snapshotCid    cid.Cid
-		err            error
+		c cid.Cid
+		h uint64
 	)
-	if s.State.Snapshot != nil {
-		snapshotHeight = s.State.Snapshot.Height
-		snapshotCid, err = cid.Cast(s.State.Snapshot.DagHead.Cid)
+
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
+	ng := &crdtNodeGetter{NodeGetter: offlineDAG}
+	for _, head := range heads {
+		p, err := ng.GetPriority(store.ctx, head)
 		if err != nil {
-			return fmt.Errorf("parsing snapshot dag: %w", err)
+			return c, h, fmt.Errorf("getting head: %w", err)
+		}
+		if p > h {
+			c = head
+			h = p
+		}
+	}
+	return c, h, nil
+}
+
+// GetAllMemberCommonHeads retrieves the DAG heads from all peers
+func (store *Datastore) GetAllMemberCommonHeads() []cid.Cid {
+	var cids []cid.Cid
+	cidCount := map[cid.Cid]int{}
+	var members int
+
+	for _, v := range store.state.GetState().Members {
+		members++
+		for _, c := range v.DagHeads {
+			id, err := cid.Cast(c.Cid)
+			if err != nil {
+				// TODO
+			}
+			cidCount[id]++
 		}
 	}
 
-	dagSize := s.MaxHeight - snapshotHeight
-	snapshotHead := s.Heads[0]
-	if dagSize > store.opts.CompactDagSize {
-		compactCid, err := store.CompactAndTruncate(store.ctx, store.bs, snapshotHead, snapshotCid)
-		if err != nil {
-			return fmt.Errorf("compacting DAG: %w", err)
+	for k, v := range cidCount {
+		if v == members {
+			cids = append(cids, k)
 		}
-		if err := store.state.SetSnapshot(store.ctx, compactCid, snapshotHead, s.MaxHeight); err != nil {
-			return fmt.Errorf("updating snapshot: %w", err)
-		}
-		return store.broadcast(store.ctx)
 	}
-	return nil
+
+	return cids
+}
+
+// walkBackDAG traverses the DAG and selects a stable head to compact from thats retainNodes behind the given startCID
+func (store *Datastore) walkBackDAG(startCID cid.Cid, retainNodes uint64) (cid.Cid, uint64, error) {
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
+	ng := crdtNodeGetter{NodeGetter: offlineDAG}
+	visited := cid.NewSet()
+
+	var (
+		targetCID cid.Cid
+		height    uint64
+		steps     uint64
+	)
+
+	var walk func(currentCID cid.Cid) error
+	walk = func(currentCID cid.Cid) error {
+		if steps >= retainNodes {
+			targetCID = currentCID
+			_, delta, err := ng.GetDelta(store.ctx, currentCID)
+			if err != nil {
+				return fmt.Errorf("getting delta: %w", err)
+			}
+			height = delta.GetPriority()
+			return nil
+		}
+		if !visited.Visit(currentCID) {
+			return nil
+		}
+
+		node, _, err := ng.GetDelta(store.ctx, currentCID)
+		if err != nil {
+			return err
+		}
+
+		links := node.Links()
+		if len(links) == 1 {
+			// Linear path, continue walking
+			steps++
+			return walk(links[0].Cid)
+		} else if len(links) > 1 {
+			// Select the most stable branch (e.g., by priority)
+			stableChild, err := store.selectStableChild(links)
+			if err != nil {
+				return err
+			}
+			steps++
+			return walk(stableChild)
+		}
+
+		return nil
+	}
+
+	if err := walk(startCID); err != nil {
+		return cid.Undef, 0, err
+	}
+	return targetCID, height, nil
+}
+
+// selectStableChild selects the most stable child node from multiple links
+func (store *Datastore) selectStableChild(links []*ipld.Link) (cid.Cid, error) {
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
+	ng := crdtNodeGetter{NodeGetter: offlineDAG}
+
+	var (
+		bestCID         cid.Cid
+		highestPriority uint64
+	)
+
+	for _, link := range links {
+		_, delta, err := ng.GetDelta(store.ctx, link.Cid)
+		if err != nil {
+			continue // Skip if priority can't be determined
+		}
+
+		priority := delta.GetPriority()
+		if priority > highestPriority {
+			bestCID = link.Cid
+			highestPriority = priority
+		}
+	}
+
+	if bestCID.Defined() {
+		return bestCID, nil
+	}
+	return cid.Undef, fmt.Errorf("no stable child found among branches")
 }

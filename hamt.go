@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/ipfs/boxo/blockservice"
-	"github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/boxo/exchange/offline"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
@@ -45,6 +44,7 @@ func valueToNode(ctx context.Context, dagService ipld.DAGService, value []byte) 
 func (store *Datastore) CompactAndTruncate(ctx context.Context, startCID, endCID cid.Cid) (cid.Cid, error) {
 	// Step 1: Set up a DAG service with offline exchange
 	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
+	ng := &crdtNodeGetter{NodeGetter: offlineDAG}
 
 	// Step 2: Collect all deltas using the offline DAG service
 	var allDeltas []*pb.Delta
@@ -65,18 +65,12 @@ func (store *Datastore) CompactAndTruncate(ctx context.Context, startCID, endCID
 		visited[current] = struct{}{}
 
 		// Fetch the IPLD node using the offline DAG service
-		node, err := offlineDAG.Get(ctx, current)
+		node, delta, err := ng.GetDelta(ctx, current)
 		if err != nil {
 			if isOfflineBlockNotFoundError(err) {
 				return cid.Undef, fmt.Errorf("block %s not found locally: %w", current, err)
 			}
 			return cid.Undef, fmt.Errorf("failed to retrieve DAG node %s: %w", current, err)
-		}
-
-		// Extract the delta from the node
-		delta, err := extractDelta(node)
-		if err != nil {
-			return cid.Undef, fmt.Errorf("failed to extract delta from %s: %w", current, err)
 		}
 
 		allDeltas = append(allDeltas, delta)
@@ -177,7 +171,7 @@ func (store *Datastore) CompactAndTruncate(ctx context.Context, startCID, endCID
 	}
 
 	// Step 7: Truncate the old DAG
-	err = store.truncateDAG(ctx, blockstore, startCID, endCID)
+	err = store.truncateDAG(ctx, startCID, endCID)
 	if err != nil {
 		return cid.Undef, fmt.Errorf("failed to truncate DAG: %w", err)
 	}
@@ -191,9 +185,9 @@ func isOfflineBlockNotFoundError(err error) bool {
 }
 
 // Truncate the DAG from startCID to endCID using an offline DAG service
-func (store *Datastore) truncateDAG(ctx context.Context, blockstore blockstore.Blockstore, startCID, endCID cid.Cid) error {
+func (store *Datastore) truncateDAG(ctx context.Context, startCID, endCID cid.Cid) error {
 	// Initialize a DAG service with an offline exchange
-	offlineDAG := dag.NewDAGService(blockservice.New(blockstore, offline.Exchange(blockstore)))
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
 
 	queue := []cid.Cid{startCID}
 	visited := make(map[cid.Cid]struct{})
@@ -222,18 +216,12 @@ func (store *Datastore) truncateDAG(ctx context.Context, blockstore blockstore.B
 			return fmt.Errorf("failed to retrieve DAG node %s: %w", current, err)
 		}
 
-		// Step 1: Delete the node from the blockstore
-		err = blockstore.DeleteBlock(ctx, current)
-		if err != nil {
-			return fmt.Errorf("failed to delete block %s: %w", current, err)
-		}
-
-		// Step 2: Queue child nodes for further deletion
+		// Step 1: Queue child nodes for further deletion
 		for _, link := range node.Links() {
 			queue = append(queue, link.Cid)
 		}
 
-		// Step 3: Clean up from the DAG service
+		// Step 2: Clean up from the DAG service
 		err = store.dagService.Remove(ctx, current)
 		if err != nil {
 			return fmt.Errorf("failed to remove DAG node %s: %w", current, err)
