@@ -6,6 +6,7 @@ import (
 	"log"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ipfs/boxo/blockstore"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
@@ -116,6 +117,81 @@ func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 		},
 		Tombstones: nil,
 	}, dagContent[501])
+}
+
+func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
+	replicas, closeReplicas := makeNReplicas(t, 2, nil)
+	defer closeReplicas()
+
+	ctx := context.Background()
+
+	// Initially, both replicas are disconnected
+
+	br0 := replicas[0].broadcaster.(*mockBroadcaster)
+	br0.dropProb.Store(101)
+
+	br1 := replicas[1].broadcaster.(*mockBroadcaster)
+	br1.dropProb.Store(101)
+
+	k := ds.NewKey("k1")
+
+	// Put key in replica 0
+	err := replicas[0].Put(ctx, k, []byte("v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = replicas[0].Put(ctx, k, []byte("v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m, ok := replicas[0].InternalStats().State.Members[replicas[0].h.ID().String()]
+	require.True(t, ok, "our peerid should exist in the state")
+	lastHead := m.DagHeads[len(m.DagHeads)-1]
+	_, headCID, err := cid.CidFromBytes(lastHead.Cid)
+	require.NoError(t, err, "failed to parse CID")
+
+	// Create snapshot
+	snapshotCid, err := replicas[0].CompactAndTruncate(ctx, headCID, cid.Cid{})
+	require.NoError(t, err, "compaction and truncation failed")
+
+	// Key should not exist in replica 1 at this point, since replicas are disconnected
+	_, err = replicas[1].Get(ctx, k)
+	require.ErrorIs(t, err, ds.ErrNotFound)
+
+	// Restore snapshot into replica 1
+	replicas[1].restoreSnapshot(replicas[1].dagService, snapshotCid, headCID, 2)
+
+	// Key now exists in replica 1
+	val, err := replicas[1].Get(ctx, k)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v2"), val)
+
+	// Delete key from replica 1
+	err = replicas[1].Delete(ctx, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// At this point, before allowing the replicas to sync, the key should not be found in replica 1
+	_, err = replicas[1].Get(ctx, k)
+	require.ErrorIs(t, err, ds.ErrNotFound)
+
+	// Allow replicas to sync
+	br0.dropProb.Store(0)
+	br1.dropProb.Store(0)
+
+	time.Sleep(10 * time.Second)
+
+	// The key should not be found in any replica
+
+	_, err = replicas[1].Get(ctx, k)
+	require.ErrorIs(t, err, ds.ErrNotFound)
+
+	_, err = replicas[0].Get(ctx, k)
+	require.ErrorIs(t, err, ds.ErrNotFound)
+
+	closeReplicas()
 }
 
 func ExtractSnapshot(ctx context.Context, dagService format.DAGService, rootCID cid.Cid) map[string]string {
