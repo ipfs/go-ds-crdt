@@ -1730,14 +1730,13 @@ func (store *Datastore) extractDAGContent(from cid.Cid, depth uint64, ng *crdtNo
 	info := DAGNodeInfo{
 		Additions: map[string][]byte{},
 	}
-	result[delta.GetPriority()] = info
-
 	for _, e := range delta.GetElements() {
 		info.Additions[e.GetKey()] = e.GetValue()
 	}
 	for _, e := range delta.GetTombstones() {
 		info.Tombstones = append(info.Tombstones, e.GetKey())
 	}
+	result[delta.GetPriority()] = info
 
 	for _, l := range nd.Links() {
 		_ = store.extractDAGContent(l.Cid, depth+1, ng, set, result)
