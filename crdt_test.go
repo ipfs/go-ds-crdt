@@ -286,7 +286,7 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 
 		h := newMockPeer(fmt.Sprintf("peer-%d", i))
 		var err error
-		replicas[i], err = New(h, makeStore(t, i), ds.NewKey("crdttest"), dagsync, bcasts[i], replicaOpts[i])
+		replicas[i], err = New(h, makeStore(t, i), bs.Blockstore(), ds.NewKey("crdttest"), dagsync, bcasts[i], replicaOpts[i])
 		if err != nil {
 			t.Fatal(err)
 		}

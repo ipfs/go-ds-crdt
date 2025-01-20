@@ -35,7 +35,7 @@ func setupTestEnv(t *testing.T) (*Datastore, Peer, blockstore.Blockstore, format
 		}
 	opts.Logger = &testLogger{name: t.Name(),
 		l: DefaultOptions().Logger}
-	store, err := New(h, memStore, ds.NewKey("/test"), dagService, broadcaster, opts)
+	store, err := New(h, memStore, bs.Blockstore(), ds.NewKey("/test"), dagService, broadcaster, opts)
 	require.NoError(t, err)
 
 	cleanup := func() {
@@ -71,7 +71,7 @@ func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 			require.NoError(t, err, "failed to parse CID")
 
 			// Perform compaction and truncation in one step
-			snapshotCID, err = store.CompactAndTruncate(ctx, bs, headCID, lastCompactedCid)
+			snapshotCID, err = store.CompactAndTruncate(ctx, headCID, lastCompactedCid)
 			require.NoError(t, err, "compaction and truncation failed")
 
 			maxID = i
