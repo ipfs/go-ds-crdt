@@ -16,6 +16,7 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	format "github.com/ipfs/go-ipld-format"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func setupTestEnv(t *testing.T) (*Datastore, Peer, blockstore.Blockstore, format.DAGService, func()) {
@@ -192,6 +193,54 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	require.ErrorIs(t, err, ds.ErrNotFound)
 
 	closeReplicas()
+}
+
+func TestCompactionWithMultipleHeads(t *testing.T) {
+	ctx := context.Background()
+	store, _, _, dagService, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	var eg errgroup.Group
+
+	// Run multiple concurrent Put's. This should trigger the creation of multiple heads.
+	for i := 1; i < 10; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := []byte(fmt.Sprintf("value-%d", i))
+		eg.Go(func() error {
+			err := store.Put(ctx, ds.NewKey(key), value)
+			if err != nil {
+				return fmt.Errorf("put error: %w", err)
+			}
+			return nil
+		})
+	}
+
+	eg.Wait()
+
+	m, ok := store.InternalStats().State.Members[store.h.ID().String()]
+	require.True(t, ok, "our peerid should exist in the state")
+	lastHead := m.DagHeads[len(m.DagHeads)-1]
+	_, headCID, err := cid.CidFromBytes(lastHead.Cid)
+	require.NoError(t, err, "failed to parse CID")
+
+	// Create snapshot
+
+	// TODO (fix me): We currently don't have a way to create a snapshot from multiple heads.
+	// As a placeholder, we are creating the snapshot only for the last head CID in our heads list.
+
+	snapshotCid, err := store.CompactAndTruncate(ctx, headCID, cid.Cid{})
+	require.NoError(t, err, "compaction and truncation failed")
+
+	snapshotContents := ExtractSnapshot(ctx, dagService, snapshotCid)
+
+	// Assert that all keys are present in snapshot
+
+	for i := 1; i < 10; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := []byte(fmt.Sprintf("value-%d", i))
+		require.Contains(t, snapshotContents, key)
+		require.Equal(t, value, snapshotContents[key])
+	}
 }
 
 func ExtractSnapshot(ctx context.Context, dagService format.DAGService, rootCID cid.Cid) map[string]string {
