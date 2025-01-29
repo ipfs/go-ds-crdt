@@ -217,6 +217,17 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 
 	eg.Wait()
 
+	heads := store.InternalStats().Heads
+
+	if len(heads) < 2 {
+		t.Fatal("Test wasn't able to create multiple concurrent heads")
+	}
+
+	key := fmt.Sprintf("key-%d", 11)
+	value := []byte(fmt.Sprintf("value-%d", 11))
+	err := store.Put(ctx, ds.NewKey(key), value)
+	require.NoError(t, err, "failed to put a good compaction point")
+
 	m, ok := store.InternalStats().State.Members[store.h.ID().String()]
 	require.True(t, ok, "our peerid should exist in the state")
 	lastHead := m.DagHeads[len(m.DagHeads)-1]
@@ -236,8 +247,8 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 	// Assert that all keys are present in snapshot
 
 	for i := 1; i < 10; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		value := []byte(fmt.Sprintf("value-%d", i))
+		key := fmt.Sprintf("/key-%d", i)
+		value := fmt.Sprintf("value-%d", i)
 		require.Contains(t, snapshotContents, key)
 		require.Equal(t, value, snapshotContents[key])
 	}
