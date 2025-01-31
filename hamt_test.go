@@ -14,7 +14,9 @@ import (
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
+	"github.com/ipfs/go-ds-crdt/pb"
 	format "github.com/ipfs/go-ipld-format"
+	ipld "github.com/ipfs/go-ipld-format"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -135,6 +137,7 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	br1.dropProb.Store(101)
 
 	k := ds.NewKey("k1")
+	k2 := ds.NewKey("k2")
 
 	// Put key in replica 0
 	err := replicas[0].Put(ctx, k, []byte("v1"))
@@ -152,6 +155,12 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	_, headCID, err := cid.CidFromBytes(lastHead.Cid)
 	require.NoError(t, err, "failed to parse CID")
 
+	// one more so the dag doesn't become empty
+	err = replicas[0].Put(ctx, k2, []byte("v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// Create snapshot
 	snapshotCid, err := replicas[0].CompactAndTruncate(ctx, headCID, cid.Cid{})
 	require.NoError(t, err, "compaction and truncation failed")
@@ -161,28 +170,42 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	require.ErrorIs(t, err, ds.ErrNotFound)
 
 	// Restore snapshot into replica 1
-	replicas[1].restoreSnapshot(replicas[1].dagService, snapshotCid, headCID, 2)
+	require.NoError(t, replicas[1].restoreSnapshot(replicas[1].dagService, snapshotCid, headCID, 2))
 
 	// Key now exists in replica 1
 	val, err := replicas[1].Get(ctx, k)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v2"), val)
 
+	/* this scenario isn't quite valid
+	   we would not allow the database operations before we have sync'd
 	// Delete key from replica 1
 	err = replicas[1].Delete(ctx, k)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	// At this point, before allowing the replicas to sync, the key should not be found in replica 1
 	_, err = replicas[1].Get(ctx, k)
 	require.ErrorIs(t, err, ds.ErrNotFound)
+
+	*/
+
+	fmt.Println("r0 dag:")
+	replicas[0].PrintDAG()
+	fmt.Println("r1 dag:")
+	replicas[1].PrintDAG()
 
 	// Allow replicas to sync
 	br0.dropProb.Store(0)
 	br1.dropProb.Store(0)
 
 	time.Sleep(10 * time.Second)
+
+	// now delete the key from replica 1
+	err = replicas[1].Delete(ctx, k)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// The key should not be found in any replica
 
@@ -290,4 +313,123 @@ func ExtractShardData(ctx context.Context, shard *hamt.Shard, getter format.Node
 		return nil
 	})
 	return result, err
+}
+
+func TestSnapShotRestore(t *testing.T) {
+	ctx := context.Background()
+	replicas, closeReplicas := makeNReplicas(t, 2, nil)
+	defer closeReplicas()
+
+	k1 := ds.NewKey("k1")
+	k2 := ds.NewKey("k2")
+
+	err := replicas[0].Put(ctx, k1, []byte("v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(15 * time.Second)
+
+	m, ok := replicas[0].InternalStats().State.Members[replicas[0].h.ID().String()]
+	if !ok {
+		t.Fatal("our peerid should exist in the state")
+	}
+	if len(m.DagHeads) < 1 {
+		t.Fatal("dag heads should contain the only head")
+	}
+	lastHead := m.DagHeads[len(m.DagHeads)-1]
+	_, headCID, err := cid.CidFromBytes(lastHead.Cid)
+	require.NoError(t, err, "failed to parse CID")
+
+	snapshotCid, err := replicas[0].CompactAndTruncate(ctx, headCID, cid.Cid{})
+	require.NoError(t, err)
+
+	// set the snapshot state
+	require.NoError(t, replicas[0].state.SetSnapshot(ctx, snapshotCid, headCID, 2))
+	// let everybody know
+	require.NoError(t, replicas[0].broadcast(ctx))
+
+	time.Sleep(5 * time.Minute)
+
+	// add two new op's ( update k1 and add k2 )
+	err = replicas[0].Put(ctx, k1, []byte("v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = replicas[0].Put(ctx, k2, []byte("v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(5 * time.Second)
+
+	for _, r := range replicas {
+		v, err := r.Get(ctx, k1)
+		if err != nil {
+			t.Error(err)
+		}
+		require.Equal(t, "v2", string(v))
+	}
+}
+
+func TestTriggerSnapshot(t *testing.T) {
+	ctx := context.Background()
+	o := DefaultOptions()
+	o.CompactDagSize = 50
+	o.CompactRetainNodes = 10
+	o.CompactInterval = 5 * time.Second
+
+	replicas, closeReplicas := makeNReplicas(t, 1, o)
+	defer closeReplicas()
+
+	// add 100 keys
+	for i := 1; i < 101; i++ {
+		k := ds.NewKey(fmt.Sprintf("k%d", i))
+		err := replicas[0].Put(ctx, k, []byte("v1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// update 50%
+	for i := 50; i < 101; i++ {
+		k := ds.NewKey(fmt.Sprintf("k%d", i))
+		err := replicas[0].Put(ctx, k, []byte("v2"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	time.Sleep(15 * time.Second)
+
+	s := replicas[0].InternalStats()
+
+	require.True(t, s.State.Snapshot != nil, "snapshot should have been triggered")
+
+	// TODO get the length of the DAG is should be == 	o.CompactRetainNodes = 10
+
+	var maxDepth uint64
+
+	// ignore the error the dag is truncated its expected
+	_ = replicas[0].WalkDAG(s.Heads, func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error {
+		maxDepth++
+		return nil
+	})
+
+	require.Equal(t, maxDepth, o.CompactRetainNodes)
+
+	// inspect the snapshot ensuring it has the correct values
+	d := replicas[0].InternalStats().State.Snapshot.SnapshotKey.Cid
+
+	r := ExtractSnapshot(ctx, replicas[0].dagService, cid.MustParse(d))
+	for i := 1; i < 101; i++ {
+		k := fmt.Sprintf("/k%d", i)
+		if i < 50 || i > 90 {
+			require.Equal(t, "v1", r[k], fmt.Sprintf("key %s has incorrect value", k))
+		} else {
+			require.Equal(t, "v2", r[k], fmt.Sprintf("key %s has incorrect value", k))
+		}
+	}
+
 }
