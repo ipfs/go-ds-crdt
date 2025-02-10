@@ -73,6 +73,7 @@ func (m *StateManager) Save(ctx context.Context) error {
 func (m *StateManager) GetState() *pb.StateBroadcast {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	return proto.Clone(m.state).(*pb.StateBroadcast)
 }
 

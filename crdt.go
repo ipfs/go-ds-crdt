@@ -641,16 +641,19 @@ func (store *Datastore) rebroadcastHeads() {
 		}
 	}
 	store.seenHeadsMux.RUnlock()
+	store.logger.Debugf("rebroadcastHeads %d", len(headsToBroadcast))
 
-	err = store.state.UpdateHeads(store.ctx, store.h.ID(), headsToBroadcast, true)
-	if err != nil {
-		store.logger.Warn("broadcast failed: %v", err)
-	}
+	if len(headsToBroadcast) > 0 {
+		err = store.state.UpdateHeads(store.ctx, store.h.ID(), headsToBroadcast, true)
+		if err != nil {
+			store.logger.Warn("broadcast failed: %v", err)
+		}
 
-	// Send them out
-	err = store.broadcast(store.ctx)
-	if err != nil {
-		store.logger.Warn("broadcast failed: %v", err)
+		// Send them out
+		err = store.broadcast(store.ctx)
+		if err != nil {
+			store.logger.Warn("broadcast failed: %v", err)
+		}
 	}
 
 	// Reset the map

@@ -3,7 +3,6 @@ package crdt
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"testing"
 	"time"
@@ -84,7 +83,7 @@ func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 	}
 
 	// Verify the snapshot in the HAMT
-	r := ExtractSnapshot(ctx, dagService, snapshotCID)
+	r := ExtractSnapshot(t, ctx, dagService, snapshotCID)
 	for i := 1; i <= maxID; i++ {
 		k := fmt.Sprintf("/key-%d", i)
 		v := fmt.Sprintf("value-%d", i)
@@ -265,7 +264,7 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 	snapshotCid, err := store.CompactAndTruncate(ctx, headCID, cid.Cid{})
 	require.NoError(t, err, "compaction and truncation failed")
 
-	snapshotContents := ExtractSnapshot(ctx, dagService, snapshotCid)
+	snapshotContents := ExtractSnapshot(t, ctx, dagService, snapshotCid)
 
 	// Assert that all keys are present in snapshot
 
@@ -277,15 +276,15 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 	}
 }
 
-func ExtractSnapshot(ctx context.Context, dagService format.DAGService, rootCID cid.Cid) map[string]string {
+func ExtractSnapshot(t *testing.T, ctx context.Context, dagService format.DAGService, rootCID cid.Cid) map[string]string {
 	hamNode, err := dagService.Get(ctx, rootCID)
 	if err != nil {
-		log.Fatalf("failed to get HAMT node: %v", err)
+		t.Fatalf("failed to get HAMT node: %v", err)
 	}
 
 	hamShard, err := hamt.NewHamtFromDag(dagService, hamNode)
 	if err != nil {
-		log.Fatalf("failed to load HAMT shard: %v", err)
+		t.Fatalf("failed to load HAMT shard: %v", err)
 	}
 
 	r, _ := ExtractShardData(ctx, hamShard, dagService)
@@ -330,7 +329,8 @@ func TestSnapShotRestore(t *testing.T) {
 
 	time.Sleep(15 * time.Second)
 
-	m, ok := replicas[0].InternalStats().State.Members[replicas[0].h.ID().String()]
+	s := replicas[0].InternalStats().State
+	m, ok := s.Members[replicas[0].h.ID().String()]
 	if !ok {
 		t.Fatal("our peerid should exist in the state")
 	}
@@ -349,7 +349,7 @@ func TestSnapShotRestore(t *testing.T) {
 	// let everybody know
 	require.NoError(t, replicas[0].broadcast(ctx))
 
-	time.Sleep(5 * time.Minute)
+	time.Sleep(15 * time.Second)
 
 	// add two new op's ( update k1 and add k2 )
 	err = replicas[0].Put(ctx, k1, []byte("v2"))
@@ -422,7 +422,7 @@ func TestTriggerSnapshot(t *testing.T) {
 	// inspect the snapshot ensuring it has the correct values
 	d := replicas[0].InternalStats().State.Snapshot.SnapshotKey.Cid
 
-	r := ExtractSnapshot(ctx, replicas[0].dagService, cid.MustParse(d))
+	r := ExtractSnapshot(t, ctx, replicas[0].dagService, cid.MustParse(d))
 	for i := 1; i < 101; i++ {
 		k := fmt.Sprintf("/k%d", i)
 		if i < 50 || i > 90 {
