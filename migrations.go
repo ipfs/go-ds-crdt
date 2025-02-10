@@ -140,7 +140,10 @@ func (store *Datastore) migrate0to1(ctx context.Context) error {
 			wStore.Delete(ctx, valueK)
 			wStore.Delete(ctx, s.priorityKey(key))
 		} else {
-			wStore.Put(ctx, valueK, v)
+			candidateEncoded := encodeValue(p, v)
+			if err := wStore.Put(ctx, valueK, candidateEncoded); err != nil {
+				return err
+			}
 			s.setPriority(ctx, wStore, key, p)
 		}
 		total++

@@ -29,7 +29,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-var numReplicas = 15
+var numReplicas = 2
 var debug = false
 
 const (
