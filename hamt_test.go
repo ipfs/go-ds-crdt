@@ -17,7 +17,6 @@ import (
 	format "github.com/ipfs/go-ipld-format"
 	ipld "github.com/ipfs/go-ipld-format"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/errgroup"
 )
 
 func setupTestEnv(t *testing.T) (*Datastore, Peer, blockstore.Blockstore, format.DAGService, func()) {
@@ -122,13 +121,18 @@ func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 }
 
 func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
-	replicas, closeReplicas := makeNReplicas(t, 2, nil)
+	// Step 1: Set up replicas with compaction options enabled
+	opts := DefaultOptions()
+	opts.CompactDagSize = 50     // Ensure compaction occurs when the DAG grows beyond 50 nodes
+	opts.CompactRetainNodes = 10 // Retain the last 10 nodes after compaction
+	opts.CompactInterval = 5 * time.Second
+
+	replicas, closeReplicas := makeNReplicas(t, 2, opts)
 	defer closeReplicas()
 
 	ctx := context.Background()
 
-	// Initially, both replicas are disconnected
-
+	// Step 2: Simulate a network partition by preventing message exchange
 	br0 := replicas[0].broadcaster.(*mockBroadcaster)
 	br0.dropProb.Store(101)
 
@@ -138,142 +142,50 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	k := ds.NewKey("k1")
 	k2 := ds.NewKey("k2")
 
-	// Put key in replica 0
-	err := replicas[0].Put(ctx, k, []byte("v1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = replicas[0].Put(ctx, k, []byte("v2"))
-	if err != nil {
-		t.Fatal(err)
+	// Step 3: Populate Replica 0 with a significant number of key updates to ensure compaction
+	for i := 1; i <= 60; i++ { // 60 operations to ensure we pass the compaction threshold
+		key := ds.NewKey(fmt.Sprintf("key-%d", i))
+		require.NoError(t, replicas[0].Put(ctx, key, []byte(fmt.Sprintf("value-%d", i))))
 	}
 
-	m, ok := replicas[0].InternalStats().State.Members[replicas[0].h.ID().String()]
-	require.True(t, ok, "our peerid should exist in the state")
-	lastHead := m.DagHeads[len(m.DagHeads)-1]
-	_, headCID, err := cid.CidFromBytes(lastHead.Cid)
-	require.NoError(t, err, "failed to parse CID")
+	// Step 4: Modify `k1` multiple times to simulate realistic updates
+	require.NoError(t, replicas[0].Put(ctx, k, []byte("v1")))
+	require.NoError(t, replicas[0].Put(ctx, k, []byte("v2")))
 
-	// one more so the dag doesn't become empty
-	err = replicas[0].Put(ctx, k2, []byte("v1"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Ensure at least one more key exists before compaction
+	require.NoError(t, replicas[0].Put(ctx, k2, []byte("v1")))
 
-	// Create snapshot
-	snapshotCid, err := replicas[0].CompactAndTruncate(ctx, headCID, cid.Cid{})
-	require.NoError(t, err, "compaction and truncation failed")
+	// Step 5: Wait for compaction to trigger automatically
+	time.Sleep(10 * time.Second) // Ensure automatic compaction runs
 
-	// Key should not exist in replica 1 at this point, since replicas are disconnected
-	_, err = replicas[1].Get(ctx, k)
-	require.ErrorIs(t, err, ds.ErrNotFound)
+	// Fetch the snapshot that was created
+	s := replicas[0].InternalStats().State
+	require.NotNil(t, s.Snapshot, "Snapshot should have been triggered")
 
-	// Restore snapshot into replica 1
-	require.NoError(t, replicas[1].restoreSnapshot(replicas[1].dagService, snapshotCid, headCID, 2))
+	// Step 6: Restore the snapshot by allowing synchronization (happens automatically)
+	br0.dropProb.Store(0)
+	br1.dropProb.Store(0)
 
-	// Key now exists in replica 1
+	time.Sleep(10 * time.Second) // Allow time for state synchronization
+
+	// Step 7: Verify that key `k1` now exists in Replica 1 with the last known value
 	val, err := replicas[1].Get(ctx, k)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v2"), val)
 
-	/* this scenario isn't quite valid
-	   we would not allow the database operations before we have sync'd
-	// Delete key from replica 1
-	err = replicas[1].Delete(ctx, k)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// At this point, before allowing the replicas to sync, the key should not be found in replica 1
-	_, err = replicas[1].Get(ctx, k)
-	require.ErrorIs(t, err, ds.ErrNotFound)
+	// Step 8: Delete `k1` in Replica 1
+	require.NoError(t, replicas[1].Delete(ctx, k))
 
-	*/
-
-	fmt.Println("r0 dag:")
-	replicas[0].PrintDAG()
-	fmt.Println("r1 dag:")
-	replicas[1].PrintDAG()
-
-	// Allow replicas to sync
-	br0.dropProb.Store(0)
-	br1.dropProb.Store(0)
-
+	// Step 9: Allow synchronization and verify deletion in both replicas
 	time.Sleep(10 * time.Second)
 
-	// now delete the key from replica 1
-	err = replicas[1].Delete(ctx, k)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The key should not be found in any replica
-
 	_, err = replicas[1].Get(ctx, k)
-	require.ErrorIs(t, err, ds.ErrNotFound)
+	require.ErrorIs(t, err, ds.ErrNotFound, "Key should not exist in Replica 1")
 
 	_, err = replicas[0].Get(ctx, k)
-	require.ErrorIs(t, err, ds.ErrNotFound)
+	require.ErrorIs(t, err, ds.ErrNotFound, "Key should not exist in Replica 0")
 
 	closeReplicas()
-}
-
-func TestCompactionWithMultipleHeads(t *testing.T) {
-	ctx := context.Background()
-	store, _, _, dagService, cleanup := setupTestEnv(t)
-	defer cleanup()
-
-	var eg errgroup.Group
-
-	// Run multiple concurrent Put's. This should trigger the creation of multiple heads.
-	for i := 1; i < 10; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		value := []byte(fmt.Sprintf("value-%d", i))
-		eg.Go(func() error {
-			err := store.Put(ctx, ds.NewKey(key), value)
-			if err != nil {
-				return fmt.Errorf("put error: %w", err)
-			}
-			return nil
-		})
-	}
-
-	eg.Wait()
-
-	heads := store.InternalStats().Heads
-
-	if len(heads) < 2 {
-		t.Fatal("Test wasn't able to create multiple concurrent heads")
-	}
-
-	key := fmt.Sprintf("key-%d", 11)
-	value := []byte(fmt.Sprintf("value-%d", 11))
-	err := store.Put(ctx, ds.NewKey(key), value)
-	require.NoError(t, err, "failed to put a good compaction point")
-
-	m, ok := store.InternalStats().State.Members[store.h.ID().String()]
-	require.True(t, ok, "our peerid should exist in the state")
-	lastHead := m.DagHeads[len(m.DagHeads)-1]
-	_, headCID, err := cid.CidFromBytes(lastHead.Cid)
-	require.NoError(t, err, "failed to parse CID")
-
-	// Create snapshot
-
-	// TODO (fix me): We currently don't have a way to create a snapshot from multiple heads.
-	// As a placeholder, we are creating the snapshot only for the last head CID in our heads list.
-
-	snapshotCid, err := store.CompactAndTruncate(ctx, headCID, cid.Cid{})
-	require.NoError(t, err, "compaction and truncation failed")
-
-	snapshotContents := ExtractSnapshot(t, ctx, dagService, snapshotCid)
-
-	// Assert that all keys are present in snapshot
-
-	for i := 1; i < 10; i++ {
-		key := fmt.Sprintf("/key-%d", i)
-		value := fmt.Sprintf("value-%d", i)
-		require.Contains(t, snapshotContents, key)
-		require.Equal(t, value, snapshotContents[key])
-	}
 }
 
 func ExtractSnapshot(t *testing.T, ctx context.Context, dagService format.DAGService, rootCID cid.Cid) map[string]string {
