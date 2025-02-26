@@ -201,6 +201,8 @@ type Datastore struct {
 	seenHeadsMux sync.RWMutex
 	seenHeads    map[cid.Cid]struct{}
 
+	compactMux sync.Mutex
+
 	curDeltaMux sync.Mutex
 	curDelta    *pb.Delta // current, unpublished delta
 
@@ -442,11 +444,15 @@ func (store *Datastore) handleNext() {
 				store.logger.Errorf("failed to parse state snapshot cid: %v", err)
 				continue
 			}
+			store.compactMux.Lock()
 			newSS, err := store.CompactAndTruncate(store.ctx, start, end)
 			if err != nil {
 				store.logger.Errorf("failed to compact the dag: %v", err)
+				store.compactMux.Unlock()
 				continue
 			}
+			store.compactMux.Unlock()
+
 			store.oldProcessedCID = state.Snapshot.DagHead.Cid
 			err = store.state.SetSnapshot(store.ctx, newSS, start, broadcast.Snapshot.Height)
 			if err != nil {
@@ -1745,6 +1751,10 @@ func (store *Datastore) TriggerCompactionIfNeeded() error {
 		return err
 	}
 
+	if height == 0 {
+		return nil
+	}
+
 	state := store.state.GetState()
 	snapshotHeight := uint64(0)
 	if state.Snapshot != nil {
@@ -1758,6 +1768,8 @@ func (store *Datastore) TriggerCompactionIfNeeded() error {
 		return nil
 	}
 
+	store.compactMux.Lock()
+	defer store.compactMux.Unlock()
 	// Extract DAG content and walk back CompactRetainNodes steps to determine the target CID
 	startCID, height, err := store.walkBackDAG(commonCid, store.opts.CompactRetainNodes)
 	if err != nil {
