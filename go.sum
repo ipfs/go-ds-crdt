@@ -97,10 +97,10 @@ github.com/ipfs/go-block-format v0.2.0 h1:ZqrkxBA2ICbDRbK8KJs/u0O3dlp6gmAuuXUJNi
 github.com/ipfs/go-block-format v0.2.0/go.mod h1:+jpL11nFx5A/SPpsoBn6Bzkra/zaArfSmsknbPMYgzM=
 github.com/ipfs/go-cid v0.4.1 h1:A/T3qGvxi4kpKWWcPC/PgbvDA2bjVLO7n4UeVwnbs/s=
 github.com/ipfs/go-cid v0.4.1/go.mod h1:uQHwDeX4c6CtyrFwdqyhpNcxVewur1M7l7fNU7LKwZk=
-github.com/ipfs/go-datastore v0.7.1-0.20250225204649-1676d105e588 h1:pbgZzzDE6/Q7E0vhdbfMpyCW24jOLXkq5HtrCBuruJQ=
-github.com/ipfs/go-datastore v0.7.1-0.20250225204649-1676d105e588/go.mod h1:BGN3N+sLTEWQUHMtOjmm2GKccMJnVFPgSLp6kshNqRk=
-github.com/ipfs/go-ds-badger v0.3.2-0.20250225205222-d5469f81d4d9 h1:99Kzqek1Lg8XpfxgMIKz30cZU/MYlBnK3xomoayvlE8=
-github.com/ipfs/go-ds-badger v0.3.2-0.20250225205222-d5469f81d4d9/go.mod h1:32kVKvRGDk2Us+flVS59qVeYk17Bwu5uTHyl4uwZqd0=
+github.com/ipfs/go-datastore v0.7.1-0.20250226000051-0dbca94435fd h1:FKcZjv1qAZGaBpKDP4Mryct1cH/v81ML+Snp+/zosNQ=
+github.com/ipfs/go-datastore v0.7.1-0.20250226000051-0dbca94435fd/go.mod h1:BGN3N+sLTEWQUHMtOjmm2GKccMJnVFPgSLp6kshNqRk=
+github.com/ipfs/go-ds-badger v0.3.2-0.20250226001010-9c7a3c9bf2d9 h1:WPGO0X5bkMKjJw01eVich2kLkEuu4zBa3QuKNcjFCFM=
+github.com/ipfs/go-ds-badger v0.3.2-0.20250226001010-9c7a3c9bf2d9/go.mod h1:Xt36c3LbR6wsXiVjE/AUxruev3MGRXJ3L1XZGw/UKxo=
 github.com/ipfs/go-ipfs-delay v0.0.1 h1:r/UXYyRcddO6thwOnhiznIAiSvxMECGgtv35Xs1IeRQ=
 github.com/ipfs/go-ipfs-delay v0.0.1/go.mod h1:8SP1YXK1M1kXuc4KJZINY3TQQ03J2rwBG9QfXmbRPrw=
 github.com/ipfs/go-ipfs-pq v0.0.3 h1:YpoHVJB+jzK15mr/xsWC574tyDLkezVrDNeaalQBsTE=
