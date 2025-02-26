@@ -97,8 +97,6 @@ github.com/ipfs/go-block-format v0.2.0 h1:ZqrkxBA2ICbDRbK8KJs/u0O3dlp6gmAuuXUJNi
 github.com/ipfs/go-block-format v0.2.0/go.mod h1:+jpL11nFx5A/SPpsoBn6Bzkra/zaArfSmsknbPMYgzM=
 github.com/ipfs/go-cid v0.4.1 h1:A/T3qGvxi4kpKWWcPC/PgbvDA2bjVLO7n4UeVwnbs/s=
 github.com/ipfs/go-cid v0.4.1/go.mod h1:uQHwDeX4c6CtyrFwdqyhpNcxVewur1M7l7fNU7LKwZk=
-github.com/ipfs/go-datastore v0.7.1-0.20250226000051-0dbca94435fd h1:FKcZjv1qAZGaBpKDP4Mryct1cH/v81ML+Snp+/zosNQ=
-github.com/ipfs/go-datastore v0.7.1-0.20250226000051-0dbca94435fd/go.mod h1:BGN3N+sLTEWQUHMtOjmm2GKccMJnVFPgSLp6kshNqRk=
 github.com/ipfs/go-datastore v0.8.0 h1:n8xKnoSTo/28L5KM+Jfz4kfohD889/afdWcDHve9VuY=
 github.com/ipfs/go-datastore v0.8.0/go.mod h1:BGN3N+sLTEWQUHMtOjmm2GKccMJnVFPgSLp6kshNqRk=
 github.com/ipfs/go-ds-badger v0.3.2-0.20250226001010-9c7a3c9bf2d9 h1:WPGO0X5bkMKjJw01eVich2kLkEuu4zBa3QuKNcjFCFM=
