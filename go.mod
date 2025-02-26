@@ -1,8 +1,6 @@
 module github.com/ipfs/go-ds-crdt
 
-go 1.23
-
-toolchain go1.23.2
+go 1.23.0
 
 require (
 	github.com/dgraph-io/badger v1.6.2
