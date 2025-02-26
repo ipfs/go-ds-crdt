@@ -445,7 +445,7 @@ func (store *Datastore) handleNext() {
 				continue
 			}
 			store.compactMux.Lock()
-			newSS, err := store.CompactAndTruncate(store.ctx, start, end)
+			newSS, err := store.compactAndTruncate(store.ctx, start, end)
 			if err != nil {
 				store.logger.Errorf("failed to compact the dag: %v", err)
 				store.compactMux.Unlock()
@@ -1733,7 +1733,7 @@ func (store *Datastore) compact() {
 			}
 			return
 		case <-timer.C:
-			err := store.TriggerCompactionIfNeeded()
+			err := store.triggerCompactionIfNeeded()
 			if err != nil {
 				//todo
 			}
@@ -1743,8 +1743,8 @@ func (store *Datastore) compact() {
 
 }
 
-// DatastoreCompaction handles compaction logic directly within the datastore
-func (store *Datastore) TriggerCompactionIfNeeded() error {
+// triggerCompactionIfNeeded handles compaction logic directly within the datastore
+func (store *Datastore) triggerCompactionIfNeeded() error {
 	// Ensure all members agree on the DAG head before compacting
 	commonCid, height, err := store.getHighestCommonCid()
 	if err != nil {
@@ -1786,7 +1786,7 @@ func (store *Datastore) TriggerCompactionIfNeeded() error {
 	}
 
 	// Run compaction from start CID
-	compactCID, err := store.CompactAndTruncate(store.ctx, startCID, lastSnapshotCid)
+	compactCID, err := store.compactAndTruncate(store.ctx, startCID, lastSnapshotCid)
 	if err != nil {
 		return fmt.Errorf("error during DAG compaction: %w", err)
 	}
@@ -1801,7 +1801,7 @@ func (store *Datastore) TriggerCompactionIfNeeded() error {
 
 // getHighestCommonCid gets the highest common cid of all members
 func (store *Datastore) getHighestCommonCid() (cid.Cid, uint64, error) {
-	heads := store.GetAllMemberCommonHeads()
+	heads := store.getAllMemberCommonHeads()
 	var (
 		c cid.Cid
 		h uint64
@@ -1822,8 +1822,8 @@ func (store *Datastore) getHighestCommonCid() (cid.Cid, uint64, error) {
 	return c, h, nil
 }
 
-// GetAllMemberCommonHeads retrieves the DAG heads from all peers
-func (store *Datastore) GetAllMemberCommonHeads() []cid.Cid {
+// getAllMemberCommonHeads retrieves the DAG heads from all peers
+func (store *Datastore) getAllMemberCommonHeads() []cid.Cid {
 	var cids []cid.Cid
 	cidCount := map[cid.Cid]int{}
 	var members int

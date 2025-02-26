@@ -71,7 +71,7 @@ func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 			require.NoError(t, err, "failed to parse CID")
 
 			// Perform compaction and truncation in one step
-			snapshotCID, err = store.CompactAndTruncate(ctx, headCID, lastCompactedCid)
+			snapshotCID, err = store.compactAndTruncate(ctx, headCID, lastCompactedCid)
 			require.NoError(t, err, "compaction and truncation failed")
 
 			maxID = i
