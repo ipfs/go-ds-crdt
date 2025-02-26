@@ -6,7 +6,7 @@ require (
 	github.com/dgraph-io/badger v1.6.2
 	github.com/ipfs/boxo v0.24.3
 	github.com/ipfs/go-cid v0.4.1
-	github.com/ipfs/go-datastore v0.7.1-0.20250226000051-0dbca94435fd
+	github.com/ipfs/go-datastore v0.8.0
 	github.com/ipfs/go-ds-badger v0.3.2-0.20250226001010-9c7a3c9bf2d9
 	github.com/ipfs/go-ipld-format v0.6.0
 	github.com/ipfs/go-log/v2 v2.5.1
