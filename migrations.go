@@ -3,12 +3,12 @@ package crdt
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
-	"github.com/pkg/errors"
 )
 
 // Use this to detect if we need to run migrations.

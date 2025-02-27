@@ -19,6 +19,7 @@ package crdt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -36,7 +37,6 @@ import (
 	query "github.com/ipfs/go-datastore/query"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
-	"github.com/pkg/errors"
 )
 
 var _ ds.Datastore = (*Datastore)(nil)
@@ -262,12 +262,12 @@ func New(
 	set, err := newCRDTSet(ctx, store, fullSetNs, dagSyncer, opts.Logger, setPutHook, setDeleteHook)
 	if err != nil {
 		cancel()
-		return nil, errors.Wrap(err, "error setting up crdt set")
+		return nil, fmt.Errorf("error setting up crdt set: %w", err)
 	}
 	heads, err := newHeads(ctx, store, fullHeadsNs, opts.Logger)
 	if err != nil {
 		cancel()
-		return nil, errors.Wrap(err, "error building heads")
+		return nil, fmt.Errorf("error building heads: %w", err)
 	}
 
 	dstore := &Datastore{
@@ -587,7 +587,7 @@ func (store *Datastore) handleBlock(ctx context.Context, c cid.Cid) error {
 	// head.
 	isProcessed, err := store.isProcessed(ctx, c)
 	if err != nil {
-		return errors.Wrapf(err, "error checking for known block %s", c)
+		return fmt.Errorf("error checking for known block %s: %w", c, err)
 	}
 	if isProcessed {
 		store.logger.Debugf("%s is known. Skip walking tree", c)
@@ -669,7 +669,7 @@ func (store *Datastore) sendNewJobs(ctx context.Context, session *sync.WaitGroup
 	if rootPrio == 0 {
 		prio, err := ng.GetPriority(cctx, children[0])
 		if err != nil {
-			return errors.Wrapf(err, "error getting root delta priority")
+			return fmt.Errorf("error getting root delta priority: %w", err)
 		}
 		rootPrio = prio
 	}
@@ -681,7 +681,7 @@ loop:
 	for deltaOpt := range ng.GetDeltas(cctx, children) {
 		// we abort whenever we a delta comes back in error.
 		if deltaOpt.err != nil {
-			err = errors.Wrapf(deltaOpt.err, "error getting delta")
+			err = fmt.Errorf("error getting delta: %w", deltaOpt.err)
 			break
 		}
 		goodDeltas[deltaOpt.node.Cid()] = struct{}{}
@@ -792,14 +792,14 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 	blockKey := dshelp.MultihashToDsKey(current.Hash()).String()
 	err := store.set.Merge(ctx, delta, blockKey)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error merging delta from %s", current)
+		return nil, fmt.Errorf("error merging delta from %s: %w", current, err)
 	}
 
 	// Record that we have processed the node so that any other worker
 	// can skip it.
 	err = store.markProcessed(ctx, current)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error recording %s as processed", current)
+		return nil, fmt.Errorf("error recording %s as processed: %w", current, err)
 	}
 
 	// Remove from the set that has the children which are queued for
@@ -820,7 +820,7 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 	if len(links) == 0 {
 		err := store.heads.Add(ctx, root, rootPrio)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error adding head %s", root)
+			return nil, fmt.Errorf("error adding head %s: %w", root, err)
 		}
 	}
 
@@ -836,12 +836,12 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 
 		isHead, _, err := store.heads.IsHead(ctx, child)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error checking if %s is head", child)
+			return nil, fmt.Errorf("error checking if %s is head: %w", child, err)
 		}
 
 		isProcessed, err := store.isProcessed(ctx, child)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error checking for known block %s", child)
+			return nil, fmt.Errorf("error checking for known block %s: %w", child, err)
 		}
 
 		if isHead {
@@ -849,7 +849,7 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 			// the tip of this branch
 			err := store.heads.Replace(ctx, child, root, rootPrio)
 			if err != nil {
-				return nil, errors.Wrapf(err, "error replacing head: %s->%s", child, root)
+				return nil, fmt.Errorf("error replacing head: %s->%s: %w", child, root, err)
 			}
 			addedAsHead = true
 
@@ -876,7 +876,7 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 				if err != nil {
 					// Don't let this failure prevent us
 					// from processing the other links.
-					store.logger.Error(errors.Wrapf(err, "error adding head %s", root))
+					store.logger.Error(fmt.Errorf("error adding head %s: %w", root, err))
 				}
 			}
 			addedAsHead = true
@@ -904,7 +904,7 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 
 	heads, _, err := store.heads.List(ctx)
 	if err != nil {
-		return errors.Wrapf(err, "error listing heads")
+		return fmt.Errorf("error listing heads: %w", err)
 	}
 
 	type nodeHead struct {
@@ -967,13 +967,13 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 		n, delta, err := getter.GetDelta(cctx, cur)
 		if err != nil {
 			cancel()
-			return errors.Wrapf(err, "error getting node for reprocessing %s", cur)
+			return fmt.Errorf("error getting node for reprocessing %s: %w", cur, err)
 		}
 		cancel()
 
 		isProcessed, err := store.isProcessed(ctx, cur)
 		if err != nil {
-			return errors.Wrapf(err, "error checking for reprocessed block %s", cur)
+			return fmt.Errorf("error checking for reprocessed block %s: %w", cur, err)
 		}
 		if !isProcessed {
 			store.logger.Debugf("reprocessing %s / %d", cur, delta.Priority)
@@ -981,7 +981,7 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 			// do not add children to our queue.
 			err = store.handleBranch(ctx, head, cur)
 			if err != nil {
-				return errors.Wrapf(err, "error reprocessing block %s", cur)
+				return fmt.Errorf("error reprocessing block %s: %w", cur, err)
 			}
 		}
 		links := n.Links()
@@ -1212,14 +1212,14 @@ func (store *Datastore) putBlock(ctx context.Context, heads []cid.Cid, height ui
 	}
 	node, err := makeNode(delta, heads)
 	if err != nil {
-		return nil, errors.Wrap(err, "error creating new block")
+		return nil, fmt.Errorf("error creating new block: %w", err)
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, store.opts.DAGSyncerTimeout)
 	defer cancel()
 	err = store.dagService.Add(cctx, node)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error writing new block %s", node.Cid())
+		return nil, fmt.Errorf("error writing new block %s: %w", node.Cid(), err)
 	}
 
 	return node, nil
@@ -1240,7 +1240,7 @@ func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 func (store *Datastore) addDAGNode(ctx context.Context, delta *pb.Delta) (cid.Cid, error) {
 	heads, height, err := store.heads.List(ctx)
 	if err != nil {
-		return cid.Undef, errors.Wrap(err, "error listing heads")
+		return cid.Undef, fmt.Errorf("error listing heads: %w", err)
 	}
 	height = height + 1 // This implies our minimum height is 1
 
@@ -1270,7 +1270,7 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta *pb.Delta) (cid.Ci
 	)
 	if err != nil {
 		store.MarkDirty(ctx) // not sure if this will fix much if this happens.
-		return cid.Undef, errors.Wrap(err, "error processing new block")
+		return cid.Undef, fmt.Errorf("error processing new block: %w", err)
 	}
 	if len(children) != 0 {
 		store.logger.Warnf("bug: created a block to unknown children")
@@ -1303,7 +1303,7 @@ func (store *Datastore) broadcast(ctx context.Context, cids []cid.Cid) error {
 
 	err = store.broadcaster.Broadcast(ctx, bcastBytes)
 	if err != nil {
-		return errors.Wrapf(err, "error broadcasting %s", cids)
+		return fmt.Errorf("error broadcasting %s: %w", cids, err)
 	}
 	return nil
 }
