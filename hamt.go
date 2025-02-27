@@ -10,7 +10,7 @@ import (
 	"github.com/ipfs/boxo/exchange/offline"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
-	cid "github.com/ipfs/go-cid"
+	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 )
@@ -41,7 +41,7 @@ func valueToNode(ctx context.Context, dagService ipld.DAGService, value []byte) 
 	return node, nil
 }
 
-func (store *Datastore) CompactAndTruncate(ctx context.Context, startCID, endCID cid.Cid) (cid.Cid, error) {
+func (store *Datastore) compactAndTruncate(ctx context.Context, startCID, endCID cid.Cid) (cid.Cid, error) {
 	// Step 1: Set up a DAG service with offline exchange
 	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
 	ng := &crdtNodeGetter{NodeGetter: offlineDAG}
