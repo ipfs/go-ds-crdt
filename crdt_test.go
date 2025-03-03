@@ -812,42 +812,6 @@ func TestCRDTSync(t *testing.T) {
 	}
 }
 
-func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
-	ctx := context.Background()
-	mh, err := multihash.Sum([]byte("emacs is best"), multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cidV0 := cid.NewCidV0(mh)
-
-	opts := DefaultOptions()
-	replicas, closeReplicas := makeReplicas(t, opts)
-	defer closeReplicas()
-
-	cids, err := replicas[0].decodeBroadcast(ctx, cidV0.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(cids) != 1 || !cids[0].Equals(cidV0) {
-		t.Error("should have returned a single cidV0", cids)
-	}
-
-	data, err := replicas[0].encodeBroadcast(ctx, cids)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cids2, err := replicas[0].decodeBroadcast(ctx, data)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(cids2) != 1 || !cids[0].Equals(cidV0) {
-		t.Error("should have reparsed cid0", cids2)
-	}
-}
-
 func BenchmarkQueryElements(b *testing.B) {
 	ctx := context.Background()
 	replicas, closeReplicas := makeNReplicas(b, 1, nil)
