@@ -64,7 +64,7 @@ func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 		require.NoError(t, store.Put(ctx, ds.NewKey(k), []byte(v)), "failed to put key-value")
 
 		if i%compactEvery == 0 {
-			m, ok := store.InternalStats().State.Members[h.ID().String()]
+			m, ok := store.InternalStats(ctx).State.Members[h.ID().String()]
 			require.True(t, ok, "our peerid should exist in the state")
 			lastHead := m.DagHeads[len(m.DagHeads)-1]
 			_, headCID, err := cid.CidFromBytes(lastHead.Cid)
@@ -94,11 +94,11 @@ func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 	//lastHead := m.DagHeads[len(m.DagHeads)-1]
 
 	// Step 2: Perform compaction and truncation
-	heads := store.InternalStats().Heads
+	heads := store.InternalStats(ctx).Heads
 	require.NotEmpty(t, heads, "DAG heads should not be empty")
 
 	// Step 3: Extract DAG content after compaction
-	dagContent, err := store.ExtractDAGContent(store.bs)
+	dagContent, err := store.ExtractDAGContent(ctx, store.bs)
 	require.NoError(t, err, "failed to extract DAG content")
 
 	// Step 4: Validate DAG has been truncated (only 1 or 2 nodes should remain)
@@ -158,7 +158,7 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	time.Sleep(10 * time.Second) // Ensure automatic compaction runs
 
 	// Fetch the snapshot that was created
-	s := replicas[0].InternalStats().State
+	s := replicas[0].InternalStats(ctx).State
 	require.NotNil(t, s.Snapshot, "Snapshot should have been triggered")
 
 	// Step 6: Restore the snapshot by allowing synchronization (happens automatically)
@@ -234,8 +234,8 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 	require.Eventually(t, func() bool {
 		// We’ll do a quick heuristic: both replicas have > 500 heads or none.
 		// In reality, you might want a more robust check, e.g. verifying a few random keys exist in both replicas.
-		heads0 := r0.InternalStats().Heads
-		heads1 := r1.InternalStats().Heads
+		heads0 := r0.InternalStats(ctx).Heads
+		heads1 := r1.InternalStats(ctx).Heads
 		return len(heads0) > 0 && len(heads1) > 0
 	}, 30*time.Second, 1*time.Second, "replicas should converge on some consistent heads")
 
@@ -248,12 +248,12 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 
 	// 6) Wait for automatic compaction on r0
 	require.Eventually(t, func() bool {
-		return r0.InternalStats().State.Snapshot != nil &&
-			r0.InternalStats().State.Snapshot.SnapshotKey != nil
+		return r0.InternalStats(ctx).State.Snapshot != nil &&
+			r0.InternalStats(ctx).State.Snapshot.SnapshotKey != nil
 	}, 1*time.Minute, 500*time.Millisecond, "replica 0 should have created a snapshot")
 
 	// 7) Verify the snapshot. We do so on r0, but you could also confirm that r1 sees it eventually.
-	snapshotCidBytes := r0.InternalStats().State.Snapshot.SnapshotKey.Cid
+	snapshotCidBytes := r0.InternalStats(ctx).State.Snapshot.SnapshotKey.Cid
 	require.NotEmpty(t, snapshotCidBytes, "Snapshot Key must be valid")
 
 	snapshotCid := cid.MustParse(snapshotCidBytes)
@@ -330,7 +330,7 @@ func TestSnapShotRestore(t *testing.T) {
 
 	// 4. Wait until replica 0 forms a snapshot automatically.
 	require.Eventually(t, func() bool {
-		snap := replicas[0].InternalStats().State.Snapshot
+		snap := replicas[0].InternalStats(ctx).State.Snapshot
 		return snap != nil && snap.SnapshotKey != nil
 	}, 15*time.Second, 500*time.Millisecond, "Replica 0 should create a snapshot")
 
@@ -343,7 +343,7 @@ func TestSnapShotRestore(t *testing.T) {
 	//    if it sees the same keys that replica 0 wrote.
 	require.Eventually(t, func() bool {
 		// quick check: does replica 1 see any snapshot yet?
-		return replicas[1].InternalStats().State.Snapshot != nil
+		return replicas[1].InternalStats(ctx).State.Snapshot != nil
 	}, 15*time.Second, 500*time.Millisecond, "Replica 1 should receive the snapshot")
 
 	// 7. At this point, both replicas should converge on the same data set from replica 0’s snapshot.
@@ -380,6 +380,6 @@ func TestTriggerSnapshot(t *testing.T) {
 	}
 
 	require.Eventually(t, func() bool {
-		return replicas[0].InternalStats().State.Snapshot != nil
+		return replicas[0].InternalStats(ctx).State.Snapshot != nil
 	}, 15*time.Second, 500*time.Millisecond)
 }

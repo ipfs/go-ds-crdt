@@ -148,7 +148,7 @@ func (hh *heads) IsCompact(c cid.Cid) (compact bool) {
 	return compact
 }
 
-(hh *heads) Len(ctx context.Context) (int, error) {
+func (hh *heads) Len(ctx context.Context) (int, error) {
 	var ret int
 	hh.cacheMux.RLock()
 	{

@@ -427,7 +427,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 		}
 
 		// merge the state with our state
-		if err := store.state.MergeMembers(store.ctx, broadcast); err != nil {
+		if err := store.state.MergeMembers(ctx, broadcast); err != nil {
 			// TODO log and continue
 			store.logger.Errorf("failed to merge broadcast: %v", err)
 			continue
@@ -450,7 +450,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 				continue
 			}
 			store.compactMux.Lock()
-			newSS, err := store.compactAndTruncate(store.ctx, start, end)
+			newSS, err := store.compactAndTruncate(ctx, start, end)
 			if err != nil {
 				store.logger.Errorf("failed to compact the dag: %v", err)
 				store.compactMux.Unlock()
@@ -459,12 +459,12 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			store.compactMux.Unlock()
 
 			store.oldProcessedCID = state.Snapshot.DagHead.Cid
-			err = store.state.SetSnapshot(store.ctx, newSS, start, broadcast.Snapshot.Height)
+			err = store.state.SetSnapshot(ctx, newSS, start, broadcast.Snapshot.Height)
 			if err != nil {
 				store.logger.Errorf("failed to set the snapshot: %v", err)
 				continue
 			}
-			err = store.broadcast(store.ctx)
+			err = store.broadcast(ctx)
 			if err != nil {
 				store.logger.Errorf("failed to broadcast: %v", err)
 				continue
@@ -485,7 +485,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 					store.logger.Errorf("failed to parse broadcast dag head cid: %v", err)
 					continue
 				}
-				err = store.restoreSnapshot(store.dagService, c, dc, broadcast.Snapshot.Height)
+				err = store.restoreSnapshot(ctx, store.dagService, c, dc, broadcast.Snapshot.Height)
 				if err != nil {
 					store.logger.Errorf("failed to restore snapshot: %v", err)
 					continue
@@ -558,18 +558,6 @@ func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) (*pb.S
 	err := proto.Unmarshal(data, &bcastData)
 	if err != nil {
 		return nil, err
-	}
-
-	// Compatibility: before we were publishing CIDs directly
-	msgReflect := bcastData.ProtoReflect()
-	if len(msgReflect.GetUnknown()) > 0 {
-		// Backwards compatibility
-		c, err := cid.Cast(msgReflect.GetUnknown())
-		if err != nil {
-			return nil, err
-		}
-		store.logger.Debugf("a legacy CID broadcast was received for: %s", c)
-		return &bcastData, nil
 	}
 
 	return &bcastData, nil
@@ -655,7 +643,7 @@ func (store *Datastore) rebroadcastHeads(ctx context.Context) {
 	store.logger.Debugf("rebroadcastHeads %d", len(headsToBroadcast))
 
 	if len(headsToBroadcast) > 0 {
-		err = store.state.UpdateHeads(store.ctx, store.h.ID(), headsToBroadcast, true)
+		err = store.state.UpdateHeads(ctx, store.h.ID(), headsToBroadcast, true)
 		if err != nil {
 			store.logger.Warn("broadcast failed: %v", err)
 		}
@@ -1354,7 +1342,7 @@ func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 		return err
 	}
 	headsToBroadcast := []cid.Cid{c}
-	err = store.state.UpdateHeads(store.ctx, store.h.ID(), headsToBroadcast, true)
+	err = store.state.UpdateHeads(ctx, store.h.ID(), headsToBroadcast, true)
 	if err != nil {
 		store.logger.Warn("broadcast failed: %v", err)
 	}
@@ -1462,19 +1450,19 @@ func (b *batch) Commit(ctx context.Context) error {
 
 type DAGCallback func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error
 
-func (store *Datastore) WalkDAG(heads []cid.Cid, callback DAGCallback) error {
+func (store *Datastore) WalkDAG(ctx context.Context, heads []cid.Cid, callback DAGCallback) error {
 	ng := &crdtNodeGetter{NodeGetter: store.dagService}
 	set := cid.NewSet()
 
 	for _, h := range heads {
-		if err := store.walkDAGRec(h, 0, ng, set, callback); err != nil {
+		if err := store.walkDAGRec(ctx, h, 0, ng, set, callback); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (store *Datastore) walkDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set, callback DAGCallback) error {
+func (store *Datastore) walkDAGRec(ctx context.Context, from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set, callback DAGCallback) error {
 	if !set.Visit(from) {
 		return nil
 	}
@@ -1491,20 +1479,20 @@ func (store *Datastore) walkDAGRec(from cid.Cid, depth uint64, ng *crdtNodeGette
 	}
 
 	for _, l := range nd.Links() {
-		if err := store.walkDAGRec(l.Cid, depth+1, ng, set, callback); err != nil {
+		if err := store.walkDAGRec(ctx, l.Cid, depth+1, ng, set, callback); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (store *Datastore) PrintDAG() error {
-	heads, _, err := store.heads.List()
+func (store *Datastore) PrintDAG(ctx context.Context) error {
+	heads, _, err := store.heads.List(ctx)
 	if err != nil {
 		return err
 	}
 
-	return store.WalkDAG(heads, func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error {
+	return store.WalkDAG(ctx, heads, func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error {
 		line := ""
 		for i := uint64(0); i < depth; i++ {
 			line += " "
@@ -1546,7 +1534,7 @@ func (store *Datastore) DotDAG(ctx context.Context, w io.Writer) error {
 	}
 	_, _ = fmt.Fprintln(w, "}")
 
-	err = store.WalkDAG(heads, func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error {
+	err = store.WalkDAG(ctx, heads, func(from cid.Cid, depth uint64, nd ipld.Node, delta *pb.Delta) error {
 		cidStr := from.String()
 		_, _ = fmt.Fprintf(w, "%s [label=\"%d | %s: +%d -%d\"]\n",
 			cidStr, delta.GetPriority(), cidStr[len(cidStr)-4:], len(delta.GetElements()), len(delta.GetTombstones()))
@@ -1584,8 +1572,8 @@ func (store *Datastore) InternalStats(ctx context.Context) Stats {
 	}
 }
 
-func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid, dagHeight uint64) error {
-	hamtNode, err := getter.Get(store.ctx, snapshotRoot)
+func (store *Datastore) restoreSnapshot(ctx context.Context, getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid, dagHeight uint64) error {
+	hamtNode, err := getter.Get(ctx, snapshotRoot)
 	if err != nil {
 		return fmt.Errorf("getting root node: %w", err)
 	}
@@ -1597,8 +1585,8 @@ func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid
 	}
 
 	// Process each link in the current shard
-	err = rootShard.ForEachLink(store.ctx, func(link *ipld.Link) error {
-		node, err := link.GetNode(store.ctx, getter)
+	err = rootShard.ForEachLink(ctx, func(link *ipld.Link) error {
+		node, err := link.GetNode(ctx, getter)
 		if err != nil {
 			return fmt.Errorf("failed to retrieve node %s: %w", link.Cid.String(), err)
 		}
@@ -1611,7 +1599,7 @@ func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid
 			Elements: []*pb.Element{{Key: strings.TrimPrefix(link.Name, "/"), Value: protoNode.Data()}},
 		}
 		id := dshelp.MultihashToDsKey(link.Cid.Hash()).String()
-		if err := store.set.Merge(store.ctx, delta, id); err != nil {
+		if err := store.set.Merge(ctx, delta, id); err != nil {
 			return fmt.Errorf("failed to merge delta: %w", err)
 
 		}
@@ -1622,7 +1610,7 @@ func (store *Datastore) restoreSnapshot(getter ipld.DAGService, snapshotRoot cid
 		return fmt.Errorf("error processing shard: %w", err)
 	}
 
-	err = store.state.SetSnapshot(store.ctx, snapshotRoot, dagHead, dagHeight)
+	err = store.state.SetSnapshot(ctx, snapshotRoot, dagHead, dagHeight)
 	if err != nil {
 		return fmt.Errorf("setting snapshot: %w", err)
 	}
@@ -1678,8 +1666,8 @@ type DAGNodeInfo struct {
 
 // ExtractDAGContent walks through the DAG starting from the given heads
 // and collects the additions and tombstones for each node.
-func (store *Datastore) ExtractDAGContent(blockstore blockstore.Blockstore) (map[uint64]DAGNodeInfo, error) {
-	heads, _, err := store.heads.List()
+func (store *Datastore) ExtractDAGContent(ctx context.Context, blockstore blockstore.Blockstore) (map[uint64]DAGNodeInfo, error) {
+	heads, _, err := store.heads.List(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1692,7 +1680,7 @@ func (store *Datastore) ExtractDAGContent(blockstore blockstore.Blockstore) (map
 	result := map[uint64]DAGNodeInfo{}
 
 	for _, h := range heads {
-		err := store.extractDAGContent(h, 0, ng, set, result)
+		err := store.extractDAGContent(ctx, h, 0, ng, set, result)
 		if err != nil {
 			return nil, err
 		}
@@ -1700,13 +1688,13 @@ func (store *Datastore) ExtractDAGContent(blockstore blockstore.Blockstore) (map
 	return result, nil
 }
 
-func (store *Datastore) extractDAGContent(from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set, result map[uint64]DAGNodeInfo) error {
+func (store *Datastore) extractDAGContent(ctx context.Context, from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set, result map[uint64]DAGNodeInfo) error {
 	ok := set.Visit(from)
 	if !ok {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(store.ctx, store.opts.DAGSyncerTimeout)
+	ctx, cancel := context.WithTimeout(ctx, store.opts.DAGSyncerTimeout)
 	defer cancel()
 	nd, delta, err := ng.GetDelta(ctx, from)
 	if err != nil {
@@ -1724,7 +1712,7 @@ func (store *Datastore) extractDAGContent(from cid.Cid, depth uint64, ng *crdtNo
 	result[delta.GetPriority()] = info
 
 	for _, l := range nd.Links() {
-		_ = store.extractDAGContent(l.Cid, depth+1, ng, set, result)
+		_ = store.extractDAGContent(ctx, l.Cid, depth+1, ng, set, result)
 	}
 	return nil
 }
@@ -1742,7 +1730,7 @@ func (store *Datastore) compact() {
 			}
 			return
 		case <-timer.C:
-			err := store.triggerCompactionIfNeeded()
+			err := store.triggerCompactionIfNeeded(store.ctx)
 			if err != nil {
 				//todo
 			}
@@ -1753,9 +1741,9 @@ func (store *Datastore) compact() {
 }
 
 // triggerCompactionIfNeeded handles compaction logic directly within the datastore
-func (store *Datastore) triggerCompactionIfNeeded() error {
+func (store *Datastore) triggerCompactionIfNeeded(ctx context.Context) error {
 	// Ensure all members agree on the DAG head before compacting
-	commonCid, height, err := store.getHighestCommonCid()
+	commonCid, height, err := store.getHighestCommonCid(ctx)
 	if err != nil {
 		return err
 	}
@@ -1780,7 +1768,7 @@ func (store *Datastore) triggerCompactionIfNeeded() error {
 	store.compactMux.Lock()
 	defer store.compactMux.Unlock()
 	// Extract DAG content and walk back CompactRetainNodes steps to determine the target CID
-	startCID, height, err := store.walkBackDAG(commonCid, store.opts.CompactRetainNodes)
+	startCID, height, err := store.walkBackDAG(ctx, commonCid, store.opts.CompactRetainNodes)
 	if err != nil {
 		return fmt.Errorf("failed to determine target CID for compaction: %w", err)
 	}
@@ -1795,13 +1783,13 @@ func (store *Datastore) triggerCompactionIfNeeded() error {
 	}
 
 	// Run compaction from start CID
-	compactCID, err := store.compactAndTruncate(store.ctx, startCID, lastSnapshotCid)
+	compactCID, err := store.compactAndTruncate(ctx, startCID, lastSnapshotCid)
 	if err != nil {
 		return fmt.Errorf("error during DAG compaction: %w", err)
 	}
 
 	// Update the snapshot if compaction changes the state
-	if err := store.state.SetSnapshot(store.ctx, compactCID, startCID, height); err != nil {
+	if err := store.state.SetSnapshot(ctx, compactCID, startCID, height); err != nil {
 		return fmt.Errorf("failed to update snapshot after compaction: %w", err)
 	}
 
@@ -1809,7 +1797,7 @@ func (store *Datastore) triggerCompactionIfNeeded() error {
 }
 
 // getHighestCommonCid gets the highest common cid of all members
-func (store *Datastore) getHighestCommonCid() (cid.Cid, uint64, error) {
+func (store *Datastore) getHighestCommonCid(ctx context.Context) (cid.Cid, uint64, error) {
 	heads := store.getAllMemberCommonHeads()
 	var (
 		c cid.Cid
@@ -1819,7 +1807,7 @@ func (store *Datastore) getHighestCommonCid() (cid.Cid, uint64, error) {
 	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
 	ng := &crdtNodeGetter{NodeGetter: offlineDAG}
 	for _, head := range heads {
-		p, err := ng.GetPriority(store.ctx, head)
+		p, err := ng.GetPriority(ctx, head)
 		if err != nil {
 			return c, h, fmt.Errorf("getting head: %w", err)
 		}
@@ -1858,7 +1846,7 @@ func (store *Datastore) getAllMemberCommonHeads() []cid.Cid {
 }
 
 // walkBackDAG traverses the DAG and selects a stable head to compact from thats retainNodes behind the given startCID
-func (store *Datastore) walkBackDAG(startCID cid.Cid, retainNodes uint64) (cid.Cid, uint64, error) {
+func (store *Datastore) walkBackDAG(ctx context.Context, startCID cid.Cid, retainNodes uint64) (cid.Cid, uint64, error) {
 	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
 	ng := crdtNodeGetter{NodeGetter: offlineDAG}
 	visited := cid.NewSet()
@@ -1873,7 +1861,7 @@ func (store *Datastore) walkBackDAG(startCID cid.Cid, retainNodes uint64) (cid.C
 	walk = func(currentCID cid.Cid) error {
 		if steps >= retainNodes {
 			targetCID = currentCID
-			_, delta, err := ng.GetDelta(store.ctx, currentCID)
+			_, delta, err := ng.GetDelta(ctx, currentCID)
 			if err != nil {
 				return fmt.Errorf("getting delta: %w", err)
 			}
@@ -1884,7 +1872,7 @@ func (store *Datastore) walkBackDAG(startCID cid.Cid, retainNodes uint64) (cid.C
 			return nil
 		}
 
-		node, _, err := ng.GetDelta(store.ctx, currentCID)
+		node, _, err := ng.GetDelta(ctx, currentCID)
 		if err != nil {
 			return err
 		}
@@ -1896,7 +1884,7 @@ func (store *Datastore) walkBackDAG(startCID cid.Cid, retainNodes uint64) (cid.C
 			return walk(links[0].Cid)
 		} else if len(links) > 1 {
 			// Select the most stable branch (e.g., by priority)
-			stableChild, err := store.selectStableChild(links)
+			stableChild, err := store.selectStableChild(ctx, links)
 			if err != nil {
 				return err
 			}
@@ -1914,7 +1902,7 @@ func (store *Datastore) walkBackDAG(startCID cid.Cid, retainNodes uint64) (cid.C
 }
 
 // selectStableChild selects the most stable child node from multiple links
-func (store *Datastore) selectStableChild(links []*ipld.Link) (cid.Cid, error) {
+func (store *Datastore) selectStableChild(ctx context.Context, links []*ipld.Link) (cid.Cid, error) {
 	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
 	ng := crdtNodeGetter{NodeGetter: offlineDAG}
 
@@ -1924,7 +1912,7 @@ func (store *Datastore) selectStableChild(links []*ipld.Link) (cid.Cid, error) {
 	)
 
 	for _, link := range links {
-		_, delta, err := ng.GetDelta(store.ctx, link.Cid)
+		_, delta, err := ng.GetDelta(ctx, link.Cid)
 		if err != nil {
 			continue // Skip if priority can't be determined
 		}
