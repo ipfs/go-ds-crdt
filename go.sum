@@ -103,12 +103,12 @@ github.com/ipfs/go-block-format v0.2.0 h1:ZqrkxBA2ICbDRbK8KJs/u0O3dlp6gmAuuXUJNi
 github.com/ipfs/go-block-format v0.2.0/go.mod h1:+jpL11nFx5A/SPpsoBn6Bzkra/zaArfSmsknbPMYgzM=
 github.com/ipfs/go-cid v0.5.0 h1:goEKKhaGm0ul11IHA7I6p1GmKz8kEYniqFopaB5Otwg=
 github.com/ipfs/go-cid v0.5.0/go.mod h1:0L7vmeNXpQpUS9vt+yEARkJ8rOg43DF3iPgn4GIN0mk=
-github.com/ipfs/go-datastore v0.8.1 h1:p4+tWJuopShJgB3kIK0MMvnH6CFPvi7g/S44f2/EHQA=
-github.com/ipfs/go-datastore v0.8.1/go.mod h1:W+pI1NsUsz3tcsAACMtfC+IZdnQTnC/7VfPoJBQuts0=
+github.com/ipfs/go-datastore v0.8.2 h1:Jy3wjqQR6sg/LhyY0NIePZC3Vux19nLtg7dx0TVqr6U=
+github.com/ipfs/go-datastore v0.8.2/go.mod h1:W+pI1NsUsz3tcsAACMtfC+IZdnQTnC/7VfPoJBQuts0=
 github.com/ipfs/go-detect-race v0.0.1 h1:qX/xay2W3E4Q1U7d9lNs1sU9nvguX0a7319XbyQ6cOk=
 github.com/ipfs/go-detect-race v0.0.1/go.mod h1:8BNT7shDZPo99Q74BpGMK+4D8Mn4j46UU0LZ723meps=
-github.com/ipfs/go-ds-badger v0.3.3 h1:KeeeSI0FCks/IFQY2VfcZvBBj59DBWTFBP/1v5mX/og=
-github.com/ipfs/go-ds-badger v0.3.3/go.mod h1:UoJWjbBnX1uhgPTXzXXJp4ZOunX3GCv+4yKWfpN0m5w=
+github.com/ipfs/go-ds-badger v0.3.4 h1:MmqFicftE0KrwMC77WjXTrPuoUxhwyFsjKONSeWrlOo=
+github.com/ipfs/go-ds-badger v0.3.4/go.mod h1:HfqsKJcNnIr9ZhZ+rkwS1J5PpaWjJjg6Ipmxd7KPfZ8=
 github.com/ipfs/go-ipfs-delay v0.0.1 h1:r/UXYyRcddO6thwOnhiznIAiSvxMECGgtv35Xs1IeRQ=
 github.com/ipfs/go-ipfs-delay v0.0.1/go.mod h1:8SP1YXK1M1kXuc4KJZINY3TQQ03J2rwBG9QfXmbRPrw=
 github.com/ipfs/go-ipfs-pq v0.0.3 h1:YpoHVJB+jzK15mr/xsWC574tyDLkezVrDNeaalQBsTE=
