@@ -16,12 +16,13 @@ import (
 
 // StateManager manages a StateBroadcast proto object in a datastore.
 type StateManager struct {
-	datastore ds.Datastore
-	key       ds.Key
-	state     *pb.StateBroadcast
-	clock     clock.Clock
-	ttl       time.Duration
-	mu        sync.Mutex // Lock for preventing concurrent access to state
+	datastore          ds.Datastore
+	key                ds.Key
+	state              *pb.StateBroadcast
+	clock              clock.Clock
+	ttl                time.Duration
+	mu                 sync.Mutex // Lock for preventing concurrent access to state
+	onMembershipUpdate func(members map[string]*pb.Participant)
 }
 
 // NewStateManager initializes a StateManager and loads the state from the datastore.
@@ -100,6 +101,10 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 		member.BestBefore = uint64(m.clock.Now().Add(m.ttl).Unix())
 	}
 
+	if m.onMembershipUpdate != nil {
+		go m.onMembershipUpdate(m.state.Members)
+	}
+
 	return m.Save(ctx)
 }
 
@@ -113,6 +118,11 @@ func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroa
 			m.state.Members[k] = v
 		}
 	}
+
+	if m.onMembershipUpdate != nil {
+		go m.onMembershipUpdate(m.state.Members)
+	}
+
 	return m.Save(ctx)
 }
 
@@ -125,4 +135,12 @@ func (m *StateManager) SetSnapshot(ctx context.Context, root cid.Cid, dagHead ci
 		Height:      dagHeight,
 	}
 	return m.Save(ctx)
+}
+
+// SetMembershipUpdateCallback registers a callback to be invoked whenever
+// membership information is updated.
+func (m *StateManager) SetMembershipUpdateCallback(callback func(members map[string]*pb.Participant)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onMembershipUpdate = callback
 }

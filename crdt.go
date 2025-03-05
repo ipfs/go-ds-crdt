@@ -126,6 +126,9 @@ type Options struct {
 	CompactDagSize uint64
 	// CompactRetainNodes defines how many recent nodes should remain after DAG compaction
 	CompactRetainNodes uint64
+
+	//MembershipHook function is triggered whenever membership changes or is updated.
+	MembershipHook func(members map[string]*pb.Participant)
 }
 
 func (opts *Options) verify() error {
@@ -302,6 +305,8 @@ func New(h Peer, store ds.Datastore, bs blockstore.Blockstore, namespace ds.Key,
 		cancel()
 		return nil, errors.Wrap(err, "error building statemanager")
 	}
+
+	sm.SetMembershipUpdateCallback(opts.MembershipHook)
 
 	dstore := &Datastore{
 		h:              h,
