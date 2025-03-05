@@ -1577,6 +1577,11 @@ func (store *Datastore) InternalStats(ctx context.Context) Stats {
 	}
 }
 
+// GetState returns the current membership state
+func (store *Datastore) GetState(ctx context.Context) *pb.StateBroadcast {
+	return store.state.GetState()
+}
+
 func (store *Datastore) restoreSnapshot(ctx context.Context, getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid, dagHeight uint64) error {
 	hamtNode, err := getter.Get(ctx, snapshotRoot)
 	if err != nil {
