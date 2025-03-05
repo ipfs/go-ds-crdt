@@ -129,6 +129,9 @@ type Options struct {
 
 	//MembershipHook function is triggered whenever membership changes or is updated.
 	MembershipHook func(members map[string]*pb.Participant)
+
+	// TTL is the duration this node is considered lost when its isolated from peers ( figured out on rejoin )
+	TTL time.Duration
 }
 
 func (opts *Options) verify() error {
@@ -178,6 +181,10 @@ func DefaultOptions() *Options {
 		MaxBatchDeltaSize:   1 * 1024 * 1024, // 1MB,
 		RepairInterval:      time.Hour,
 		MultiHeadProcessing: false,
+		TTL:                 time.Hour * 24 * 7,
+		CompactInterval:     time.Hour,
+		CompactDagSize:      10000,
+		CompactRetainNodes:  1000,
 	}
 }
 
@@ -300,7 +307,7 @@ func New(h Peer, store ds.Datastore, bs blockstore.Blockstore, namespace ds.Key,
 	}
 
 	// load the state
-	sm, err := NewStateManager(ctx, store, stateNs, time.Hour*24*7)
+	sm, err := NewStateManager(ctx, store, stateNs, opts.TTL)
 	if err != nil {
 		cancel()
 		return nil, errors.Wrap(err, "error building statemanager")
