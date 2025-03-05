@@ -119,6 +119,13 @@ func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroa
 		}
 	}
 
+	// throw away members that have outlived their ttl
+	for k, v := range m.state.Members {
+		if v.BestBefore < uint64(m.clock.Now().Unix()) {
+			delete(m.state.Members, k)
+		}
+	}
+
 	if m.onMembershipUpdate != nil {
 		go m.onMembershipUpdate(m.state.Members)
 	}
@@ -173,5 +180,4 @@ func (m *StateManager) SetMeta(ctx context.Context, id peer.ID, metaData map[str
 	member.BestBefore = uint64(m.clock.Now().Add(m.ttl).Unix())
 
 	return m.Save(ctx)
-
 }
