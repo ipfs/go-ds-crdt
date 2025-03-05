@@ -144,3 +144,34 @@ func (m *StateManager) SetMembershipUpdateCallback(callback func(members map[str
 	defer m.mu.Unlock()
 	m.onMembershipUpdate = callback
 }
+
+func (m *StateManager) SetMeta(ctx context.Context, id peer.ID, metaData map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var changesMade bool
+
+	member, ok := m.state.Members[id.String()]
+	if !ok {
+		changesMade = true
+		member = &pb.Participant{
+			Metadata: metaData,
+		}
+		m.state.Members[id.String()] = member
+	} else {
+		for k, v := range metaData {
+			if current, exists := member.Metadata[k]; !exists || v != current {
+				changesMade = true
+				member.Metadata[k] = v
+			}
+		}
+	}
+
+	if !changesMade {
+		return nil
+	}
+	member.BestBefore = uint64(m.clock.Now().Add(m.ttl).Unix())
+
+	return m.Save(ctx)
+
+}

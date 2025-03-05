@@ -1939,3 +1939,8 @@ func (store *Datastore) selectStableChild(ctx context.Context, links []*ipld.Lin
 	}
 	return cid.Undef, fmt.Errorf("no stable child found among branches")
 }
+
+// UpdateMeta returns the current membership state
+func (store *Datastore) UpdateMeta(ctx context.Context, meta map[string]string) error {
+	return store.state.SetMeta(ctx, store.h.ID(), meta)
+}
