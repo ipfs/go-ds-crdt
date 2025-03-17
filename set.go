@@ -7,10 +7,11 @@ import (
 	"errors"
 	"strings"
 	"sync"
-	"time"
 
-	bloom "github.com/ipfs/bbloom"
+	dshelp "github.com/ipfs/boxo/datastore/dshelp"
+	cid "github.com/ipfs/go-cid"
 	pb "github.com/ipfs/go-ds-crdt/pb"
+	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
 	multierr "go.uber.org/multierr"
 
@@ -34,6 +35,7 @@ var (
 // sorting their unique IDs alphabetically.
 type set struct {
 	store      ds.Datastore
+	dagService ipld.DAGService
 	namespace  ds.Key
 	putHook    func(key string, v []byte)
 	deleteHook func(key string)
@@ -42,84 +44,28 @@ type set struct {
 	// Avoid merging two things at the same time since
 	// we read-write value-priorities in a non-atomic way.
 	putElemsMux sync.Mutex
-
-	tombstonesBloom *bloom.Bloom
 }
-
-// Tombstones bloom filter options.
-// We have optimized the defaults for speed:
-// - commit 30 MiB of memory to the filter
-// - only hash twice
-// - False positive probabily is 1 in 10000 when working with 1M items in the filter.
-// See https://hur.st/bloomfilter/?n=&p=0.0001&m=30MiB&k=2
-var (
-	TombstonesBloomFilterSize   float64 = 30 * 1024 * 1024 * 8 // 30 MiB
-	TombstonesBloomFilterHashes float64 = 2
-)
 
 func newCRDTSet(
 	ctx context.Context,
 	d ds.Datastore,
 	namespace ds.Key,
+	dagService ipld.DAGService,
 	logger logging.StandardLogger,
 	putHook func(key string, v []byte),
 	deleteHook func(key string),
 ) (*set, error) {
 
-	blm, err := bloom.New(
-		float64(TombstonesBloomFilterSize),
-		float64(TombstonesBloomFilterHashes),
-	)
-	if err != nil {
-		return nil, err
-	}
-
 	set := &set{
-		namespace:       namespace,
-		store:           d,
-		logger:          logger,
-		putHook:         putHook,
-		deleteHook:      deleteHook,
-		tombstonesBloom: blm,
+		namespace:  namespace,
+		store:      d,
+		dagService: dagService,
+		logger:     logger,
+		putHook:    putHook,
+		deleteHook: deleteHook,
 	}
 
-	return set, set.primeBloomFilter(ctx)
-}
-
-// We need to add all <key/block> keys in tombstones to the filter.
-func (s *set) primeBloomFilter(ctx context.Context) error {
-	tombsPrefix := s.keyPrefix(tombsNs) // /ns/tombs
-	q := query.Query{
-		Prefix:   tombsPrefix.String(),
-		KeysOnly: true,
-	}
-
-	t := time.Now()
-	nTombs := 0
-
-	results, err := s.store.Query(ctx, q)
-	if err != nil {
-		return err
-	}
-	defer results.Close()
-
-	for r := range results.Next() {
-		if r.Error != nil {
-			return r.Error
-		}
-
-		// Switch from /ns/tombs/key/block to /key/block
-		key := ds.NewKey(
-			strings.TrimPrefix(r.Key, tombsPrefix.String()))
-		// Switch from /key/block to key
-		key = key.Parent()
-		// fmt.Println("Bloom filter priming with:", key)
-		// put the key in the bloom cache
-		s.tombstonesBloom.Add(key.Bytes())
-		nTombs++
-	}
-	s.logger.Infof("Tombstones have bloomed: %d tombs. Took: %s", nTombs, time.Since(t))
-	return nil
+	return set, nil
 }
 
 // Add returns a new delta-set adding the given key/value.
@@ -187,34 +133,15 @@ func (s *set) Element(ctx context.Context, key string) ([]byte, error) {
 	// We can only GET an element if it's part of the Set (in
 	// "elements" and not in "tombstones").
 
-	// As an optimization:
-	// * If the key has a value in the store it means:
-	//   -> It occurs at least once in "elems"
-	//   -> It may or not be tombstoned
-	// * If the key does not have a value in the store:
-	//   -> It was either never added
+	// * If the key has a value in the store it means that it has been
+	//   written and is alive. putTombs will delete the value if all elems
+	//   are tombstoned, or leave the best one.
+
 	valueK := s.valueKey(key)
 	value, err := s.store.Get(ctx, valueK)
 	if err != nil { // not found is fine, we just return it
 		return value, err
 	}
-
-	// We have an existing element. Check if tombstoned.
-	inSet, err := s.checkNotTombstoned(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-
-	if !inSet {
-		// attempt to remove so next time we do not have to do this
-		// lookup.
-		// In concurrency, this may delete a key that was just written
-		// and should not be deleted.
-		// s.store.Delete(valueK)
-
-		return nil, ds.ErrNotFound
-	}
-	// otherwise return the value
 	return value, nil
 }
 
@@ -321,9 +248,10 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 				return
 			}
 
-			if !has {
-				continue
-			}
+			// The fact that /v is set means it is not tombstoned,
+			// as tombstoning removes /v and /p or sets them to
+			// the best value.
+
 			if q.KeysOnly {
 				entry.Size = -1
 				entry.Value = nil
@@ -340,73 +268,10 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 // InSet returns true if the key belongs to one of the elements in the "elems"
 // set, and this element is not tombstoned.
 func (s *set) InSet(ctx context.Context, key string) (bool, error) {
-	// Optimization: if we do not have a value
-	// this key was never added.
+	// If we do not have a value this key was never added or it was fully
+	// tombstoned.
 	valueK := s.valueKey(key)
-	if ok, err := s.store.Has(ctx, valueK); !ok {
-		return false, err
-	}
-
-	// Otherwise, do the long check.
-	return s.checkNotTombstoned(ctx, key)
-}
-
-// Returns true when we have a key/block combination in the
-// elements set that has not been tombstoned.
-//
-// Warning: In order to do a quick bloomfilter check, this assumes the key is
-// in elems already. Any code calling this function already has verified
-// that there is a value-key entry for the key, thus there must necessarily
-// be a non-empty set of key/block in elems.
-//
-// Put otherwise: this code will misbehave when called directly to check if an
-// element exists. See Element()/InSet() etc..
-func (s *set) checkNotTombstoned(ctx context.Context, key string) (bool, error) {
-	// Bloom filter check: has this key been potentially tombstoned?
-
-	// fmt.Println("Bloom filter check:", key)
-	if !s.tombstonesBloom.HasTS([]byte(key)) {
-		return true, nil
-	}
-
-	// /namespace/elems/<key>
-	prefix := s.elemsPrefix(key)
-	q := query.Query{
-		Prefix:   prefix.String(),
-		KeysOnly: true,
-	}
-
-	results, err := s.store.Query(ctx, q)
-	if err != nil {
-		return false, err
-	}
-	defer results.Close()
-
-	// range all the /namespace/elems/<key>/<block_cid>.
-	for r := range results.Next() {
-		if r.Error != nil {
-			return false, err
-		}
-
-		id := strings.TrimPrefix(r.Key, prefix.String())
-		if !ds.RawKey(id).IsTopLevel() {
-			// our prefix matches blocks from other keys i.e. our
-			// prefix is "hello" and we have a different key like
-			// "hello/bye" so we have a block id like
-			// "bye/<block>". If we got the right key, then the id
-			// should be the block id only.
-			continue
-		}
-		// if not tombstoned, we have it
-		inTomb, err := s.inTombsKeyID(ctx, key, id)
-		if err != nil {
-			return false, err
-		}
-		if !inTomb {
-			return true, nil
-		}
-	}
-	return false, nil
+	return s.store.Has(ctx, valueK)
 }
 
 // /namespace/<key>
@@ -465,8 +330,7 @@ func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, 
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
 func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, prio uint64) error {
-	// If this key was tombstoned already, do not store/update the value
-	// at all.
+	// If this key was tombstoned already, do not store/update the value.
 	deleted, err := s.inTombsKeyID(ctx, key, id)
 	if err != nil || deleted {
 		return err
@@ -505,6 +369,106 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 	// trigger add hook
 	s.putHook(key, value)
 	return nil
+}
+
+// findBestValue looks for all entries for the given key, figures out their
+// priority from their delta (skipping the blocks by the given pendingTombIDs)
+// and returns the value with the highest priority that is not tombstoned nor
+// about to be tombstoned.
+func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []string) ([]byte, uint64, error) {
+	// /namespace/elems/<key>
+	prefix := s.elemsPrefix(key)
+	q := query.Query{
+		Prefix:   prefix.String(),
+		KeysOnly: true,
+	}
+
+	results, err := s.store.Query(ctx, q)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer results.Close()
+
+	var bestValue []byte
+	var bestPriority uint64
+	var deltaCid cid.Cid
+	ng := crdtNodeGetter{NodeGetter: s.dagService}
+
+	// range all the /namespace/elems/<key>/<block_cid>.
+NEXT:
+	for r := range results.Next() {
+		if r.Error != nil {
+			return nil, 0, err
+		}
+
+		id := strings.TrimPrefix(r.Key, prefix.String())
+		if !ds.RawKey(id).IsTopLevel() {
+			// our prefix matches blocks from other keys i.e. our
+			// prefix is "hello" and we have a different key like
+			// "hello/bye" so we have a block id like
+			// "bye/<block>". If we got the right key, then the id
+			// should be the block id only.
+			continue
+		}
+		// if block is one of the pending tombIDs, continue
+		for _, tombID := range pendingTombIDs {
+			if tombID == id {
+				continue NEXT
+			}
+		}
+
+		// if tombstoned, continue
+		inTomb, err := s.inTombsKeyID(ctx, key, id)
+		if err != nil {
+			return nil, 0, err
+		}
+		if inTomb {
+			continue
+		}
+
+		// get the block
+		mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+		if err != nil {
+			return nil, 0, err
+		}
+		deltaCid = cid.NewCidV1(cid.DagProtobuf, mhash)
+		_, delta, err := ng.GetDelta(ctx, deltaCid)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		// discard this delta.
+		if delta.Priority < bestPriority {
+			continue
+		}
+
+		// When equal priority, choose the greatest among values in
+		// the delta and current. When higher priority, choose the
+		// greatest only among those in the delta.
+		var greatestValueInDelta []byte
+		for _, elem := range delta.GetElements() {
+			if elem.GetKey() != key {
+				continue
+			}
+			v := elem.GetValue()
+			if bytes.Compare(greatestValueInDelta, v) < 0 {
+				greatestValueInDelta = v
+			}
+		}
+
+		if delta.Priority > bestPriority {
+			bestValue = greatestValueInDelta
+			bestPriority = delta.Priority
+			continue
+		}
+
+		// equal priority
+		if bytes.Compare(bestValue, greatestValueInDelta) < 0 {
+			bestValue = greatestValueInDelta
+		}
+	}
+
+	return bestValue, bestPriority, nil
 }
 
 // putElems adds items to the "elems" set. It will also set current
@@ -577,23 +541,35 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 	}
 
-	deletedElems := make(map[string]struct{})
+	// key -> tombstonedBlockID. Carries the tombstoned blocks for each
+	// element in this delta.
+	deletedElems := make(map[string][]string)
+
 	for _, e := range tombs {
 		// /namespace/tombs/<key>/<id>
-		elemKey := e.GetKey()
-		k := s.tombsPrefix(elemKey).ChildString(e.GetId())
-		err := store.Put(ctx, k, nil)
+		key := e.GetKey()
+		id := e.GetId()
+		valueK := s.valueKey(key)
+		deletedElems[key] = append(deletedElems[key], id)
+
+		// Find best value for element that we are going to delete
+		v, p, err := s.findBestValue(ctx, key, deletedElems[key])
 		if err != nil {
 			return err
 		}
-		s.tombstonesBloom.AddTS([]byte(elemKey))
-		//fmt.Println("Bloom filter add:", elemKey)
-		// run delete hook only once for all
-		// versions of the same element tombstoned
-		// in this delta
-		if _, ok := deletedElems[elemKey]; !ok {
-			deletedElems[elemKey] = struct{}{}
-			s.deleteHook(elemKey)
+		if v == nil {
+			store.Delete(ctx, valueK)
+			store.Delete(ctx, s.priorityKey(key))
+		} else {
+			store.Put(ctx, valueK, v)
+			s.setPriority(ctx, store, key, p)
+		}
+
+		// Write tomb into store.
+		k := s.tombsPrefix(key).ChildString(id)
+		err = store.Put(ctx, k, nil)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -603,6 +579,14 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 			return err
 		}
 	}
+
+	// run delete hook only once for all versions of the same element
+	// tombstoned in this delta. Note it may be that the element was not
+	// fully deleted and only a different value took its place.
+	for del := range deletedElems {
+		s.deleteHook(del)
+	}
+
 	return nil
 }
 

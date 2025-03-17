@@ -22,8 +22,9 @@ var randg = rand.New(rand.NewSource(time.Now().UnixNano()))
 // TODO we should also test with a non-batching store
 func newTestHeads(t *testing.T) *heads {
 	t.Helper()
+	ctx := context.Background()
 	store := dssync.MutexWrap(ds.NewMapDatastore())
-	heads, err := newHeads(store, headsTestNS, &testLogger{
+	heads, err := newHeads(ctx, store, headsTestNS, &testLogger{
 		name: t.Name(),
 		l:    DefaultOptions().Logger,
 	})
@@ -49,7 +50,7 @@ func TestHeadsBasic(t *testing.T) {
 	ctx := context.Background()
 
 	heads := newTestHeads(t)
-	l, err := heads.Len()
+	l, err := heads.Len(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +89,7 @@ func TestHeadsBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	heads, err = newHeads(heads.store, headsTestNS, &testLogger{
+	heads, err = newHeads(ctx, heads.store, headsTestNS, &testLogger{
 		name: t.Name(),
 		l:    DefaultOptions().Logger,
 	})
@@ -100,8 +101,9 @@ func TestHeadsBasic(t *testing.T) {
 
 func assertHeads(t *testing.T, hh *heads, cidHeights map[cid.Cid]uint64) {
 	t.Helper()
+	ctx := context.Background()
 
-	headCids, maxHeight, err := hh.List()
+	headCids, maxHeight, err := hh.List(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +118,7 @@ func assertHeads(t *testing.T, hh *heads, cidHeights map[cid.Cid]uint64) {
 		t.Errorf("expected max height=%d, got=%d", expectedMaxHeight, maxHeight)
 	}
 
-	headsLen, err := hh.Len()
+	headsLen, err := hh.Len(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +139,7 @@ func assertHeads(t *testing.T, hh *heads, cidHeights map[cid.Cid]uint64) {
 		t.Errorf("given cids don't match cids returned by List: %v, %v", cids, headCids)
 	}
 	for _, c := range cids {
-		present, height, err := hh.IsHead(c)
+		present, height, err := hh.IsHead(ctx, c)
 		if err != nil {
 			t.Fatal(err)
 		}

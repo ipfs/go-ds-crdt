@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -97,7 +98,7 @@ type mockBroadcaster struct {
 	ctx      context.Context
 	chans    []chan []byte
 	myChan   chan []byte
-	dropProb int // probability of dropping a message instead of receiving it
+	dropProb *atomic.Int64 // probability of dropping a message instead of receiving it
 	t        testing.TB
 }
 
@@ -105,27 +106,28 @@ func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFun
 	ctx, cancel := context.WithCancel(context.Background())
 	broadcasters := make([]*mockBroadcaster, n)
 	chans := make([]chan []byte, n)
+	dropP := &atomic.Int64{}
 	for i := range chans {
 		chans[i] = make(chan []byte, 300)
 		broadcasters[i] = &mockBroadcaster{
 			ctx:      ctx,
 			chans:    chans,
 			myChan:   chans[i],
-			dropProb: 0,
+			dropProb: dropP,
 			t:        t,
 		}
 	}
 	return broadcasters, cancel
 }
 
-func (mb *mockBroadcaster) Broadcast(data []byte) error {
+func (mb *mockBroadcaster) Broadcast(ctx context.Context, data []byte) error {
 	var wg sync.WaitGroup
 
 	randg := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for i, ch := range mb.chans {
-		n := randg.Intn(100)
-		if n < mb.dropProb {
+		n := randg.Int63n(100)
+		if n < mb.dropProb.Load() {
 			continue
 		}
 		wg.Add(1)
@@ -153,10 +155,12 @@ func (mb *mockBroadcaster) Broadcast(data []byte) error {
 	return nil
 }
 
-func (mb *mockBroadcaster) Next() ([]byte, error) {
+func (mb *mockBroadcaster) Next(ctx context.Context) ([]byte, error) {
 	select {
 	case data := <-mb.myChan:
 		return data, nil
+	case <-ctx.Done():
+		return nil, ErrNoMoreBroadcast
 	case <-mb.ctx.Done():
 		return nil, ErrNoMoreBroadcast
 	}
@@ -235,7 +239,7 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 			name: fmt.Sprintf("r#%d: ", i),
 			l:    DefaultOptions().Logger,
 		}
-		replicaOpts[i].RebroadcastInterval = time.Second * 10
+		replicaOpts[i].RebroadcastInterval = time.Second * 5
 		replicaOpts[i].NumWorkers = 5
 		replicaOpts[i].DAGSyncerTimeout = time.Second
 	}
@@ -399,7 +403,7 @@ func TestCRDTReplication(t *testing.T) {
 	}
 
 	for _, r := range replicas {
-		list, _, err := r.heads.List()
+		list, _, err := r.heads.List(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -489,7 +493,7 @@ func TestCRDTCatchUp(t *testing.T) {
 
 	r := replicas[len(replicas)-1]
 	br := r.broadcaster.(*mockBroadcaster)
-	br.dropProb = 101
+	br.dropProb.Store(101)
 
 	// this items will not get to anyone
 	for i := 0; i < nItems; i++ {
@@ -501,7 +505,7 @@ func TestCRDTCatchUp(t *testing.T) {
 	}
 
 	time.Sleep(100 * time.Millisecond)
-	br.dropProb = 0
+	br.dropProb.Store(0)
 
 	// this message will get to everyone
 	err := r.Put(ctx, ds.RandomKey(), nil)
@@ -540,7 +544,7 @@ func TestCRDTPrintDAG(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	err := replicas[0].PrintDAG()
+	err := replicas[0].PrintDAG(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,6 +787,7 @@ func TestCRDTSync(t *testing.T) {
 }
 
 func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
+	ctx := context.Background()
 	mh, err := multihash.Sum([]byte("emacs is best"), multihash.SHA2_256, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -793,7 +798,7 @@ func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
-	cids, err := replicas[0].decodeBroadcast(cidV0.Bytes())
+	cids, err := replicas[0].decodeBroadcast(ctx, cidV0.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,12 +807,12 @@ func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
 		t.Error("should have returned a single cidV0", cids)
 	}
 
-	data, err := replicas[0].encodeBroadcast(cids)
+	data, err := replicas[0].encodeBroadcast(ctx, cids)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cids2, err := replicas[0].decodeBroadcast(data)
+	cids2, err := replicas[0].decodeBroadcast(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -815,56 +820,6 @@ func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
 	if len(cids2) != 1 || !cids[0].Equals(cidV0) {
 		t.Error("should have reparsed cid0", cids2)
 	}
-}
-
-// There is no easy way to see if the bloom filter is doing its job without
-// wiring some sort of metric or benchmarking. Instead, this just hits the
-// 3 places relevant to bloom filter:
-// * When adding a tomb
-// * When checking if something is tombstoned
-// * When priming the filter
-//
-// The main thing is to manually verify (via printlns) that the bloom filter
-// is used with the expected key everywhere: i.e. "/mykey" and not
-// "mykey". "/something/else" and not "/something". Protip: it has been
-// verified and it does that.
-func TestBloomingTombstones(t *testing.T) {
-	ctx := context.Background()
-	replicas, closeReplicas := makeNReplicas(t, 1, nil)
-	defer closeReplicas()
-
-	k := ds.NewKey("hola/adios/")
-	err := replicas[0].Put(ctx, k, []byte("bytes"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = replicas[0].Delete(ctx, k)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = replicas[0].Put(ctx, k, []byte("bytes"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	q := query.Query{
-		KeysOnly: false,
-	}
-	results, err := replicas[0].Query(ctx, q)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer results.Close()
-
-	for r := range results.Next() {
-		if r.Error != nil {
-			t.Error(r.Error)
-		}
-	}
-
-	replicas[0].set.primeBloomFilter(ctx)
 }
 
 func BenchmarkQueryElements(b *testing.B) {
@@ -912,5 +867,146 @@ func TestRandomizeInterval(t *testing.T) {
 			t.Log("r and prevR were equal")
 		}
 		prevR = r
+	}
+}
+
+func TestCRDTPutPutDelete(t *testing.T) {
+	replicas, closeReplicas := makeNReplicas(t, 2, nil)
+	defer closeReplicas()
+
+	ctx := context.Background()
+
+	br0 := replicas[0].broadcaster.(*mockBroadcaster)
+	br0.dropProb.Store(101)
+
+	br1 := replicas[1].broadcaster.(*mockBroadcaster)
+	br1.dropProb.Store(101)
+
+	k := ds.NewKey("k1")
+
+	// r0 - put put delete
+	err := replicas[0].Put(ctx, k, []byte("r0-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = replicas[0].Put(ctx, k, []byte("r0-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = replicas[0].Delete(ctx, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// r1 - put
+	err = replicas[1].Put(ctx, k, []byte("r1-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	br0.dropProb.Store(0)
+	br1.dropProb.Store(0)
+
+	time.Sleep(15 * time.Second)
+
+	r0Res, err := replicas[0].Get(ctx, ds.NewKey("k1"))
+	if err != nil {
+		if !errors.Is(err, ds.ErrNotFound) {
+			t.Fatal(err)
+		}
+	}
+
+	r1Res, err := replicas[1].Get(ctx, ds.NewKey("k1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeReplicas()
+
+	if string(r0Res) != string(r1Res) {
+		fmt.Printf("r0Res: %s\nr1Res: %s\n", string(r0Res), string(r1Res))
+		t.Log("r0 dag")
+		replicas[0].PrintDAG(ctx)
+
+		t.Log("r1 dag")
+		replicas[1].PrintDAG(ctx)
+
+		t.Fatal("r0 and r1 should have the same value")
+	}
+}
+
+func TestMigration0to1(t *testing.T) {
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+	replica := replicas[0]
+	ctx := context.Background()
+
+	nItems := 200
+	var keys []ds.Key
+	// Add nItems
+	for i := 0; i < nItems; i++ {
+		k := ds.RandomKey()
+		keys = append(keys, k)
+		v := []byte(fmt.Sprintf("%d", i))
+		err := replica.Put(ctx, k, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+	}
+
+	// Overwrite n/2 items 5 times to have multiple tombstones per key
+	// later...
+	for j := 0; j < 5; j++ {
+		for i := 0; i < nItems/2; i++ {
+			v := []byte(fmt.Sprintf("%d", i))
+			err := replica.Put(ctx, keys[i], v)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// delete keys
+	for i := 0; i < nItems/2; i++ {
+		err := replica.Delete(ctx, keys[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// And write them again
+	for i := 0; i < nItems/2; i++ {
+		err := replica.Put(ctx, keys[i], []byte("final value"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// And now we manually put the wrong value
+	for i := 0; i < nItems/2; i++ {
+		valueK := replica.set.valueKey(keys[i].String())
+		err := replica.set.store.Put(ctx, valueK, []byte("wrong value"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = replica.set.setPriority(ctx, replica.set.store, keys[i].String(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := replica.migrate0to1(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < nItems/2; i++ {
+		v, err := replica.Get(ctx, keys[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(v) != "final value" {
+			t.Fatalf("value for elem %d should be final value: %s", i, string(v))
+		}
 	}
 }

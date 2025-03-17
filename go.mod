@@ -6,7 +6,6 @@ toolchain go1.24.0
 
 require (
 	github.com/dgraph-io/badger v1.6.2
-	github.com/ipfs/bbloom v0.0.4
 	github.com/ipfs/boxo v0.29.1
 	github.com/ipfs/go-cid v0.5.0
 	github.com/ipfs/go-datastore v0.8.2
@@ -15,7 +14,6 @@ require (
 	github.com/ipfs/go-log/v2 v2.5.1
 	github.com/libp2p/go-libp2p-pubsub v0.13.0
 	github.com/multiformats/go-multihash v0.2.3
-	github.com/pkg/errors v0.9.1
 	go.uber.org/multierr v1.11.0
 	google.golang.org/protobuf v1.36.5
 )
@@ -33,6 +31,7 @@ require (
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+	github.com/ipfs/bbloom v0.0.4 // indirect
 	github.com/ipfs/go-block-format v0.2.0 // indirect
 	github.com/ipfs/go-detect-race v0.0.1 // indirect
 	github.com/ipfs/go-ipfs-util v0.0.3 // indirect
@@ -55,6 +54,7 @@ require (
 	github.com/multiformats/go-multicodec v0.9.0 // indirect
 	github.com/multiformats/go-multistream v0.6.0 // indirect
 	github.com/multiformats/go-varint v0.0.7 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/polydawn/refmt v0.89.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
