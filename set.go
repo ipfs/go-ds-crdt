@@ -184,22 +184,35 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 		KeysOnly: false,
 	}
 
-	// send the result and returns false if we must exit
-	sendResult := func(qctx context.Context, output chan<- query.Result, r query.Result) bool {
+	// send the result and returns false if we must exit.
+	sendResult := func(ctx, qctx context.Context, r query.Result, out chan<- query.Result) bool {
 		select {
-		case output <- r:
+		case out <- r:
+		case <-ctx.Done():
+			return false
 		case <-qctx.Done():
 			return false
 		}
 		return r.Error == nil
 	}
 
-	// The code below is very inspired in the Query implementation in
+	// The code below was very inspired in the Query implementation in
 	// flatfs.
-	return query.ResultsWithContext(q, func(qctx context.Context, output chan<- query.Result) {
+
+	// Originally we were able to set the output channel capacity and it
+	// was set to 128 even though not much difference to 1 could be
+	// observed on mem-based testing.
+
+	// Using KeysOnly still gives a 128-item channel.
+	// See: https://github.com/ipfs/go-datastore/issues/40
+	r := query.ResultsWithContext(q, func(qctx context.Context, out chan<- query.Result) {
+		// qctx is a Background context for the query. It is not
+		// associated to ctx. It is closed when this function finishes
+		// along with the output channel, or when the Results are
+		// Closed directly.
 		results, err := s.store.Query(ctx, setQuery)
 		if err != nil {
-			sendResult(qctx, output, query.Result{Error: err})
+			sendResult(ctx, qctx, query.Result{Error: err}, out)
 			return
 		}
 		defer results.Close()
@@ -207,7 +220,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 		var entry query.Entry
 		for r := range results.Next() {
 			if r.Error != nil {
-				sendResult(qctx, output, query.Result{Error: r.Error})
+				sendResult(ctx, qctx, query.Result{Error: r.Error}, out)
 				return
 			}
 
@@ -238,11 +251,13 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 				entry.Size = -1
 				entry.Value = nil
 			}
-			if !sendResult(qctx, output, query.Result{Entry: entry}) {
+			if !sendResult(ctx, qctx, query.Result{Entry: entry}, out) {
 				return
 			}
 		}
-	}), nil
+	})
+
+	return r, nil
 }
 
 // InSet returns true if the key belongs to one of the elements in the "elems"
