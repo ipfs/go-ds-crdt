@@ -242,11 +242,6 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			entry.Value = r.Value
 			entry.Size = r.Size
 			entry.Expiration = r.Expiration
-			has, err := s.checkNotTombstoned(ctx, key)
-			if err != nil {
-				sendResult(ctx, qctx, query.Result{Error: err}, out)
-				return
-			}
 
 			// The fact that /v is set means it is not tombstoned,
 			// as tombstoning removes /v and /p or sets them to
