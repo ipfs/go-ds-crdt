@@ -1,6 +1,7 @@
 package crdt
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -12,7 +13,7 @@ import (
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
-	"github.com/ipfs/go-ipld-format"
+	format "github.com/ipfs/go-ipld-format"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -42,6 +43,14 @@ func setupTestEnv(t *testing.T) (*Datastore, Peer, format.DAGService, func()) {
 		cancel()
 	}
 	return store, h, dagService, cleanup
+}
+
+func requireReplicaHasKey(t *testing.T, ctx context.Context, replica *Datastore, key ds.Key, value []byte) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		v, err := replica.Get(ctx, key)
+		return err == nil && bytes.Equal(v, value)
+	}, 15*time.Second, 500*time.Millisecond)
 }
 
 func TestCompactAndTruncateDeltaDAG(t *testing.T) {
@@ -382,4 +391,137 @@ func TestTriggerSnapshot(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return replicas[0].InternalStats(ctx).State.Snapshot != nil
 	}, 15*time.Second, 500*time.Millisecond)
+}
+
+func TestCompactChoosesAppropriateCompactionPoint(t *testing.T) {
+	ctx := context.Background()
+	o := DefaultOptions()
+	o.CompactDagSize = 7
+	o.CompactRetainNodes = 2
+	o.CompactInterval = 5 * time.Second
+
+	replicas, closeReplicas := makeNReplicas(t, 2, o)
+	defer closeReplicas()
+
+	// DAG node A
+	require.NoError(t, replicas[0].Put(ctx, ds.NewKey("k1"), []byte("v1")))
+
+	// Wait until replica 1 also sees node A
+
+	requireReplicaHasKey(t, ctx, replicas[1], ds.NewKey("k1"), []byte("v1"))
+
+	// All peers should have a DAG height of 1 and only 1 head (key k1)
+	for i := 0; i < 2; i++ {
+		require.Equal(t, uint64(1), replicas[i].InternalStats(ctx).MaxHeight)
+		require.Equal(t, 1, len(replicas[i].InternalStats(ctx).Heads))
+	}
+
+	br0 := replicas[0].broadcaster.(*mockBroadcaster)
+	br1 := replicas[1].broadcaster.(*mockBroadcaster)
+
+	// Turn off communication between both peers
+	br0.dropProb.Store(101)
+	br1.dropProb.Store(101)
+
+	require.NoError(t, replicas[0].Put(ctx, ds.NewKey("k2"), []byte("v2")))                 // DAG node C
+	require.NoError(t, replicas[0].Put(ctx, ds.NewKey("k3"), []byte("v3-GreaterPriority"))) // DAG node E
+
+	require.NoError(t, replicas[1].Put(ctx, ds.NewKey("k3"), []byte("v3-LowerPriority"))) // DAG node B
+	require.NoError(t, replicas[1].Put(ctx, ds.NewKey("k4"), []byte("v4")))               // DAG node D
+
+	// Assert that replica 0 knows about value v3-GreaterPriority
+	v, err := replicas[0].Get(ctx, ds.NewKey("k3"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3-GreaterPriority"), v)
+
+	// Assert that replica 1 knows about value v3-LowerPriority
+	v, err = replicas[1].Get(ctx, ds.NewKey("k3"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3-LowerPriority"), v)
+
+	// Partially turn on communication, only from replica 0 to replica 1
+	br0.dropProb.Store(0)
+	br1.dropProb.Store(101)
+
+	// Now replica 1 should see the value v3-GreaterPriority for k3, received from replica 0
+	requireReplicaHasKey(t, ctx, replicas[1], ds.NewKey("k3"), []byte("v3-GreaterPriority"))
+
+	// Turn off all communication again
+	br0.dropProb.Store(101)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Delete k3 from replica 0; this should create a removal delta for the v3-GreaterPriority value only
+	// (and not v3-LowerPriority, since replica 0 doesn't have DAG node B yet)
+	replicas[0].Delete(ctx, ds.NewKey("k3"))
+
+	// Now replica 0 should see no value for k3
+	_, err = replicas[0].Get(ctx, ds.NewKey("k3"))
+	require.Error(t, err, ds.ErrNotFound)
+
+	// Replica 1 should still see v3-GreaterPriority, since it has not received the removal from replica 0 yet
+	v, err = replicas[1].Get(ctx, ds.NewKey("k3"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3-GreaterPriority"), v)
+
+	// Add some more nodes to replica 0's DAG (node I)
+	require.NoError(t, replicas[0].Put(ctx, ds.NewKey("somekey-1"), []byte("somevalue-1")))
+
+	// Add some more nodes to replica 1's DAG (nodes F, H and J)
+	require.NoError(t, replicas[1].Put(ctx, ds.NewKey("somekey-2"), []byte("somevalue-2")))
+	require.NoError(t, replicas[1].Put(ctx, ds.NewKey("somekey-3"), []byte("somevalue-3")))
+	require.NoError(t, replicas[1].Put(ctx, ds.NewKey("somekey-4"), []byte("somevalue-4")))
+
+	// Turn on all communication
+	br0.dropProb.Store(0)
+	br1.dropProb.Store(0)
+
+	// Wait for DAGs in both peers to converge
+	requireReplicaHasKey(t, ctx, replicas[1], ds.NewKey("k3"), []byte("v3-LowerPriority"))
+	requireReplicaHasKey(t, ctx, replicas[0], ds.NewKey("somekey-4"), []byte("somevalue-4"))
+
+	// Add a final key to the top of the DAG
+	require.NoError(t, replicas[0].Put(ctx, ds.NewKey("final-key"), []byte("final-value")))
+	requireReplicaHasKey(t, ctx, replicas[1], ds.NewKey("final-key"), []byte("final-value"))
+
+	// Wait for both DAGs to converge, at which point both should have a height of 7.
+	require.Equal(t, uint64(7), replicas[0].InternalStats(ctx).MaxHeight)
+	require.Equal(t, uint64(7), replicas[1].InternalStats(ctx).MaxHeight)
+
+	// Wait for snapshot to be triggered
+	require.Eventually(t, func() bool {
+		return replicas[0].InternalStats(ctx).State.Snapshot != nil
+	}, 25*time.Second, 500*time.Millisecond, "Replica 0 should generate a snapshot")
+
+	// Since both replicas have converged, both should see the value v3-LowerPriority for k3,
+	// because v3-GreaterPriority was removed by replica 0.
+	requireReplicaHasKey(t, ctx, replicas[0], ds.NewKey("k3"), []byte("v3-LowerPriority"))
+	requireReplicaHasKey(t, ctx, replicas[1], ds.NewKey("k3"), []byte("v3-LowerPriority"))
+
+	// Note that the sub-DAG whose head is the snapshot head contains the DAG nodes that add v3-GreaterPriority
+	// and v3-LowerPriority, but, since v3-GreaterPriority has a greater height, it's chosen as  the best value of k3.
+	//
+	// On the other hand, both replicas converged to v3-LowerPriority, because v3-GreaterPriority was removed by a DAG
+	// node outside of the snapshot.
+	//
+	// If the snapshot only keeps best values, it will contain only v3-GreaterPriority. In that scenario, if a new peer joins
+	// and uses this snapshot, it will have no way to get the v3-LowerPriority value.
+	//
+	// So, the next lines assert that that the v3-LowerPriority value should exist in the snapshot.
+
+	snapshotCidBytes := replicas[0].InternalStats(ctx).State.Snapshot.SnapshotKey.Cid
+
+	snapshotCID, err := cid.Cast(snapshotCidBytes)
+	require.NoError(t, err)
+
+	snapshot, err := ExtractSnapshot(t, ctx, replicas[0].dagService, snapshotCID)
+
+	// Collect snapshot values
+	snapshotValues := make([]string, len(snapshot))
+	for _, v := range snapshot {
+		snapshotValues = append(snapshotValues, v)
+	}
+
+	// Check whether the v3-LowerPriority value exists in the snapshot.
+	require.Contains(t, snapshotValues, "v3-LowerPriority")
 }
