@@ -1749,6 +1749,7 @@ func (store *Datastore) compact() {
 		case <-timer.C:
 			err := store.triggerCompactionIfNeeded(store.ctx)
 			if err != nil {
+				store.logger.Errorf("Error during compaction: %v", err)
 				//todo
 			}
 		}
