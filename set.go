@@ -8,8 +8,6 @@ import (
 	"strings"
 	"sync"
 
-	dshelp "github.com/ipfs/boxo/datastore/dshelp"
-	cid "github.com/ipfs/go-cid"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
@@ -143,7 +141,13 @@ func (s *set) Element(ctx context.Context, key string) ([]byte, error) {
 	if err != nil { // not found is fine, we just return it
 		return value, err
 	}
-	return value, nil
+
+	_, v, err := decodeValue(value)
+	if err != nil { // not found is fine, we just return it
+		return value, err
+	}
+
+	return v, nil
 }
 
 // Elements returns all the elements in the set.
@@ -250,7 +254,12 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			)
 
 			entry.Key = key
-			entry.Value = r.Value
+			// decode the value
+			_, v, err := decodeValue(r.Value)
+			if err != nil {
+				sendResult(b, p, query.Result{Error: err})
+			}
+			entry.Value = v
 			entry.Size = r.Size
 			entry.Expiration = r.Expiration
 
@@ -306,20 +315,19 @@ func (s *set) priorityKey(key string) ds.Key {
 }
 
 func (s *set) getPriority(ctx context.Context, key string) (uint64, error) {
-	prioK := s.priorityKey(key)
-	data, err := s.store.Get(ctx, prioK)
+	valueK := s.valueKey(key)
+	data, err := s.store.Get(ctx, valueK)
 	if err != nil {
 		if err == ds.ErrNotFound {
 			return 0, nil
 		}
 		return 0, err
 	}
-
-	prio, n := binary.Uvarint(data)
-	if n <= 0 {
-		return prio, errors.New("error decoding priority")
+	prio, _, err := decodeValue(data)
+	if err != nil {
+		return 0, err
 	}
-	return prio - 1, nil
+	return prio, nil
 }
 
 func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, prio uint64) error {
@@ -336,43 +344,40 @@ func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, 
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
 func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, prio uint64) error {
-	// If this key was tombstoned already, do not store/update the value.
+	// Do not update if this delta has been tombstoned.
 	deleted, err := s.inTombsKeyID(ctx, key, id)
 	if err != nil || deleted {
 		return err
 	}
 
-	curPrio, err := s.getPriority(ctx, key)
-	if err != nil {
+	// Encode the candidate value.
+	newEncoded := encodeValue(prio, value)
+	valueK := s.valueKey(key)
+	curEncoded, err := s.store.Get(ctx, valueK)
+	if err != nil && err != ds.ErrNotFound {
 		return err
 	}
-
-	if prio < curPrio {
-		return nil
-	}
-	valueK := s.valueKey(key)
-
-	if prio == curPrio {
-		curValue, _ := s.store.Get(ctx, valueK)
-		// new value greater than old
-		if bytes.Compare(curValue, value) >= 0 {
+	if err == nil {
+		curPrio, curVal, err := decodeValue(curEncoded)
+		if err != nil {
+			return err
+		}
+		// Only update if the new candidate has higher priority or,
+		// when equal, a lexicographically greater value.
+		if prio < curPrio {
+			return nil
+		}
+		if prio == curPrio && bytes.Compare(curVal, value) >= 0 {
 			return nil
 		}
 	}
 
-	// store value
-	err = writeStore.Put(ctx, valueK, value)
-	if err != nil {
+	// Store the new “best” encoded value.
+	if err = writeStore.Put(ctx, valueK, newEncoded); err != nil {
 		return err
 	}
 
-	// store priority
-	err = s.setPriority(ctx, writeStore, key, prio)
-	if err != nil {
-		return err
-	}
-
-	// trigger add hook
+	// Trigger the add hook with the original (unencoded) value.
 	s.putHook(key, value)
 	return nil
 }
@@ -382,11 +387,10 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 // and returns the value with the highest priority that is not tombstoned nor
 // about to be tombstoned.
 func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []string) ([]byte, uint64, error) {
-	// /namespace/elems/<key>
 	prefix := s.elemsPrefix(key)
 	q := query.Query{
 		Prefix:   prefix.String(),
-		KeysOnly: true,
+		KeysOnly: false,
 	}
 
 	results, err := s.store.Query(ctx, q)
@@ -397,33 +401,24 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 
 	var bestValue []byte
 	var bestPriority uint64
-	var deltaCid cid.Cid
-	ng := crdtNodeGetter{NodeGetter: s.dagService}
 
-	// range all the /namespace/elems/<key>/<block_cid>.
 NEXT:
 	for r := range results.Next() {
 		if r.Error != nil {
-			return nil, 0, err
+			return nil, 0, r.Error
 		}
 
 		id := strings.TrimPrefix(r.Key, prefix.String())
 		if !ds.RawKey(id).IsTopLevel() {
-			// our prefix matches blocks from other keys i.e. our
-			// prefix is "hello" and we have a different key like
-			// "hello/bye" so we have a block id like
-			// "bye/<block>". If we got the right key, then the id
-			// should be the block id only.
 			continue
 		}
-		// if block is one of the pending tombIDs, continue
+
 		for _, tombID := range pendingTombIDs {
 			if tombID == id {
 				continue NEXT
 			}
 		}
 
-		// if tombstoned, continue
 		inTomb, err := s.inTombsKeyID(ctx, key, id)
 		if err != nil {
 			return nil, 0, err
@@ -432,45 +427,28 @@ NEXT:
 			continue
 		}
 
-		// get the block
-		mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+		// Instead of doing a block lookup for the delta, we simply read the
+		// encoded candidate value stored in the elems entry.
+		candidateEncoded := r.Value
+		if candidateEncoded == nil {
+			continue
+		}
+		candidatePrio, candidateVal, err := decodeValue(candidateEncoded)
 		if err != nil {
 			return nil, 0, err
 		}
-		deltaCid = cid.NewCidV1(cid.DagProtobuf, mhash)
-		_, delta, err := ng.GetDelta(ctx, deltaCid)
-		if err != nil {
-			return nil, 0, err
-		}
 
-		// discard this delta.
-		if delta.Priority < bestPriority {
+		if candidatePrio < bestPriority {
 			continue
 		}
-
-		// When equal priority, choose the greatest among values in
-		// the delta and current. When higher priority, choose the
-		// greatest only among those in the delta.
-		var greatestValueInDelta []byte
-		for _, elem := range delta.GetElements() {
-			if elem.GetKey() != key {
-				continue
-			}
-			v := elem.GetValue()
-			if bytes.Compare(greatestValueInDelta, v) < 0 {
-				greatestValueInDelta = v
-			}
-		}
-
-		if delta.Priority > bestPriority {
-			bestValue = greatestValueInDelta
-			bestPriority = delta.Priority
+		if candidatePrio > bestPriority {
+			bestPriority = candidatePrio
+			bestValue = candidateVal
 			continue
 		}
-
-		// equal priority
-		if bytes.Compare(bestValue, greatestValueInDelta) < 0 {
-			bestValue = greatestValueInDelta
+		// If equal priority, choose the lexicographically greater value.
+		if bytes.Compare(bestValue, candidateVal) < 0 {
+			bestValue = candidateVal
 		}
 	}
 
@@ -496,8 +474,7 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 
 	var store ds.Write = s.store
 	var err error
-	batchingDs, batching := store.(ds.Batching)
-	if batching {
+	if batchingDs, ok := store.(ds.Batching); ok {
 		store, err = batchingDs.Batch(ctx)
 		if err != nil {
 			return err
@@ -505,27 +482,26 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 	}
 
 	for _, e := range elems {
-		e.Id = id // overwrite the identifier as it would come unset
+		e.Id = id // overwrite the identifier if not set
 		key := e.GetKey()
-		// /namespace/elems/<key>/<id>
+		// Write into /namespace/elems/<key>/<id> the encoded candidate value.
 		k := s.elemsPrefix(key).ChildString(id)
-		err := store.Put(ctx, k, nil)
-		if err != nil {
+
+		v := e.GetValue()
+
+		candidateEncoded := encodeValue(prio, v)
+		if err := store.Put(ctx, k, candidateEncoded); err != nil {
 			return err
 		}
 
-		// update the value if applicable:
-		// * higher priority than we currently have.
-		// * not tombstoned before.
-		err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
-		if err != nil {
+		// Update the best value for this key if needed.
+		if err := s.setValue(ctx, store, key, id, e.GetValue(), prio); err != nil {
 			return err
 		}
 	}
 
-	if batching {
-		err := store.(ds.Batch).Commit(ctx)
-		if err != nil {
+	if batchingDs, ok := store.(ds.Batch); ok {
+		if err := batchingDs.Commit(ctx); err != nil {
 			return err
 		}
 	}
@@ -567,7 +543,10 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 			store.Delete(ctx, valueK)
 			store.Delete(ctx, s.priorityKey(key))
 		} else {
-			store.Put(ctx, valueK, v)
+			candidateEncoded := encodeValue(p, v)
+			if err := store.Put(ctx, valueK, candidateEncoded); err != nil {
+				return err
+			}
 			s.setPriority(ctx, store, key, p)
 		}
 
@@ -649,4 +628,19 @@ func (s *set) datastoreSync(ctx context.Context, prefix ds.Key) error {
 	}
 
 	return multierr.Combine(errs...)
+}
+
+func encodeValue(prio uint64, value []byte) []byte {
+	buf := make([]byte, 8+len(value))
+	binary.BigEndian.PutUint64(buf[:8], prio)
+	copy(buf[8:], value)
+	return buf
+}
+
+func decodeValue(encoded []byte) (uint64, []byte, error) {
+	if len(encoded) < 8 {
+		return 0, nil, errors.New("encoded value too short")
+	}
+	prio := binary.BigEndian.Uint64(encoded[:8])
+	return prio, encoded[8:], nil
 }
