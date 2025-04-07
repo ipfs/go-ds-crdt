@@ -11,7 +11,6 @@ import (
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
-	goprocess "github.com/jbenet/goprocess"
 	multierr "go.uber.org/multierr"
 
 	ds "github.com/ipfs/go-datastore"
@@ -189,45 +188,35 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 		KeysOnly: false,
 	}
 
-	// send the result and returns false if we must exit
-	sendResult := func(b *query.ResultBuilder, p goprocess.Process, r query.Result) bool {
+	// send the result and returns false if we must exit.
+	sendResult := func(ctx, qctx context.Context, r query.Result, out chan<- query.Result) bool {
 		select {
-		case b.Output <- r:
-		case <-p.Closing():
+		case out <- r:
+		case <-ctx.Done():
+			return false
+		case <-qctx.Done():
 			return false
 		}
 		return r.Error == nil
 	}
 
-	// The code below is very inspired in the Query implementation in
+	// The code below was very inspired in the Query implementation in
 	// flatfs.
 
-	// NewResultBuilder(q) gives us a ResultBuilder with a channel of
-	// capacity 1 when using KeysOnly = false, and 128 otherwise.
-	//
-	// Having a 128-item buffered channel was an improvement to speed up
-	// keys-only queries, but there is no explanation on how other
-	// non-key only queries would improve.
-	// See: https://github.com/ipfs/go-datastore/issues/40
-	//
-	// I do not see a huge noticeable improvement when forcing a 128 with
-	// in-mem stores, but I also don't see how some leeway can make things
-	// worse (real-world testing suggest it is not horrible at least).
-	//
-	// b := query.NewResultBuilder(q)
-	b := &query.ResultBuilder{
-		Query:  q,
-		Output: make(chan query.Result, 128),
-	}
-	b.Process = goprocess.WithTeardown(func() error {
-		close(b.Output)
-		return nil
-	})
+	// Originally we were able to set the output channel capacity and it
+	// was set to 128 even though not much difference to 1 could be
+	// observed on mem-based testing.
 
-	b.Process.Go(func(p goprocess.Process) {
+	// Using KeysOnly still gives a 128-item channel.
+	// See: https://github.com/ipfs/go-datastore/issues/40
+	r := query.ResultsWithContext(q, func(qctx context.Context, out chan<- query.Result) {
+		// qctx is a Background context for the query. It is not
+		// associated to ctx. It is closed when this function finishes
+		// along with the output channel, or when the Results are
+		// Closed directly.
 		results, err := s.store.Query(ctx, setQuery)
 		if err != nil {
-			sendResult(b, p, query.Result{Error: err})
+			sendResult(ctx, qctx, query.Result{Error: err}, out)
 			return
 		}
 		defer results.Close()
@@ -235,7 +224,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 		var entry query.Entry
 		for r := range results.Next() {
 			if r.Error != nil {
-				sendResult(b, p, query.Result{Error: r.Error})
+				sendResult(ctx, qctx, query.Result{Error: r.Error}, out)
 				return
 			}
 
@@ -257,7 +246,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			// decode the value
 			_, v, err := decodeValue(r.Value)
 			if err != nil {
-				sendResult(b, p, query.Result{Error: err})
+				sendResult(ctx, qctx, query.Result{Error: r.Error}, out)
 			}
 			entry.Value = v
 			entry.Size = r.Size
@@ -271,13 +260,13 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 				entry.Size = -1
 				entry.Value = nil
 			}
-			if !sendResult(b, p, query.Result{Entry: entry}) {
+			if !sendResult(ctx, qctx, query.Result{Entry: entry}, out) {
 				return
 			}
 		}
 	})
-	go b.Process.CloseAfterChildren() //nolint
-	return b.Results(), nil
+
+	return r, nil
 }
 
 // InSet returns true if the key belongs to one of the elements in the "elems"
