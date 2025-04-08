@@ -3,12 +3,12 @@ package crdt
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
-	"github.com/pkg/errors"
 )
 
 // Use this to detect if we need to run migrations.
@@ -66,7 +66,7 @@ func (store *Datastore) applyMigrations(ctx context.Context) error {
 		fallthrough
 
 	case version:
-		store.logger.Infof("CRDT database format v%d")
+		store.logger.Infof("CRDT database format v%d", version)
 		return nil
 	}
 	return nil
