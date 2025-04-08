@@ -102,7 +102,9 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 	}
 
 	if m.onMembershipUpdate != nil {
-		go m.onMembershipUpdate(m.state.Members)
+		go func() {
+			m.onMembershipUpdate(m.GetState().Members)
+		}()
 	}
 
 	return m.Save(ctx)
@@ -127,7 +129,9 @@ func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroa
 	}
 
 	if m.onMembershipUpdate != nil {
-		go m.onMembershipUpdate(m.state.Members)
+		go func() {
+			m.onMembershipUpdate(m.GetState().Members)
+		}()
 	}
 
 	return m.Save(ctx)
