@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ipfs/boxo/blockservice"
+	"github.com/ipfs/boxo/ipld/merkledag"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	mdutils "github.com/ipfs/boxo/ipld/merkledag/test"
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	format "github.com/ipfs/go-ipld-format"
+	ipld "github.com/ipfs/go-ipld-format"
+	log "github.com/ipfs/go-log/v2"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -43,6 +49,111 @@ func setupTestEnv(t *testing.T) (*Datastore, Peer, format.DAGService, func()) {
 		cancel()
 	}
 	return store, h, dagService, cleanup
+}
+
+type testEnv struct {
+	t                 testing.TB
+	mu                sync.Mutex
+	replicas          []*Datastore
+	broadcasters      []*mockBroadcaster
+	replicaBcastChans []chan []byte
+	bs                blockservice.BlockService
+	dagserv           ipld.DAGService
+	ctx               context.Context
+	cancelBcasts      context.CancelFunc
+}
+
+func createTestEnv(t testing.TB) *testEnv {
+	replicas := make([]*Datastore, 0)
+	broadcasters := make([]*mockBroadcaster, 0)
+	bs := mdutils.Bserv()
+	dagserv := merkledag.NewDAGService(bs)
+	bcastChans := make([]chan []byte, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	return &testEnv{
+		t:                 t,
+		ctx:               ctx,
+		replicas:          replicas,
+		broadcasters:      broadcasters,
+		replicaBcastChans: bcastChans,
+		bs:                bs,
+		dagserv:           dagserv,
+		cancelBcasts:      cancel,
+	}
+}
+
+func (env *testEnv) AddReplica(opts *Options) {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+
+	var replicaOpts *Options
+	if opts == nil {
+		replicaOpts = DefaultOptions()
+	} else {
+		copy := *opts
+		replicaOpts = &copy
+	}
+
+	// Index for new replica in repicas list
+	i := len(env.replicas)
+
+	// Set up replica options
+	replicaOpts.Logger = &testLogger{
+		name: fmt.Sprintf("r#%d: ", i),
+		l:    DefaultOptions().Logger,
+	}
+	replicaOpts.RebroadcastInterval = time.Second * 5
+	replicaOpts.NumWorkers = 5
+	replicaOpts.DAGSyncerTimeout = time.Second
+
+	// Create mock broadcaster for the new replica
+
+	myChan := make(chan []byte, 300)
+	env.replicaBcastChans = append(env.replicaBcastChans, myChan)
+	broadcaster := &mockBroadcaster{
+		ctx:      env.ctx,
+		chans:    env.replicaBcastChans,
+		myChan:   myChan,
+		dropProb: &atomic.Int64{},
+		t:        env.t,
+	}
+	env.broadcasters = append(env.broadcasters, broadcaster)
+
+	// Create the new replica
+
+	dagsync := &mockDAGSvc{
+		DAGService: env.dagserv,
+		bs:         env.bs.Blockstore(),
+	}
+	h := newMockPeer(fmt.Sprintf("peer-%d", i))
+	var err error
+	replica, err := New(h, makeStore(env.t, i), env.bs.Blockstore(), ds.NewKey("crdttest"), dagsync, broadcaster, replicaOpts)
+	if err != nil {
+		env.t.Fatal(err)
+	}
+
+	// Add new replica to list of replicas
+	env.replicas = append(env.replicas, replica)
+
+	// Update all replica broadcasters with new list of broadcast channels
+	for i := range env.broadcasters {
+		env.broadcasters[i].chans = env.replicaBcastChans
+	}
+
+	if debug {
+		log.SetLogLevel("crdt", "debug")
+	}
+}
+
+func (env *testEnv) Cleanup() {
+	env.cancelBcasts()
+	for i, r := range env.replicas {
+		err := r.Close()
+		if err != nil {
+			env.t.Error(err)
+		}
+		os.RemoveAll(storeFolder(i))
+	}
 }
 
 func requireReplicaHasKey(t *testing.T, ctx context.Context, replica *Datastore, key ds.Key, value []byte) {
@@ -393,15 +504,20 @@ func TestTriggerSnapshot(t *testing.T) {
 	}, 15*time.Second, 500*time.Millisecond)
 }
 
-func TestCompactChoosesAppropriateCompactionPoint(t *testing.T) {
+func TestSnapshotAllowsLowerPriorityValueToResurface(t *testing.T) {
 	ctx := context.Background()
 	o := DefaultOptions()
 	o.CompactDagSize = 7
 	o.CompactRetainNodes = 2
 	o.CompactInterval = 5 * time.Second
 
-	replicas, closeReplicas := makeNReplicas(t, 2, o)
-	defer closeReplicas()
+	env := createTestEnv(t)
+	defer env.Cleanup()
+
+	env.AddReplica(o)
+	env.AddReplica(o)
+
+	replicas := env.replicas
 
 	// DAG node A
 	require.NoError(t, replicas[0].Put(ctx, ds.NewKey("k1"), []byte("v1")))
@@ -498,30 +614,17 @@ func TestCompactChoosesAppropriateCompactionPoint(t *testing.T) {
 	requireReplicaHasKey(t, ctx, replicas[0], ds.NewKey("k3"), []byte("v3-LowerPriority"))
 	requireReplicaHasKey(t, ctx, replicas[1], ds.NewKey("k3"), []byte("v3-LowerPriority"))
 
-	// Note that the sub-DAG whose head is the snapshot head contains the DAG nodes that add v3-GreaterPriority
-	// and v3-LowerPriority, but, since v3-GreaterPriority has a greater height, it's chosen as  the best value of k3.
-	//
-	// On the other hand, both replicas converged to v3-LowerPriority, because v3-GreaterPriority was removed by a DAG
-	// node outside of the snapshot.
-	//
-	// If the snapshot only keeps best values, it will contain only v3-GreaterPriority. In that scenario, if a new peer joins
-	// and uses this snapshot, it will have no way to get the v3-LowerPriority value.
-	//
-	// So, the next lines assert that that the v3-LowerPriority value should exist in the snapshot.
+	// Now we add a new replica, wait for it to restore its state from the snapshot and verify
+	// that it correctly contains v3-LowerPriority.
 
-	snapshotCidBytes := replicas[0].InternalStats(ctx).State.Snapshot.SnapshotKey.Cid
+	// Add replica 2
+	env.AddReplica(o)
 
-	snapshotCID, err := cid.Cast(snapshotCidBytes)
-	require.NoError(t, err)
+	// Wait for it to get snapshot.
+	require.Eventually(t, func() bool {
+		return env.replicas[2].InternalStats(ctx).State.Snapshot != nil
+	}, 25*time.Second, 500*time.Millisecond, "Replica 2 should eventually restore snapshot")
 
-	snapshot, err := ExtractSnapshot(t, ctx, replicas[0].dagService, snapshotCID)
-
-	// Collect snapshot values
-	snapshotValues := make([]string, len(snapshot))
-	for _, v := range snapshot {
-		snapshotValues = append(snapshotValues, v)
-	}
-
-	// Check whether the v3-LowerPriority value exists in the snapshot.
-	require.Contains(t, snapshotValues, "v3-LowerPriority")
+	// Wait for it to see the value v3-LowerPriority for k3
+	requireReplicaHasKey(t, ctx, env.replicas[2], ds.NewKey("k3"), []byte("v3-LowerPriority"))
 }
