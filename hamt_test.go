@@ -1,18 +1,23 @@
 package crdt
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ipfs/boxo/blockservice"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	mdutils "github.com/ipfs/boxo/ipld/merkledag/test"
 	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
-	"github.com/ipfs/go-ipld-format"
+	format "github.com/ipfs/go-ipld-format"
+	log "github.com/ipfs/go-log/v2"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -42,6 +47,119 @@ func setupTestEnv(t *testing.T) (*Datastore, Peer, format.DAGService, func()) {
 		cancel()
 	}
 	return store, h, dagService, cleanup
+}
+
+type testEnv struct {
+	t                 testing.TB
+	mu                sync.Mutex
+	replicas          []*Datastore
+	broadcasters      []*mockBroadcaster
+	replicaBcastChans []chan []byte
+	bs                blockservice.BlockService
+	dagserv           format.DAGService
+	ctx               context.Context
+	cancelBcasts      context.CancelFunc
+}
+
+func createTestEnv(t testing.TB) *testEnv {
+	replicas := make([]*Datastore, 0)
+	broadcasters := make([]*mockBroadcaster, 0)
+	bs := mdutils.Bserv()
+	dagserv := dag.NewDAGService(bs)
+	bcastChans := make([]chan []byte, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	return &testEnv{
+		t:                 t,
+		ctx:               ctx,
+		replicas:          replicas,
+		broadcasters:      broadcasters,
+		replicaBcastChans: bcastChans,
+		bs:                bs,
+		dagserv:           dagserv,
+		cancelBcasts:      cancel,
+	}
+}
+
+func (env *testEnv) AddReplica(opts *Options) {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+
+	var replicaOpts *Options
+	if opts == nil {
+		replicaOpts = DefaultOptions()
+	} else {
+		copy := *opts
+		replicaOpts = &copy
+	}
+
+	// Index for new replica in replicas list
+	i := len(env.replicas)
+
+	// Set up replica options
+	replicaOpts.Logger = &testLogger{
+		name: fmt.Sprintf("r#%d: ", i),
+		l:    DefaultOptions().Logger,
+	}
+	replicaOpts.RebroadcastInterval = time.Second * 5
+	replicaOpts.NumWorkers = 5
+	replicaOpts.DAGSyncerTimeout = time.Second
+
+	// Create mock broadcaster for the new replica
+
+	myChan := make(chan []byte, 300)
+	env.replicaBcastChans = append(env.replicaBcastChans, myChan)
+	broadcaster := &mockBroadcaster{
+		ctx:      env.ctx,
+		chans:    env.replicaBcastChans,
+		myChan:   myChan,
+		dropProb: &atomic.Int64{},
+		t:        env.t,
+	}
+	env.broadcasters = append(env.broadcasters, broadcaster)
+
+	// Create the new replica
+
+	dagsync := &mockDAGSvc{
+		DAGService: env.dagserv,
+		bs:         env.bs.Blockstore(),
+	}
+	h := newMockPeer(fmt.Sprintf("peer-%d", i))
+	var err error
+	replica, err := New(h, makeStore(env.t, i), env.bs.Blockstore(), ds.NewKey("crdttest"), dagsync, broadcaster, replicaOpts)
+	if err != nil {
+		env.t.Fatal(err)
+	}
+
+	// Add new replica to list of replicas
+	env.replicas = append(env.replicas, replica)
+
+	// Update all replica broadcasters with new list of broadcast channels
+	for i := range env.broadcasters {
+		env.broadcasters[i].chans = env.replicaBcastChans
+	}
+
+	if debug {
+		log.SetLogLevel("crdt", "debug")
+	}
+}
+
+func (env *testEnv) Cleanup() {
+	env.cancelBcasts()
+	for i, r := range env.replicas {
+		err := r.Close()
+		if err != nil {
+			env.t.Error(err)
+		}
+		os.RemoveAll(storeFolder(i))
+	}
+}
+
+func requireReplicaHasKey(t *testing.T, ctx context.Context, replica *Datastore, key ds.Key, value []byte) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		v, err := replica.Get(ctx, key)
+		return err == nil && bytes.Equal(v, value)
+	}, 15*time.Second, 500*time.Millisecond)
 }
 
 func TestCompactAndTruncateDeltaDAG(t *testing.T) {
@@ -382,4 +500,127 @@ func TestTriggerSnapshot(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return replicas[0].InternalStats(ctx).State.Snapshot != nil
 	}, 15*time.Second, 500*time.Millisecond)
+}
+
+func TestSnapshotAllowsLowerPriorityValueToResurface(t *testing.T) {
+	ctx := context.Background()
+	o := DefaultOptions()
+	o.CompactDagSize = 7
+	o.CompactRetainNodes = 2
+	o.CompactInterval = 5 * time.Second
+
+	env := createTestEnv(t)
+	defer env.Cleanup()
+
+	env.AddReplica(o)
+	env.AddReplica(o)
+
+	// DAG node A
+	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("k1"), []byte("v1")))
+
+	// Wait until replica 1 also sees node A
+
+	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("k1"), []byte("v1"))
+
+	// All peers should have a DAG height of 1 and only 1 head (key k1)
+	for i := 0; i < 2; i++ {
+		require.Equal(t, uint64(1), env.replicas[i].InternalStats(ctx).MaxHeight)
+		require.Equal(t, 1, len(env.replicas[i].InternalStats(ctx).Heads))
+	}
+
+	br0 := env.replicas[0].broadcaster.(*mockBroadcaster)
+	br1 := env.replicas[1].broadcaster.(*mockBroadcaster)
+
+	// Turn off communication between both peers
+	br0.dropProb.Store(101)
+	br1.dropProb.Store(101)
+
+	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("k2"), []byte("v2")))                 // DAG node C
+	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("k3"), []byte("v3-GreaterPriority"))) // DAG node E
+
+	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("k3"), []byte("v3-LowerPriority"))) // DAG node B
+	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("k4"), []byte("v4")))               // DAG node D
+
+	// Assert that replica 0 knows about value v3-GreaterPriority
+	v, err := env.replicas[0].Get(ctx, ds.NewKey("k3"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3-GreaterPriority"), v)
+
+	// Assert that replica 1 knows about value v3-LowerPriority
+	v, err = env.replicas[1].Get(ctx, ds.NewKey("k3"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3-LowerPriority"), v)
+
+	// Partially turn on communication, only from replica 0 to replica 1
+	br0.dropProb.Store(0)
+	br1.dropProb.Store(101)
+
+	// Now replica 1 should see the value v3-GreaterPriority for k3, received from replica 0
+	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("k3"), []byte("v3-GreaterPriority"))
+
+	// Turn off all communication again
+	br0.dropProb.Store(101)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Delete k3 from replica 0; this should create a removal delta for the v3-GreaterPriority value only
+	// (and not v3-LowerPriority, since replica 0 doesn't have DAG node B yet)
+	env.replicas[0].Delete(ctx, ds.NewKey("k3"))
+
+	// Now replica 0 should see no value for k3
+	_, err = env.replicas[0].Get(ctx, ds.NewKey("k3"))
+	require.Error(t, err, ds.ErrNotFound)
+
+	// Replica 1 should still see v3-GreaterPriority, since it has not received the removal from replica 0 yet
+	v, err = env.replicas[1].Get(ctx, ds.NewKey("k3"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3-GreaterPriority"), v)
+
+	// Add some more nodes to replica 0's DAG (node I)
+	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("somekey-1"), []byte("somevalue-1")))
+
+	// Add some more nodes to replica 1's DAG (nodes F, H and J)
+	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("somekey-2"), []byte("somevalue-2")))
+	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("somekey-3"), []byte("somevalue-3")))
+	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("somekey-4"), []byte("somevalue-4")))
+
+	// Turn on all communication
+	br0.dropProb.Store(0)
+	br1.dropProb.Store(0)
+
+	// Wait for DAGs in both peers to converge
+	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("k3"), []byte("v3-LowerPriority"))
+	requireReplicaHasKey(t, ctx, env.replicas[0], ds.NewKey("somekey-4"), []byte("somevalue-4"))
+
+	// Add a final key to the top of the DAG
+	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("final-key"), []byte("final-value")))
+	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("final-key"), []byte("final-value"))
+
+	// Wait for both DAGs to converge, at which point both should have a height of 7.
+	require.Equal(t, uint64(7), env.replicas[0].InternalStats(ctx).MaxHeight)
+	require.Equal(t, uint64(7), env.replicas[1].InternalStats(ctx).MaxHeight)
+
+	// Wait for snapshot to be triggered
+	require.Eventually(t, func() bool {
+		return env.replicas[0].InternalStats(ctx).State.Snapshot != nil
+	}, 25*time.Second, 500*time.Millisecond, "Replica 0 should generate a snapshot")
+
+	// Since both replicas have converged, both should see the value v3-LowerPriority for k3,
+	// because v3-GreaterPriority was removed by replica 0.
+	requireReplicaHasKey(t, ctx, env.replicas[0], ds.NewKey("k3"), []byte("v3-LowerPriority"))
+	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("k3"), []byte("v3-LowerPriority"))
+
+	// Now we add a new replica, wait for it to restore its state from the snapshot and verify
+	// that it correctly contains v3-LowerPriority.
+
+	// Add replica 2
+	env.AddReplica(o)
+
+	// Wait for it to get snapshot.
+	require.Eventually(t, func() bool {
+		return env.replicas[2].InternalStats(ctx).State.Snapshot != nil
+	}, 25*time.Second, 500*time.Millisecond, "Replica 2 should eventually restore snapshot")
+
+	// Wait for it to see the value v3-LowerPriority for k3
+	requireReplicaHasKey(t, ctx, env.replicas[2], ds.NewKey("k3"), []byte("v3-LowerPriority"))
 }
