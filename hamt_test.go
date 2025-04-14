@@ -259,15 +259,15 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	k := ds.NewKey("k1")
 	k2 := ds.NewKey("k2")
 
-	// Step 3: Populate Replica 0 with a significant number of key updates to ensure compaction
+	// Step 3: Modify `k1` multiple times to simulate realistic updates
+	require.NoError(t, replicas[0].Put(ctx, k, []byte("v1")))
+	require.NoError(t, replicas[0].Put(ctx, k, []byte("v2")))
+
+	// Step 4: Populate Replica 0 with a significant number of key updates to ensure compaction
 	for i := 1; i <= 60; i++ { // 60 operations to ensure we pass the compaction threshold
 		key := ds.NewKey(fmt.Sprintf("key-%d", i))
 		require.NoError(t, replicas[0].Put(ctx, key, []byte(fmt.Sprintf("value-%d", i))))
 	}
-
-	// Step 4: Modify `k1` multiple times to simulate realistic updates
-	require.NoError(t, replicas[0].Put(ctx, k, []byte("v1")))
-	require.NoError(t, replicas[0].Put(ctx, k, []byte("v2")))
 
 	// Ensure at least one more key exists before compaction
 	require.NoError(t, replicas[0].Put(ctx, k2, []byte("v1")))
