@@ -3,6 +3,7 @@ package crdt
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -162,6 +163,14 @@ func requireReplicaHasKey(t *testing.T, ctx context.Context, replica *Datastore,
 	}, 15*time.Second, 500*time.Millisecond)
 }
 
+func requireReplicaDoesNotHaveKey(t *testing.T, ctx context.Context, replica *Datastore, key ds.Key, msgAndArgs ...interface{}) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		_, err := replica.Get(ctx, key)
+		return errors.Is(err, ds.ErrNotFound)
+	}, 15*time.Second, 500*time.Millisecond, msgAndArgs...)
+}
+
 func TestCompactAndTruncateDeltaDAG(t *testing.T) {
 	ctx := context.Background()
 	store, h, dagService, cleanup := setupTestEnv(t)
@@ -273,7 +282,10 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	require.NoError(t, replicas[0].Put(ctx, k2, []byte("v1")))
 
 	// Step 5: Wait for compaction to trigger automatically
-	time.Sleep(10 * time.Second) // Ensure automatic compaction runs
+	require.Eventually(t, func() bool {
+		return replicas[0].InternalStats(ctx).State.Snapshot != nil &&
+			replicas[0].InternalStats(ctx).State.Snapshot.SnapshotKey != nil
+	}, 1*time.Minute, 500*time.Millisecond, "Replica 0 should have created a snapshot")
 
 	// Fetch the snapshot that was created
 	s := replicas[0].InternalStats(ctx).State
@@ -283,12 +295,14 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	br0.dropProb.Store(0)
 	br1.dropProb.Store(0)
 
-	time.Sleep(10 * time.Second) // Allow time for state synchronization
+	// Wait for snapshot to be present in replica 1
+	require.Eventually(t, func() bool {
+		return replicas[1].InternalStats(ctx).State.Snapshot != nil &&
+			replicas[1].InternalStats(ctx).State.Snapshot.SnapshotKey != nil
+	}, 1*time.Minute, 500*time.Millisecond, "Replica 1 should have gotten a snapshot")
 
 	// Step 7: Verify that key `k1` now exists in Replica 1 with the last known value
-	val, err := replicas[1].Get(ctx, k)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v2"), val)
+	requireReplicaHasKey(t, ctx, replicas[1], k, []byte("v2"))
 
 	// Step 8: Delete `k1` in Replica 1
 	require.NoError(t, replicas[1].Delete(ctx, k))
@@ -296,11 +310,10 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	// Step 9: Allow synchronization and verify deletion in both replicas
 	time.Sleep(10 * time.Second)
 
-	_, err = replicas[1].Get(ctx, k)
+	_, err := replicas[1].Get(ctx, k)
 	require.ErrorIs(t, err, ds.ErrNotFound, "Key should not exist in Replica 1")
 
-	_, err = replicas[0].Get(ctx, k)
-	require.ErrorIs(t, err, ds.ErrNotFound, "Key should not exist in Replica 0")
+	requireReplicaDoesNotHaveKey(t, ctx, replicas[0], k, "Key should not exist in Replica 0")
 
 	closeReplicas()
 }
