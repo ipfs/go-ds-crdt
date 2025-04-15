@@ -253,69 +253,60 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 	opts.CompactRetainNodes = 10 // Retain the last 10 nodes after compaction
 	opts.CompactInterval = 5 * time.Second
 
-	replicas, closeReplicas := makeNReplicas(t, 2, opts)
-	defer closeReplicas()
+	env := createTestEnv(t)
+	defer env.Cleanup()
+
+	env.AddReplica(opts)
 
 	ctx := context.Background()
-
-	// Step 2: Simulate a network partition by preventing message exchange
-	br0 := replicas[0].broadcaster.(*mockBroadcaster)
-	br0.dropProb.Store(101)
-
-	br1 := replicas[1].broadcaster.(*mockBroadcaster)
-	br1.dropProb.Store(101)
 
 	k := ds.NewKey("k1")
 	k2 := ds.NewKey("k2")
 
-	// Step 3: Modify `k1` multiple times to simulate realistic updates
-	require.NoError(t, replicas[0].Put(ctx, k, []byte("v1")))
-	require.NoError(t, replicas[0].Put(ctx, k, []byte("v2")))
+	// Modify `k1` multiple times to simulate realistic updates
+	require.NoError(t, env.replicas[0].Put(ctx, k, []byte("v1")))
+	require.NoError(t, env.replicas[0].Put(ctx, k, []byte("v2")))
 
-	// Step 4: Populate Replica 0 with a significant number of key updates to ensure compaction
+	// Populate Replica 0 with a significant number of key updates to ensure compaction
 	for i := 1; i <= 60; i++ { // 60 operations to ensure we pass the compaction threshold
 		key := ds.NewKey(fmt.Sprintf("key-%d", i))
-		require.NoError(t, replicas[0].Put(ctx, key, []byte(fmt.Sprintf("value-%d", i))))
+		require.NoError(t, env.replicas[0].Put(ctx, key, []byte(fmt.Sprintf("value-%d", i))))
 	}
 
 	// Ensure at least one more key exists before compaction
-	require.NoError(t, replicas[0].Put(ctx, k2, []byte("v1")))
+	require.NoError(t, env.replicas[0].Put(ctx, k2, []byte("v1")))
 
-	// Step 5: Wait for compaction to trigger automatically
+	// Wait for compaction to trigger automatically
 	require.Eventually(t, func() bool {
-		return replicas[0].InternalStats(ctx).State.Snapshot != nil &&
-			replicas[0].InternalStats(ctx).State.Snapshot.SnapshotKey != nil
+		return env.replicas[0].InternalStats(ctx).State.Snapshot != nil &&
+			env.replicas[0].InternalStats(ctx).State.Snapshot.SnapshotKey != nil
 	}, 1*time.Minute, 500*time.Millisecond, "Replica 0 should have created a snapshot")
 
 	// Fetch the snapshot that was created
-	s := replicas[0].InternalStats(ctx).State
+	s := env.replicas[0].InternalStats(ctx).State
 	require.NotNil(t, s.Snapshot, "Snapshot should have been triggered")
 
-	// Step 6: Restore the snapshot by allowing synchronization (happens automatically)
-	br0.dropProb.Store(0)
-	br1.dropProb.Store(0)
+	// Add new replica, which should eventually restore the snapshot automatically
+	env.AddReplica(opts)
 
 	// Wait for snapshot to be present in replica 1
 	require.Eventually(t, func() bool {
-		return replicas[1].InternalStats(ctx).State.Snapshot != nil &&
-			replicas[1].InternalStats(ctx).State.Snapshot.SnapshotKey != nil
+		return env.replicas[1].InternalStats(ctx).State.Snapshot != nil &&
+			env.replicas[1].InternalStats(ctx).State.Snapshot.SnapshotKey != nil
 	}, 1*time.Minute, 500*time.Millisecond, "Replica 1 should have gotten a snapshot")
 
-	// Step 7: Verify that key `k1` now exists in Replica 1 with the last known value
-	requireReplicaHasKey(t, ctx, replicas[1], k, []byte("v2"))
+	// Verify that key `k1` now exists in Replica 1 with the last known value
+	requireReplicaHasKey(t, ctx, env.replicas[1], k, []byte("v2"))
 
-	// Step 8: Delete `k1` in Replica 1
-	require.NoError(t, replicas[1].Delete(ctx, k))
+	// Delete `k1` in Replica 1
+	require.NoError(t, env.replicas[1].Delete(ctx, k))
 
-	// Step 9: Allow synchronization and verify deletion in both replicas
-	time.Sleep(10 * time.Second)
+	// Verify deletion in both replicas
 
-	_, err := replicas[1].Get(ctx, k)
+	_, err := env.replicas[1].Get(ctx, k)
 	require.ErrorIs(t, err, ds.ErrNotFound, "Key should not exist in Replica 1")
 
-	requireReplicaDoesNotHaveKey(t, ctx, replicas[0], k, "Key should not exist in Replica 0")
-
-	closeReplicas()
+	requireReplicaDoesNotHaveKey(t, ctx, env.replicas[0], k, "Key should not exist in Replica 0")
 }
 
 func TestCompactionWithMultipleHeads(t *testing.T) {
