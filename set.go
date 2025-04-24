@@ -367,6 +367,9 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 	}
 
 	// Trigger the add hook with the original (unencoded) value.
+	if s.putHook == nil {
+		return nil
+	}
 	s.putHook(key, value)
 	return nil
 }
@@ -540,8 +543,7 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 
 		// Write tomb into store.
-		k := s.tombsPrefix(key).ChildString(id)
-		err = store.Put(ctx, k, nil)
+		err = s.recordTombstone(ctx, key, id, store)
 		if err != nil {
 			return err
 		}
@@ -554,6 +556,10 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 	}
 
+	if s.deleteHook == nil {
+		return nil
+	}
+
 	// run delete hook only once for all versions of the same element
 	// tombstoned in this delta. Note it may be that the element was not
 	// fully deleted and only a different value took its place.
@@ -561,6 +567,15 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		s.deleteHook(del)
 	}
 
+	return nil
+}
+
+func (s *set) recordTombstone(ctx context.Context, key string, id string, store ds.Write) error {
+	k := s.tombsPrefix(key).ChildString(id)
+	err := store.Put(ctx, k, nil)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
