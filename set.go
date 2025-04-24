@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -343,7 +344,7 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 	newEncoded := encodeValue(prio, value)
 	valueK := s.valueKey(key)
 	curEncoded, err := s.store.Get(ctx, valueK)
-	if err != nil && err != ds.ErrNotFound {
+	if err != nil && !errors.Is(err, ds.ErrNotFound) {
 		return err
 	}
 	if err == nil {
@@ -647,4 +648,47 @@ func decodeValue(encoded []byte) (uint64, []byte, error) {
 	}
 	prio := binary.BigEndian.Uint64(encoded[:8])
 	return prio, encoded[8:], nil
+}
+
+func (s *set) CloneFrom(ctx context.Context, src *set) error {
+	// TODO fire hooks to sync state
+	q := query.Query{
+		Prefix:   "/",
+		KeysOnly: false,
+	}
+
+	results, err := src.store.Query(ctx, q)
+	if err != nil {
+		return fmt.Errorf("failed to query: %w", err)
+	}
+	defer results.Close()
+
+	var store ds.Write = s.store
+	if batchingDs, ok := s.store.(ds.Batching); ok {
+		store, err = batchingDs.Batch(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create batch for dest set: %w", err)
+		}
+	}
+
+	for r := range results.Next() {
+		if r.Error != nil {
+			return fmt.Errorf("error scanning prefix: %w", r.Error)
+		}
+
+		key := s.namespace.ChildString(r.Entry.Key)
+		val := r.Entry.Value
+
+		if err := store.Put(ctx, key, val); err != nil {
+			return fmt.Errorf("failed writing key %s: %w", key.String(), err)
+		}
+	}
+
+	// Commit if we created a batch
+	if batch, ok := store.(ds.Batch); ok {
+		if err := batch.Commit(ctx); err != nil {
+			return fmt.Errorf("failed committing batch: %w", err)
+		}
+	}
+	return nil
 }

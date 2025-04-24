@@ -1,0 +1,11 @@
+syntax = "proto3";
+package crdt.pb;
+import "bcast.proto";
+
+option go_package=".;pb";
+
+message SnapshotInfo {
+  uint64 Height    = 1;         // DAG height at compaction
+  Head DeltaHeadCid = 2;
+
+}
