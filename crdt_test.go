@@ -23,10 +23,12 @@ import (
 	dssync "github.com/ipfs/go-datastore/sync"
 	dstest "github.com/ipfs/go-datastore/test"
 	badgerds "github.com/ipfs/go-ds-badger"
+	"github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/stretchr/testify/require"
 )
 
 var numReplicas = 15
@@ -999,4 +1001,49 @@ func TestMigration0to1(t *testing.T) {
 			t.Fatalf("value for elem %d should be final value: %s", i, string(v))
 		}
 	}
+}
+
+func TestGetAllMemberCommonHeads(t *testing.T) {
+	ctx := context.Background()
+	stateMgr, err := NewStateManager(ctx, ds.NewMapDatastore(), ds.NewKey(""), 300)
+	require.NoError(t, err)
+	store := &Datastore{state: stateMgr}
+
+	// Generate three valid dummy CIDs:
+	head1CID := cid.MustParse("bafybeigdyrzt6xjftfs3m76psn3fupk7zvj7jl5p5zfw5v4ic22fxh45pe")
+	head2CID := cid.MustParse("bafybeia6z6rlvqfwtknx7br7dxes5gj32rhrcprdz7sw5kxjdlkbkoqvfa")
+	head3CID := cid.MustParse("bafybeig5jt5xfx4tn7zqomwqxg7tq6cphg7h5wr64p4quzpsolhx5ypmpu")
+
+	snapshotA := &pb.Snapshot{SnapshotKey: &pb.Head{Cid: head1CID.Bytes()}}
+	snapshotB := &pb.Snapshot{SnapshotKey: &pb.Head{Cid: head3CID.Bytes()}}
+
+	stateMgr.state = &pb.StateBroadcast{
+		Members: map[string]*pb.Participant{
+			"peer1": {
+				Snapshot: snapshotA,
+				DagHeads: []*pb.Head{
+					{Cid: head1CID.Bytes()},
+					{Cid: head2CID.Bytes()},
+				},
+			},
+			"peer2": {
+				Snapshot: snapshotA,
+				DagHeads: []*pb.Head{
+					{Cid: head1CID.Bytes()},
+					{Cid: head2CID.Bytes()},
+				},
+			},
+			"peer3": {
+				Snapshot: snapshotB,
+				DagHeads: []*pb.Head{
+					{Cid: head3CID.Bytes()},
+				},
+			},
+		},
+	}
+
+	commonHeads := store.getAllMemberCommonHeads()
+	require.Len(t, commonHeads, 2)
+	require.Contains(t, commonHeads, head1CID)
+	require.Contains(t, commonHeads, head2CID)
 }
