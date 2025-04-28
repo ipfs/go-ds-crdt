@@ -78,11 +78,6 @@ func (m *StateManager) GetState() *pb.StateBroadcast {
 	return proto.Clone(m.state).(*pb.StateBroadcast)
 }
 
-// IsNew returns if the state is fresh
-func (m *StateManager) IsNew() bool {
-	return m.state.Snapshot == nil
-}
-
 func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.Cid, updateTTL bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -137,14 +132,22 @@ func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroa
 	return m.Save(ctx)
 }
 
-func (m *StateManager) SetSnapshot(ctx context.Context, root cid.Cid, dagHead cid.Cid, dagHeight uint64) error {
+func (m *StateManager) SetSnapshot(ctx context.Context, selfID peer.ID, info *SnapshotInfo) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.state.Snapshot = &pb.Snapshot{
-		SnapshotKey: &pb.Head{Cid: root.Bytes()},
-		DagHead:     &pb.Head{Cid: dagHead.Bytes()},
-		Height:      dagHeight,
+
+	member, ok := m.state.Members[selfID.String()]
+	if !ok {
+		member = &pb.Participant{}
+		m.state.Members[selfID.String()] = member
 	}
+
+	member.Snapshot = &pb.Snapshot{
+		SnapshotKey: &pb.Head{Cid: info.WrapperCID.Bytes()},
+		DagHead:     &pb.Head{Cid: info.DeltaHeadCID.Bytes()},
+		Height:      info.Height,
+	}
+
 	return m.Save(ctx)
 }
 

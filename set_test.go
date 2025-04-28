@@ -315,3 +315,59 @@ func TestHAMTDatastoreWithSet(t *testing.T) {
 		assert.Equal(t, []byte("initial"), value, "Element should have rolled back to initial value")
 	})
 }
+
+func TestSetCloneFrom(t *testing.T) {
+	ctx := context.Background()
+
+	// Create two separate datastores
+	srcStore := ds.NewMapDatastore()
+	destStore := ds.NewMapDatastore()
+
+	// Mock DAGService and logger (don't matter here, no DAG ops happen)
+	dagService := mdutils.Mock()
+	logger := logging.Logger("test")
+
+	// Create source Set
+	srcSet, err := newCRDTSet(ctx, srcStore, ds.NewKey("/test/namespace"), dagService, logger, nil, nil)
+	require.NoError(t, err)
+
+	// Create destination Set (initially empty)
+	destSet, err := newCRDTSet(ctx, destStore, ds.NewKey("/test/namespace"), dagService, logger, nil, nil)
+	require.NoError(t, err)
+
+	// Add some elements into source Set
+	err = srcSet.Merge(ctx, &pb.Delta{
+		Elements: []*pb.Element{
+			{Key: "key1", Value: []byte("value1")},
+			{Key: "key2", Value: []byte("value2")},
+		},
+		Priority: 1,
+	}, "test-id-1")
+	require.NoError(t, err)
+
+	err = srcSet.Merge(ctx, &pb.Delta{
+		Tombstones: []*pb.Element{
+			{Key: "key3", Id: "some-id"},
+		},
+		Priority: 2,
+	}, "test-id-2")
+	require.NoError(t, err)
+
+	// Now Clone source -> dest
+	err = destSet.CloneFrom(ctx, srcSet)
+	require.NoError(t, err)
+
+	// Validate: destSet must now have the same elements
+	val1, err := destSet.Element(ctx, "key1")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("value1"), val1)
+
+	val2, err := destSet.Element(ctx, "key2")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("value2"), val2)
+
+	// key3 should NOT exist (tombstoned)
+	_, err = destSet.Element(ctx, "key3")
+	assert.Error(t, err)
+	assert.Equal(t, ds.ErrNotFound, err)
+}

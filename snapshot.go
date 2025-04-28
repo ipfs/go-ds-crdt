@@ -3,6 +3,7 @@ package crdt
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/ipfs/boxo/blockservice"
 	"github.com/ipfs/boxo/datastore/dshelp"
@@ -272,6 +273,58 @@ func (store *Datastore) compactAndSnapshot(
 	}
 
 	return si, nil
+}
+
+// Helper function to check for offline fetch errors
+func isOfflineBlockNotFoundError(err error) bool {
+	return strings.Contains(err.Error(), "block was not found locally (offline)")
+}
+
+// Truncate the DAG from startCID to endCID using an offline DAG service
+func (store *Datastore) truncateDAG(ctx context.Context, startCID, endCID cid.Cid) error {
+	// Initialize a DAG service with an offline exchange
+	offlineDAG := dag.NewDAGService(blockservice.New(store.bs, offline.Exchange(store.bs)))
+
+	queue := []cid.Cid{startCID}
+	visited := make(map[cid.Cid]struct{})
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		// Stop if we've reached the endCID (for partial truncation)
+		if endCID.Defined() && current == endCID {
+			continue
+		}
+
+		if _, ok := visited[current]; ok {
+			continue
+		}
+		visited[current] = struct{}{}
+
+		// Fetch the IPLD node locally using the offline DAG service
+		node, err := offlineDAG.Get(ctx, current)
+		if err != nil {
+			if isOfflineBlockNotFoundError(err) {
+				// Block is already gone, continue cleanup
+				continue
+			}
+			return fmt.Errorf("failed to retrieve DAG node %s: %w", current, err)
+		}
+
+		// Step 1: Queue child nodes for further deletion
+		for _, link := range node.Links() {
+			queue = append(queue, link.Cid)
+		}
+
+		// Step 2: Clean up from the DAG service
+		err = store.dagService.Remove(ctx, current)
+		if err != nil {
+			return fmt.Errorf("failed to remove DAG node %s: %w", current, err)
+		}
+	}
+
+	return nil
 }
 
 // getLatestSnapshotCID returns the CID of the latest snapshot wrapper.

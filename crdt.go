@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,7 +33,6 @@ import (
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 	"github.com/ipfs/boxo/exchange/offline"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
-	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"go.uber.org/multierr"
@@ -226,6 +224,7 @@ type Datastore struct {
 	h              Peer
 	// old snapshot cid is the snapshot cid seen before the "current" one
 	oldProcessedCID []byte
+	seenSnapshots   *ringSnapshots
 }
 
 type dagJob struct {
@@ -333,6 +332,7 @@ func New(h Peer, store ds.Datastore, bs blockstore.Blockstore, namespace ds.Key,
 		jobQueue:       make(chan *dagJob, opts.NumWorkers),
 		sendJobs:       make(chan *dagJob),
 		queuedChildren: newCidSafeSet(),
+		seenSnapshots:  newRingSnapshots(10),
 	}
 
 	err = dstore.applyMigrations(ctx)
@@ -423,145 +423,102 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			continue
 		}
 
-		processHead := func(ctx context.Context, c cid.Cid) {
-			err = store.handleBlock(ctx, c) //handleBlock blocks
-			if err != nil {
-				store.logger.Errorf("error processing new head: %s", err)
-				// For posterity: do not mark the store as
-				// Dirty if we could not handle a block. If an
-				// error happens here, it means the node could
-				// not be fetched, thus it could not be
-				// processed, thus it did not leave a branch
-				// half-processed and there's nothign to
-				// recover.
-				// disabled: store.MarkDirty()
-			}
-		}
-
-		// merge the state with our state
+		// Always merge member metadata, even if we diverge
 		if err := store.state.MergeMembers(ctx, broadcast); err != nil {
-			// TODO log and continue
 			store.logger.Errorf("failed to merge broadcast: %v", err)
 			continue
 		}
-		state := store.state.GetState()
 
-		if !store.state.IsNew() && broadcast.Snapshot != nil &&
-			broadcast.Snapshot.DagHead != state.Snapshot.DagHead &&
-			!bytes.Equal(broadcast.Snapshot.DagHead.Cid, store.oldProcessedCID) {
+		// Get our snapshot for comparison
+		var mySnapshot *pb.Snapshot
+		participant := store.state.GetState().Members[store.h.ID().String()]
+		if participant != nil {
+			mySnapshot = participant.Snapshot
+		}
 
-			start, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
-			if err != nil {
-				store.logger.Errorf("failed to parse broadcast snapshot cid: %v", err)
-				continue
-
-			}
-			end, err := cid.Cast(state.Snapshot.DagHead.Cid)
-			if err != nil {
-				store.logger.Errorf("failed to parse state snapshot cid: %v", err)
+		for peerID, participant := range broadcast.Members {
+			if snapshotsEqual(mySnapshot, participant.Snapshot) {
+				// Snapshots match, we can safely process heads
+				store.processParticipantHeads(ctx, peerID, participant)
 				continue
 			}
-			store.compactMux.Lock()
-			newSS, err := store.compactAndTruncate(ctx, start, end)
-			if err != nil {
-				store.logger.Errorf("failed to compact the dag: %v", err)
-				store.compactMux.Unlock()
-				continue
-			}
-			store.compactMux.Unlock()
 
-			store.oldProcessedCID = state.Snapshot.DagHead.Cid
-			err = store.state.SetSnapshot(ctx, newSS, start, broadcast.Snapshot.Height)
-			if err != nil {
-				store.logger.Errorf("failed to set the snapshot: %v", err)
-				continue
+			if participant.Snapshot == nil {
+				continue // No snapshot, skip
 			}
-			err = store.broadcast(ctx)
+
+			if store.hasProcessedSnapshot(cidFromBytes(participant.Snapshot.DagHead.Cid)) {
+				continue // Already seen, skip
+			}
+
+			// Snapshots differ, attempt fast-forward
+			err := store.tryFastForwardToSnapshot(ctx, mySnapshot, participant)
 			if err != nil {
-				store.logger.Errorf("failed to broadcast: %v", err)
-				continue
+				store.logger.Warnf("divergence detected with %s: %v", peerID, err)
+				store.handleDivergence(ctx, participant.Snapshot)
 			}
 		}
 
-		// if we have no snapshot head then we're probably a fresh database or node
-		// we should process the snapshot before doing anything else
-		if store.state.IsNew() && broadcast.Snapshot != nil {
-			c, err := cid.Cast(broadcast.Snapshot.SnapshotKey.Cid)
-			if err != nil {
-				store.logger.Errorf("failed to parse broadcasat snapshot cid: %v", err)
-				continue
-			}
-			if c != cid.Undef {
-				dc, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
-				if err != nil {
-					store.logger.Errorf("failed to parse broadcast dag head cid: %v", err)
-					continue
-				}
-				err = store.restoreSnapshot(ctx, store.dagService, c, dc, broadcast.Snapshot.Height)
-				if err != nil {
-					store.logger.Errorf("failed to restore snapshot: %v", err)
-					continue
-				}
-			}
-		}
-
-		// if we have no state, make seen-state state immediately.  On
-		// a fresh start, this allows us to start building on top of
-		// recent state, even if we have not fully synced rather than
-		// creating new orphan branches.
-		curHeadCount, err := store.heads.Len(ctx)
-		if err != nil {
-			store.logger.Error(err)
-			continue
-		}
-
-		bcastHeads := map[cid.Cid]cid.Cid{}
-
-		for _, member := range broadcast.Members {
-			for _, h := range member.DagHeads {
-				c, err := cid.Cast(h.Cid)
-				if err == nil && c != cid.Undef {
-					bcastHeads[c] = c
-				}
-			}
-		}
-
-		if curHeadCount == 0 {
-			dg := &crdtNodeGetter{NodeGetter: store.dagService}
-			for _, bCastHead := range bcastHeads {
-				prio, err := dg.GetPriority(ctx, bCastHead)
-				if err != nil {
-					store.logger.Error(err)
-					continue
-				}
-				err = store.heads.Add(ctx, bCastHead, head{height: prio})
-				if err != nil {
-					store.logger.Error(err)
-				}
-			}
-		}
-
-		// For each head, we process it.
-		for _, head := range bcastHeads {
-			// A thing to try here would be to process state in
-			// the same broadcast in parallel, but do not process
-			// state from multiple broadcasts in parallel.
-			if store.opts.MultiHeadProcessing {
-				go processHead(ctx, head)
-			} else {
-				processHead(ctx, head)
-			}
-			store.seenHeadsMux.Lock()
-			store.seenHeads[head] = struct{}{}
-			store.seenHeadsMux.Unlock()
-		}
-
-		// TODO: We should store trusted-peer signatures associated to
-		// each head in a timecache. When we broadcast, attach the
-		// signatures (along with our own) to the broadcast.
-		// Other peers can use the signatures to verify that the
-		// received CIDs have been issued by a trusted peer.
 	}
+}
+
+func (store *Datastore) hasProcessedSnapshot(c cid.Cid) bool {
+	if c == cid.Undef {
+		return false
+	}
+	return store.seenSnapshots.Contains(c)
+}
+
+func (store *Datastore) processHead(ctx context.Context, c cid.Cid) {
+	err := store.handleBlock(ctx, c) // handleBlock blocks
+	if err != nil {
+		store.logger.Errorf("error processing new head: %s", err)
+		// Do NOT mark dirty here — see previous logic notes
+	}
+}
+
+func (store *Datastore) processParticipantHeads(ctx context.Context, peerID string, participant *pb.Participant) {
+	bcastHeads := map[cid.Cid]cid.Cid{}
+
+	for _, h := range participant.DagHeads {
+		c, err := cid.Cast(h.Cid)
+		if err == nil && c != cid.Undef {
+			bcastHeads[c] = c
+		}
+	}
+
+	for head := range bcastHeads {
+		// Same logic as before
+		store.seenHeadsMux.Lock()
+		store.seenHeads[head] = struct{}{}
+		store.seenHeadsMux.Unlock()
+
+		if store.opts.MultiHeadProcessing {
+			go store.processHead(ctx, head)
+		} else {
+			store.processHead(ctx, head)
+		}
+	}
+}
+
+func (store *Datastore) handleDivergence(ctx context.Context, target *pb.Snapshot) {
+	// TODO: Apply divergence policy
+	store.logger.Warn("divergence handling not implemented")
+}
+
+func snapshotsEqual(a, b *pb.Snapshot) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return bytes.Equal(a.SnapshotKey.Cid, b.SnapshotKey.Cid)
+}
+
+func cidFromBytes(b []byte) cid.Cid {
+	c, _ := cid.Cast(b)
+	return c
 }
 
 func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) (*pb.StateBroadcast, error) {
@@ -1589,51 +1546,6 @@ func (store *Datastore) GetState(ctx context.Context) *pb.StateBroadcast {
 	return store.state.GetState()
 }
 
-func (store *Datastore) restoreSnapshot(ctx context.Context, getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid, dagHeight uint64) error {
-	hamtNode, err := getter.Get(ctx, snapshotRoot)
-	if err != nil {
-		return fmt.Errorf("getting root node: %w", err)
-	}
-
-	// Load the root HAMT shard
-	rootShard, err := hamt.NewHamtFromDag(getter, hamtNode) // Adjust bit width as necessary
-	if err != nil {
-		return fmt.Errorf("failed to load HAMT root shard: %w", err)
-	}
-
-	// Process each link in the current shard
-	err = rootShard.ForEachLink(ctx, func(link *ipld.Link) error {
-		node, err := link.GetNode(ctx, getter)
-		if err != nil {
-			return fmt.Errorf("failed to retrieve node %s: %w", link.Cid.String(), err)
-		}
-
-		protoNode, ok := node.(*dag.ProtoNode)
-		if !ok {
-			return fmt.Errorf("unexpected node type '%t'", node)
-		}
-		delta := &pb.Delta{
-			Elements: []*pb.Element{{Key: strings.TrimPrefix(link.Name, "/"), Value: protoNode.Data()}},
-		}
-		id := dshelp.MultihashToDsKey(link.Cid.Hash()).String()
-		if err := store.set.Merge(ctx, delta, id); err != nil {
-			return fmt.Errorf("failed to merge delta: %w", err)
-
-		}
-
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("error processing shard: %w", err)
-	}
-
-	err = store.state.SetSnapshot(ctx, snapshotRoot, dagHead, dagHeight)
-	if err != nil {
-		return fmt.Errorf("setting snapshot: %w", err)
-	}
-	return nil
-}
-
 type cidSafeSet struct {
 	set map[cid.Cid]struct{}
 	mux sync.RWMutex
@@ -1758,56 +1670,53 @@ func (store *Datastore) compact() {
 
 }
 
-// triggerCompactionIfNeeded handles compaction logic directly within the datastore
+// triggerCompactionIfNeeded handles snapshot creation logic if the DAG grows too large.
+// triggerCompactionIfNeeded checks if compaction is needed and creates a new snapshot lagging behind current heads.
 func (store *Datastore) triggerCompactionIfNeeded(ctx context.Context) error {
-	// Ensure all members agree on the DAG head before compacting
-	commonCid, height, err := store.getHighestCommonCid(ctx)
-	if err != nil {
-		return err
-	}
-
-	if height == 0 {
-		return nil
-	}
-
 	state := store.state.GetState()
-	snapshotHeight := uint64(0)
-	if state.Snapshot != nil {
-		snapshotHeight = state.Snapshot.Height
+	myParticipant := state.Members[store.h.ID().String()]
+	var lastDagHead cid.Cid
+
+	var snapshotHeight uint64
+	if myParticipant != nil && myParticipant.Snapshot != nil {
+		lastDagHead = cidFromBytes(myParticipant.Snapshot.DagHead.Cid)
+		snapshotHeight = myParticipant.Snapshot.Height
 	}
 
-	dagSize := height - snapshotHeight
+	commonCID, highestPriority, err := store.getHighestCommonCid(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get highest common cid: %w", err)
+	}
 
-	// Check if DAG size exceeds the threshold for compaction
+	if highestPriority == 0 {
+		return nil // Nothing to compact
+	}
+
+	dagSize := highestPriority - snapshotHeight
 	if dagSize < store.opts.CompactDagSize {
-		return nil
+		return nil // DAG still small enough
 	}
 
 	store.compactMux.Lock()
 	defer store.compactMux.Unlock()
-	// Extract DAG content and walk back CompactRetainNodes steps to determine the target CID
-	startCID, height, err := store.walkBackDAG(ctx, commonCid, store.opts.CompactRetainNodes)
+
+	// Walk back from common head to a stable point lagging behind
+	targetCID, _, err := store.walkBackDAG(ctx, commonCID, store.opts.CompactRetainNodes)
 	if err != nil {
-		return fmt.Errorf("failed to determine target CID for compaction: %w", err)
+		return fmt.Errorf("failed to walk back DAG for compaction: %w", err)
 	}
 
-	var lastSnapshotCid cid.Cid
-
-	if state.Snapshot != nil {
-		lastSnapshotCid, err = cid.Cast(state.Snapshot.DagHead.Cid)
-		if err != nil {
-			return fmt.Errorf("parsing last snapshot cid: %w", err)
-		}
+	if !targetCID.Defined() {
+		return fmt.Errorf("could not determine stable compaction point")
 	}
 
-	// Run compaction from start CID
-	compactCID, err := store.compactAndTruncate(ctx, startCID, lastSnapshotCid)
+	latestSnapshotInfo, err := store.compactAndSnapshot(ctx, targetCID, lastDagHead)
 	if err != nil {
-		return fmt.Errorf("error during DAG compaction: %w", err)
+		return fmt.Errorf("failed to create snapshot at compaction point: %w", err)
 	}
 
-	// Update the snapshot if compaction changes the state
-	if err := store.state.SetSnapshot(ctx, compactCID, startCID, height); err != nil {
+	// Update our snapshot pointer
+	if err := store.state.SetSnapshot(ctx, store.h.ID(), latestSnapshotInfo); err != nil {
 		return fmt.Errorf("failed to update snapshot after compaction: %w", err)
 	}
 
@@ -1837,25 +1746,46 @@ func (store *Datastore) getHighestCommonCid(ctx context.Context) (cid.Cid, uint6
 	return c, h, nil
 }
 
-// getAllMemberCommonHeads retrieves the DAG heads from all peers
+// getAllMemberCommonHeads retrieves the DAG heads from all peers who share our snapshot
 func (store *Datastore) getAllMemberCommonHeads() []cid.Cid {
-	var cids []cid.Cid
-	cidCount := map[cid.Cid]int{}
-	var members int
+	snapshotHeads := make(map[string]map[cid.Cid]int)
+	snapshotMembers := make(map[string]int)
 
-	for _, v := range store.state.GetState().Members {
-		members++
-		for _, c := range v.DagHeads {
+	for _, member := range store.state.GetState().Members {
+		var snapshotKey string
+		if member.Snapshot != nil {
+			snapshotKey = cidFromBytes(member.Snapshot.SnapshotKey.Cid).String()
+		} else {
+			snapshotKey = "no_snapshot"
+		}
+
+		snapshotMembers[snapshotKey]++
+		if snapshotHeads[snapshotKey] == nil {
+			snapshotHeads[snapshotKey] = make(map[cid.Cid]int)
+		}
+
+		for _, c := range member.DagHeads {
 			id, err := cid.Cast(c.Cid)
 			if err != nil {
-				// TODO
+				continue
 			}
-			cidCount[id]++
+			snapshotHeads[snapshotKey][id]++
 		}
 	}
 
-	for k, v := range cidCount {
-		if v == members {
+	// Choose the most recent snapshotKey with full membership
+	var chosenKey string
+	var maxMembers int
+	for k, count := range snapshotMembers {
+		if count > maxMembers {
+			maxMembers = count
+			chosenKey = k
+		}
+	}
+
+	var cids []cid.Cid
+	for k, v := range snapshotHeads[chosenKey] {
+		if v == snapshotMembers[chosenKey] {
 			cids = append(cids, k)
 		}
 	}
