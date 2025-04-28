@@ -135,19 +135,6 @@ func (hh *heads) IsHead(ctx context.Context, c cid.Cid) (ok bool, height uint64,
 	return ok, height, nil
 }
 
-// IsCompact returns if a given cid is compacted.
-func (hh *heads) IsCompact(c cid.Cid) (compact bool) {
-	hh.cacheMux.RLock()
-	{
-		h, ok := hh.cache[c]
-		if ok {
-			compact = h.flags&FlagCompacted == FlagCompacted
-		}
-	}
-	hh.cacheMux.RUnlock()
-	return compact
-}
-
 func (hh *heads) Len(ctx context.Context) (int, error) {
 	var ret int
 	hh.cacheMux.RLock()
