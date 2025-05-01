@@ -650,44 +650,175 @@ func decodeValue(encoded []byte) (uint64, []byte, error) {
 	return prio, encoded[8:], nil
 }
 
-func (s *set) CloneFrom(ctx context.Context, src *set) error {
-	// TODO fire hooks to sync state
-	q := query.Query{
-		Prefix:   "/",
-		KeysOnly: false,
-	}
-
-	results, err := src.store.Query(ctx, q)
-	if err != nil {
-		return fmt.Errorf("failed to query: %w", err)
-	}
-	defer results.Close()
-
-	var store ds.Write = s.store
-	if batchingDs, ok := s.store.(ds.Batching); ok {
-		store, err = batchingDs.Batch(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to create batch for dest set: %w", err)
-		}
-	}
-
+func (s *set) CloneFrom(ctx context.Context, src *set, priorityHint uint64) error {
+	// 1) Snapshot the OLD state (before any writes)
+	old := make(map[string][]byte)
+	prefix := s.keyPrefix(keysNs).String()
+	results, _ := s.store.Query(ctx, query.Query{Prefix: prefix, KeysOnly: false})
 	for r := range results.Next() {
-		if r.Error != nil {
-			return fmt.Errorf("error scanning prefix: %w", r.Error)
+		if !strings.HasSuffix(r.Key, "/"+valueSuffix) {
+			continue
 		}
+		key := extractKey(r.Key, prefix)
+		prio, val, _ := decodeValue(r.Value)
+		if prio > priorityHint {
+			old[key] = val
+		}
+	}
+	results.Close()
 
-		key := s.namespace.ChildString(r.Entry.Key)
-		val := r.Entry.Value
+	// 2) Bulk‐wipe the namespace so we don’t leave old keys behind
+	if err := s.clearNamespace(ctx); err != nil {
+		return err
+	}
 
-		if err := store.Put(ctx, key, val); err != nil {
-			return fmt.Errorf("failed writing key %s: %w", key.String(), err)
+	// 3) Bulk‐copy everything from src
+	if err := s.cloneDataOnly(ctx, src); err != nil {
+		return err
+	}
+
+	// 4) Scan NEW state, fire putHooks & remove seen keys from `old`
+	results2, _ := s.store.Query(ctx, query.Query{Prefix: prefix, KeysOnly: false})
+	for r := range results2.Next() {
+		if !strings.HasSuffix(r.Key, "/"+valueSuffix) {
+			continue
+		}
+		key := extractKey(r.Key, prefix)
+		prio, newVal, _ := decodeValue(r.Value)
+		if prio <= priorityHint {
+			delete(old, key)
+			continue
+		}
+		if oldVal, seen := old[key]; seen {
+			delete(old, key)
+			if !bytes.Equal(oldVal, newVal) && s.putHook != nil {
+				s.putHook(key, newVal)
+			}
+		} else if s.putHook != nil {
+			s.putHook(key, newVal)
+		}
+	}
+	results2.Close()
+
+	// 5) Any key still in `old` was deleted—fire deleteHook and delete the key
+	for key := range old {
+		if s.deleteHook != nil {
+			s.deleteHook(key)
+		}
+		_ = s.store.Delete(ctx, s.valueKey(key))
+	}
+
+	return nil
+}
+
+// extractKey strips off the prefix and the "/v" suffix,
+// turning e.g. "/my/ns/set/k/foo/v" with prefix "/my/ns/set/k/"
+// into "foo".
+func extractKey(fullKey, prefix string) string {
+	// remove the namespace+keysNs prefix
+	rel := strings.TrimPrefix(fullKey, prefix)
+	// strip any leading "/"
+	rel = strings.TrimPrefix(rel, "/")
+	// strip the "/v" suffix
+	if strings.HasSuffix(rel, "/"+valueSuffix) {
+		rel = strings.TrimSuffix(rel, "/"+valueSuffix)
+	}
+	return rel
+}
+
+// clearNamespace wipes *all* entries under this set's namespace
+// so we can do a clean bulk‐copy.
+func (s *set) clearNamespace(ctx context.Context) error {
+	prefix := s.namespace.String()
+	// list everything under s.namespace
+	res, err := s.store.Query(ctx, query.Query{
+		Prefix:   prefix,
+		KeysOnly: false,
+	})
+	if err != nil {
+		return fmt.Errorf("clearNamespace: query failed: %w", err)
+	}
+	defer res.Close()
+
+	// batch if supported
+	var batch ds.Batch
+	if b, ok := s.store.(ds.Batching); ok {
+		batch, err = b.Batch(ctx)
+		if err != nil {
+			return fmt.Errorf("clearNamespace: open batch: %w", err)
 		}
 	}
 
-	// Commit if we created a batch
-	if batch, ok := store.(ds.Batch); ok {
+	for r := range res.Next() {
+		if r.Error != nil {
+			return fmt.Errorf("clearNamespace: scan error: %w", r.Error)
+		}
+		key := ds.NewKey(r.Entry.Key)
+		if batch != nil {
+			if err := batch.Delete(ctx, key); err != nil {
+				return fmt.Errorf("clearNamespace: batch delete %s: %w", key, err)
+			}
+		} else {
+			if err := s.store.Delete(ctx, key); err != nil {
+				return fmt.Errorf("clearNamespace: delete %s: %w", key, err)
+			}
+		}
+	}
+
+	if batch != nil {
 		if err := batch.Commit(ctx); err != nil {
-			return fmt.Errorf("failed committing batch: %w", err)
+			return fmt.Errorf("clearNamespace: commit: %w", err)
+		}
+	}
+	return nil
+}
+
+// cloneDataOnly copies *all* entries under src.namespace into s.namespace
+// one‐for‐one, without firing any hooks.
+func (s *set) cloneDataOnly(ctx context.Context, src *set) error {
+	prefix := src.namespace.String()
+	// fetch every key/value under src.namespace
+	res, err := src.store.Query(ctx, query.Query{
+		Prefix:   prefix,
+		KeysOnly: false,
+	})
+	if err != nil {
+		return fmt.Errorf("cloneDataOnly: query src: %w", err)
+	}
+	defer res.Close()
+
+	// batch the writes if possible
+	var batch ds.Batch
+	if b, ok := s.store.(ds.Batching); ok {
+		batch, err = b.Batch(ctx)
+		if err != nil {
+			return fmt.Errorf("cloneDataOnly: open dest batch: %w", err)
+		}
+	}
+
+	for r := range res.Next() {
+		if r.Error != nil {
+			return fmt.Errorf("cloneDataOnly: scan error: %w", r.Error)
+		}
+		// drop the src.namespace prefix, rebase under s.namespace
+		rel := strings.TrimPrefix(r.Entry.Key, prefix)
+		rel = strings.TrimPrefix(rel, "/")
+		targetKey := s.namespace.ChildString(rel)
+
+		if batch != nil {
+			if err := batch.Put(ctx, targetKey, r.Entry.Value); err != nil {
+				return fmt.Errorf("cloneDataOnly: batch put %s: %w", targetKey, err)
+			}
+		} else {
+			if err := s.store.Put(ctx, targetKey, r.Entry.Value); err != nil {
+				return fmt.Errorf("cloneDataOnly: put %s: %w", targetKey, err)
+			}
+		}
+	}
+
+	if batch != nil {
+		if err := batch.Commit(ctx); err != nil {
+			return fmt.Errorf("cloneDataOnly: commit: %w", err)
 		}
 	}
 	return nil

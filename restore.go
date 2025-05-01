@@ -252,7 +252,7 @@ func (store *Datastore) restoreSnapshot(ctx context.Context, snapshotInfo *Snaps
 
 	store.logger.Debugf("restoring from snapshot %s", snapshotInfo.WrapperCID)
 	// Clone snapshot into the live Set
-	if err := store.set.CloneFrom(ctx, snapshotSet); err != nil {
+	if err := store.set.CloneFrom(ctx, snapshotSet, 0); err != nil {
 		return fmt.Errorf("failed to clone snapshot into live set: %w", err)
 	}
 

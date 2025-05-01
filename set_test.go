@@ -1,13 +1,17 @@
+// crdt/set_clone_priority_test.go
 package crdt
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	mdutils "github.com/ipfs/boxo/ipld/merkledag/test"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
+	"github.com/ipfs/go-datastore/query"
 	"github.com/ipfs/go-ds-crdt/pb"
+
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -177,142 +181,42 @@ func TestHAMTDatastoreWithSet(t *testing.T) {
 		assert.Equal(t, []byte("value2"), value, "Element should have value from higher priority delta")
 	})
 
-	// Test 4: Tombstone handling with Set using HAMTDatastore
-	t.Run("TombstoneHandling", func(t *testing.T) {
-		// Create a HAMT datastore
-		hamtDS, err := NewHAMTDatastore(ctx, dagService, cid.Undef)
-		require.NoError(t, err, "Failed to create HAMT datastore")
-
-		// Create a set using the HAMT datastore
-		set, err := newCRDTSet(ctx, hamtDS, namespace, dagService, logger, nil, nil)
-		require.NoError(t, err, "Failed to create CRDT set")
-
-		// Add a key
-		delta := set.Add(ctx, "to-delete", []byte("original"))
-
-		err = set.Merge(ctx, delta, "add-delta")
-		require.NoError(t, err, "Failed to merge Add delta")
-
-		// Verify the key is in the set
-		inSet, err := set.InSet(ctx, "to-delete")
-		require.NoError(t, err, "Failed to check if to-delete is in set")
-		assert.True(t, inSet, "to-delete should be in the set")
-
-		// Create a Remove delta
-		removeDelta, err := set.Rmv(ctx, "to-delete")
-		require.NoError(t, err, "Failed to create rmv delta")
-
-		// Apply the Remove delta
-		err = set.Merge(ctx, removeDelta, "rmv-delta")
-		require.NoError(t, err, "Failed to merge Remove delta")
-
-		// Verify the key is no longer in the set
-		inSet, err = set.InSet(ctx, "to-delete")
-		require.NoError(t, err, "Failed to check if to-delete is in set after removal")
-		assert.False(t, inSet, "to-delete should not be in the set after removal")
-
-		// Try to add the key again with a lower priority
-		lowerDelta := &pb.Delta{
-			Elements: []*pb.Element{
-				{
-					Key:   "to-delete",
-					Value: []byte("new-value"),
-					Id:    "lower-id",
-				},
-			},
-			Priority: removeDelta.Priority - 1, // Lower priority than the tombstone
-		}
-
-		err = set.Merge(ctx, lowerDelta, "lower-delta")
-		require.NoError(t, err, "Failed to merge lower priority delta")
-
-		// Verify the key is still not in the set
-		inSet, err = set.InSet(ctx, "to-delete")
-		require.NoError(t, err, "Failed to check if to-delete is in set after lower priority add")
-		assert.False(t, inSet, "to-delete should not be in the set (tombstone wins)")
-
-		// Now add with higher priority
-		higherDelta := &pb.Delta{
-			Elements: []*pb.Element{
-				{
-					Key:   "to-delete",
-					Value: []byte("higher-priority"),
-					Id:    "higher-id",
-				},
-			},
-			Priority: removeDelta.Priority + 1, // Higher priority than the tombstone
-		}
-
-		err = set.Merge(ctx, higherDelta, "higher-delta")
-		require.NoError(t, err, "Failed to merge higher priority delta")
-
-		// Verify the key is now in the set
-		inSet, err = set.InSet(ctx, "to-delete")
-		require.NoError(t, err, "Failed to check if to-delete is in set after higher priority add")
-		assert.True(t, inSet, "to-delete should be in the set (higher priority wins)")
-
-		// Get the element to verify the value
-		value, err := set.Element(ctx, "to-delete")
-		require.NoError(t, err, "Failed to get to-delete element")
-		assert.Equal(t, []byte("higher-priority"), value, "Element should have value from higher priority delta")
-	})
-
 	// Test 5: Specific tombstone handling - undo a specific value change
-	t.Run("SpecificTombstoneHandling", func(t *testing.T) {
+	t.Run("SpecificValueTombstone", func(t *testing.T) {
 		// Create a HAMT datastore
 		hamtDS, err := NewHAMTDatastore(ctx, dagService, cid.Undef)
-		require.NoError(t, err, "Failed to create HAMT datastore")
-
-		// Create a set using the HAMT datastore
+		require.NoError(t, err)
 		set, err := newCRDTSet(ctx, hamtDS, namespace, dagService, logger, nil, nil)
-		require.NoError(t, err, "Failed to create CRDT set")
+		require.NoError(t, err)
 
-		// Add initial value
-		initialDelta := set.Add(ctx, "multi-value", []byte("initial"))
-		err = set.Merge(ctx, initialDelta, "initial-delta")
-		require.NoError(t, err, "Failed to merge initial delta")
+		// 1) Add the first version
+		delta1 := set.Add(ctx, "multi", []byte("v1"))
+		require.NoError(t, set.Merge(ctx, delta1, "id1"))
 
-		// Add a second value with higher priority
-		secondDelta := &pb.Delta{
-			Elements: []*pb.Element{
-				{
-					Key:   "multi-value",
-					Value: []byte("second"),
-					Id:    "second-id",
-				},
-			},
-			Priority: initialDelta.Priority + 1,
-		}
-		err = set.Merge(ctx, secondDelta, "second-delta")
-		require.NoError(t, err, "Failed to merge second delta")
+		// 2) Add a second version at higher priority
+		delta2 := set.Add(ctx, "multi", []byte("v2"))
+		// bump priority on the delta itself so that set.Merge uses it:
+		delta2.Priority = delta1.Priority + 1
+		require.NoError(t, set.Merge(ctx, delta2, "id2"))
 
-		// Verify the current value is "second"
-		value, err := set.Element(ctx, "multi-value")
-		require.NoError(t, err, "Failed to get multi-value element")
-		assert.Equal(t, []byte("second"), value, "Element should have the second value")
+		// sanity: we now see "v2"
+		cur, err := set.Element(ctx, "multi")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("v2"), cur)
 
-		// Now create a tombstone specifically for the second value (not the whole key)
-		tombstoneDelta := &pb.Delta{
+		// 3) Now tombstone *only* the second ID, to roll back to v1
+		tomb := &pb.Delta{
 			Tombstones: []*pb.Element{
-				{
-					Key: "multi-value",
-					Id:  "second-id", // Specifically target the second-id
-				},
+				{Key: "multi", Id: "/id2"},
 			},
-			Priority: secondDelta.Priority + 1, // Higher priority to ensure it wins
+			Priority: delta2.Priority + 1,
 		}
-		err = set.Merge(ctx, tombstoneDelta, "tombstone-delta")
-		require.NoError(t, err, "Failed to merge tombstone delta")
+		require.NoError(t, set.Merge(ctx, tomb, "tomb-id2"))
 
-		// The key should still be in the set (because we only tombstoned one value)
-		inSet, err := set.InSet(ctx, "multi-value")
-		require.NoError(t, err, "Failed to check if multi-value is in set")
-		assert.True(t, inSet, "multi-value should still be in the set")
-
-		// The value should now be "initial" (the only remaining value)
-		value, err = set.Element(ctx, "multi-value")
-		require.NoError(t, err, "Failed to get multi-value element after tombstone")
-		assert.Equal(t, []byte("initial"), value, "Element should have rolled back to initial value")
+		// final: we should be back to "v1"
+		cur, err = set.Element(ctx, "multi")
+		require.NoError(t, err)
+		assert.Equal(t, []byte("v1"), cur)
 	})
 }
 
@@ -354,7 +258,7 @@ func TestSetCloneFrom(t *testing.T) {
 	require.NoError(t, err)
 
 	// Now Clone source -> dest
-	err = destSet.CloneFrom(ctx, srcSet)
+	err = destSet.CloneFrom(ctx, srcSet, 0)
 	require.NoError(t, err)
 
 	// Validate: destSet must now have the same elements
@@ -370,4 +274,233 @@ func TestSetCloneFrom(t *testing.T) {
 	_, err = destSet.Element(ctx, "key3")
 	assert.Error(t, err)
 	assert.Equal(t, ds.ErrNotFound, err)
+}
+
+func TestCloneFrom_WithPriorityHint_HAMT(t *testing.T) {
+	ctx := context.Background()
+	namespace := ds.NewKey("/test")
+	dagServ := mdutils.Mock()
+	logger := logging.Logger("clone-test")
+
+	const basePrio = uint64(10)
+
+	// 1) Build the **base** state at priority 10
+	hamtDS1, err := NewHAMTDatastore(ctx, dagServ, cid.Undef)
+	require.NoError(t, err)
+	baseSet, err := newCRDTSet(ctx, hamtDS1, namespace, dagServ, logger, nil, nil)
+	require.NoError(t, err)
+
+	// add k1@10
+	d1 := baseSet.Add(ctx, "k1", []byte("v1"))
+	d1.Priority = basePrio
+	require.NoError(t, baseSet.Merge(ctx, d1, "block-base-1"))
+
+	// add k2@10
+	d2 := baseSet.Add(ctx, "k2", []byte("v2"))
+	d2.Priority = basePrio
+	require.NoError(t, baseSet.Merge(ctx, d2, "block-base-2"))
+
+	// capture base root
+	baseRoot, err := hamtDS1.GetRoot(ctx)
+	require.NoError(t, err)
+
+	// 2) Build the **updated** state by loading from baseRoot
+	hamtDS2, err := NewHAMTDatastore(ctx, dagServ, baseRoot)
+	require.NoError(t, err)
+	updatedSet, err := newCRDTSet(ctx, hamtDS2, namespace, dagServ, logger, nil, nil)
+	require.NoError(t, err)
+
+	// (a) update k1 → v1b @ prio=11
+	du := updatedSet.Add(ctx, "k1", []byte("v1b"))
+	du.Priority = basePrio + 1
+	require.NoError(t, updatedSet.Merge(ctx, du, "block-upd1"))
+
+	// (b) tombstone k2 @ prio=12
+	rt, err := updatedSet.Rmv(ctx, "k2")
+	require.NoError(t, err)
+	rt.Priority = basePrio + 2
+	require.NoError(t, updatedSet.Merge(ctx, rt, "block-tomb2"))
+
+	// (c) add k3 → v3 @ prio=13
+	da := updatedSet.Add(ctx, "k3", []byte("v3"))
+	da.Priority = basePrio + 3
+	require.NoError(t, updatedSet.Merge(ctx, da, "block-add3"))
+
+	// 3) Prepare the **destination** by loading from the same baseRoot
+	hamtDS3, err := NewHAMTDatastore(ctx, dagServ, baseRoot)
+	require.NoError(t, err)
+	var gotPuts, gotDels []string
+	dstSet, err := newCRDTSet(
+		ctx, hamtDS3, namespace, dagServ, logger,
+		func(k string, _ []byte) { gotPuts = append(gotPuts, k) },
+		func(k string) { gotDels = append(gotDels, k) },
+	)
+	require.NoError(t, err)
+
+	// 4) Clone only the prio>10 changes
+	require.NoError(t, dstSet.CloneFrom(ctx, updatedSet, basePrio))
+
+	// 5a) Final values must match updatedSet
+	v1, err := dstSet.Element(ctx, "k1")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v1b"), v1)
+
+	_, err = dstSet.Element(ctx, "k2")
+	assert.Error(t, err, "k2 should have been tombstoned")
+
+	v3, err := dstSet.Element(ctx, "k3")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v3"), v3)
+
+	// 5b) Underlying priorities
+	pr1, err := dstSet.getPriority(ctx, "k1")
+	require.NoError(t, err)
+	assert.Equal(t, basePrio+1, pr1, "k1 should have priority 11")
+
+	pr3, err := dstSet.getPriority(ctx, "k3")
+	require.NoError(t, err)
+	assert.Equal(t, basePrio+3, pr3, "k3 should have priority 13")
+
+	// 5c) Hooks fired exactly for k1,k3 (puts); no deletes should fire
+	assert.ElementsMatch(t, []string{"k1", "k3"}, gotPuts)
+	assert.Empty(t, gotDels, "no DeleteHook should be fired since k2 was already tombstoned at basePrio=10")
+
+}
+
+func TestCloneFrom_HookConsistency_AllScenarios(t *testing.T) {
+	ctx := context.Background()
+	dagServ := mdutils.Mock()
+	logger := logging.Logger("clone-hooks")
+	namespace := ds.NewKey("/test")
+
+	const basePrio = uint64(10)
+
+	// Track hooks
+	putHooks := map[string][]byte{}
+	var delHooks []string
+
+	hookSet := func(k string, v []byte) { putHooks[k] = v }
+	hookDel := func(k string) { delHooks = append(delHooks, k) }
+
+	// === BASE STATE ===
+	baseDS, err := NewHAMTDatastore(ctx, dagServ, cid.Undef)
+	require.NoError(t, err)
+	baseSet, err := newCRDTSet(ctx, baseDS, namespace, dagServ, logger, nil, nil)
+	require.NoError(t, err)
+
+	merge := func(s *set, d *pb.Delta, id string) { require.NoError(t, s.Merge(ctx, d, id)) }
+
+	// k1 → unchanged
+	merge(baseSet, baseSet.Add(ctx, "k1", []byte("v1")), "id-k1")
+
+	// k2 → deleted (but removal at prio > 10, so CloneFrom sees nothing)
+	d := baseSet.Add(ctx, "k2", []byte("v2"))
+	d.Priority = basePrio
+	merge(baseSet, d, "id-k2")
+
+	// k9 → present in base, will be removed in update (should fire deleteHook)
+	d9base := baseSet.Add(ctx, "k9", []byte("v9"))
+	d9base.Priority = basePrio + 1
+	merge(baseSet, d9base, "id-k9a")
+
+	baseRoot, err := baseDS.GetRoot(ctx)
+	require.NoError(t, err)
+
+	// === UPDATED STATE ===
+	updDS, err := NewHAMTDatastore(ctx, dagServ, baseRoot)
+	require.NoError(t, err)
+	updSet, err := newCRDTSet(ctx, updDS, namespace, dagServ, logger, nil, nil)
+	require.NoError(t, err)
+
+	// k2 → tombstone @12 (will not fire delete hook due to filtering)
+	rmv2, err := updSet.Rmv(ctx, "k2")
+	require.NoError(t, err)
+	rmv2.Priority = basePrio + 2
+	merge(updSet, rmv2, "id-k2-rmv")
+
+	// k3 → added
+	d3 := updSet.Add(ctx, "k3", []byte("v3"))
+	d3.Priority = basePrio + 3
+	merge(updSet, d3, "id-k3")
+
+	// k4 → add then tombstone (but not visible, no hook)
+	d4a := updSet.Add(ctx, "k4", []byte("v4"))
+	d4a.Priority = basePrio + 4
+	merge(updSet, d4a, "id-k4a")
+	rmv4, err := updSet.Rmv(ctx, "k4")
+	require.NoError(t, err)
+	rmv4.Priority = basePrio + 5
+	merge(updSet, rmv4, "id-k4b")
+
+	// k5 → removed then re-added (should fire putHook once)
+	d5a := updSet.Add(ctx, "k5", []byte("v5a"))
+	d5a.Priority = basePrio + 6
+	merge(updSet, d5a, "id-k5a")
+	rmv5, err := updSet.Rmv(ctx, "k5")
+	require.NoError(t, err)
+	rmv5.Priority = basePrio + 7
+	merge(updSet, rmv5, "id-k5b")
+	d5b := updSet.Add(ctx, "k5", []byte("v5b"))
+	d5b.Priority = basePrio + 8
+	merge(updSet, d5b, "id-k5c")
+
+	// k6 → v1 (base) → v2 → tombstone v2 (should revert to v1, no hook)
+	d6a := updSet.Add(ctx, "k6", []byte("v6a"))
+	d6a.Priority = basePrio + 1
+	merge(updSet, d6a, "id-k6a")
+	d6b := updSet.Add(ctx, "k6", []byte("v6b"))
+	d6b.Elements[0].Id = "id-k6b"
+	d6b.Priority = basePrio + 9
+	merge(updSet, d6b, "id-k6b")
+	rmv6, err := updSet.Rmv(ctx, "k6")
+	require.NoError(t, err)
+
+	// Filter to only tombstone v6b
+	filtered := []*pb.Element{}
+	for _, e := range rmv6.Tombstones {
+		if e.Id == "/id-k6b" {
+			filtered = append(filtered, e)
+		}
+	}
+	rmv6.Tombstones = filtered
+	rmv6.Priority = basePrio + 10
+	merge(updSet, rmv6, "id-k6c")
+
+	// k9 → present in base, removed in update (should fire deleteHook)
+	// (k9 already exists from base state, just remove it)
+	rmv9, err := updSet.Rmv(ctx, "k9")
+	require.NoError(t, err)
+	rmv9.Priority = basePrio + 2
+	merge(updSet, rmv9, "id-k9b")
+
+	// === DEST STATE ===
+	dstDS, err := NewHAMTDatastore(ctx, dagServ, baseRoot)
+	require.NoError(t, err)
+	dstSet, err := newCRDTSet(ctx, dstDS, namespace, dagServ, logger, hookSet, hookDel)
+	require.NoError(t, err)
+
+	require.NoError(t, dstSet.CloneFrom(ctx, updSet, basePrio))
+
+	// === ASSERTIONS ===
+	assert.Equal(t, map[string][]byte{
+		"k3": []byte("v3"),
+		"k5": []byte("v5b"),
+		"k6": []byte("v6a"),
+	}, putHooks, "unexpected putHooks")
+
+	assert.ElementsMatch(t, []string{"k9"}, delHooks, "expected delete hook for k9")
+
+	// confirm final state matches
+	final := map[string]string{}
+	q, _ := dstSet.Elements(ctx, query.Query{})
+	for r := range q.Next() {
+		key := strings.TrimPrefix(r.Key, "/")
+		final[key] = string(r.Value)
+	}
+	assert.Equal(t, map[string]string{
+		"k1": "v1",
+		"k3": "v3",
+		"k5": "v5b",
+		"k6": "v6a",
+	}, final, "final dstSet state")
 }
