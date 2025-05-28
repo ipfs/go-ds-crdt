@@ -521,7 +521,7 @@ func TestSnapshotAllowsLowerPriorityValueToResurface(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		m := env.replicas[2].InternalStats(ctx).State.Members[env.replicas[2].h.ID().String()]
-		return m.Snapshot != nil
+		return m != nil && m.Snapshot != nil
 	}, 25*time.Second, 500*time.Millisecond)
 
 	requireReplicaHasKey(t, ctx, env.replicas[2], ds.NewKey("k3"), []byte("v3-LowerPriority"))
