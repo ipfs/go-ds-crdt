@@ -663,11 +663,14 @@ func (s *set) CloneFrom(ctx context.Context, src *set, priorityHint uint64) erro
 		prio, val, _ := decodeValue(r.Value)
 		if prio > priorityHint {
 			old[key] = val
+			s.logger.Infof("CloneFrom: Adding to old map: %s = %s (prio=%d)", key, string(val), prio)
 		}
 	}
 	results.Close()
 
-	// 2) Bulk‐wipe the namespace so we don’t leave old keys behind
+	s.logger.Debugf("CloneFrom: Initial old map: %v", old)
+
+	// 2) Bulk‐wipe the namespace so we don't leave old keys behind
 	if err := s.clearNamespace(ctx); err != nil {
 		return err
 	}
@@ -686,22 +689,29 @@ func (s *set) CloneFrom(ctx context.Context, src *set, priorityHint uint64) erro
 		key := extractKey(r.Key, prefix)
 		prio, newVal, _ := decodeValue(r.Value)
 		if prio <= priorityHint {
+			s.logger.Debugf("CloneFrom: Removing from old (low prio): %s (prio=%d <= %d)", key, prio, priorityHint)
 			delete(old, key)
 			continue
 		}
 		if oldVal, seen := old[key]; seen {
+			s.logger.Debugf("CloneFrom: Key %s seen in both old and new", key)
 			delete(old, key)
 			if !bytes.Equal(oldVal, newVal) && s.putHook != nil {
+				s.logger.Debugf("CloneFrom: Firing putHook for %s (value changed)", key)
 				s.putHook(key, newVal)
 			}
 		} else if s.putHook != nil {
+			s.logger.Debugf("CloneFrom: Firing putHook for %s (new key)", key)
 			s.putHook(key, newVal)
 		}
 	}
 	results2.Close()
 
+	s.logger.Debugf("CloneFrom: Final old map before delete hooks: %v", old)
+
 	// 5) Any key still in `old` was deleted—fire deleteHook and delete the key
 	for key := range old {
+		s.logger.Debugf("CloneFrom: Firing deleteHook for %s", key)
 		if s.deleteHook != nil {
 			s.deleteHook(key)
 		}
