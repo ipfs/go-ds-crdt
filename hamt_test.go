@@ -16,6 +16,7 @@ import (
 	mdutils "github.com/ipfs/boxo/ipld/merkledag/test"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
+	"github.com/ipfs/go-ds-crdt/pb"
 	format "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
 	logging "github.com/ipfs/go-log/v2"
@@ -444,85 +445,130 @@ func TestTriggerSnapshot(t *testing.T) {
 
 func TestSnapshotAllowsLowerPriorityValueToResurface(t *testing.T) {
 	ctx := context.Background()
+
+	//=== CRITICAL BUG REGRESSION TEST ===
+	//Testing that snapshots preserve full CRDT history, not just current k-v pairs
+	//
+	//📋 SCENARIO THAT EXPOSES THE BUG:
+	//1. Create k3=v1 (lower priority)
+	//2. Create k3=v2 (higher priority) - v2 wins
+	//3. 🔄 CREATE SNAPSHOT (this is the critical step)
+	//4. Selectively tombstone ONLY v2 (not v1)
+	//5. Expected: v1 should resurface
+	//6. 🐛 OLD BUG: New replica from snapshot only knows k3=v2, shows k3 as deleted after tombstone
+	//7. ✅ FIXED: New replica knows about v1, correctly shows k3=v1
+	//
+
+	// We need to create this scenario using internal CRDT operations
+	// because we need the snapshot to happen BEFORE the selective tombstone
+
 	opts := DefaultOptions()
-	opts.CompactDagSize = 7
+	opts.CompactDagSize = 8
 	opts.CompactRetainNodes = 2
-	opts.CompactInterval = 5 * time.Second
+	opts.CompactInterval = 2 * time.Second
 
 	env := createTestEnv(t)
 	defer env.Cleanup()
 
 	env.AddReplica(opts)
+	replica := env.replicas[0]
+
+	// Phase 1: Create the CRDT state with both versions
+	t.Log("Phase 1: Creating CRDT state with lower and higher priority versions")
+
+	require.NoError(t, replica.Put(ctx, ds.NewKey("k1"), []byte("baseline")))
+	require.NoError(t, replica.Put(ctx, ds.NewKey("k3"), []byte("v3-LowerPriority"))) // Priority ~2
+
+	// Snapshot of the tombstone delta BEFORE the second Put. We use this to filter later.
+	rmvTmpDelta, err := replica.set.Rmv(ctx, "k3")
+	require.NoError(t, err)
+
+	// Add operations to build priority
+	for i := 0; i < 3; i++ {
+		key := ds.NewKey(fmt.Sprintf("build-%d", i))
+		require.NoError(t, replica.Put(ctx, key, []byte("value")))
+	}
+
+	require.NoError(t, replica.Put(ctx, ds.NewKey("k3"), []byte("v3-GreaterPriority"))) // Priority ~6
+
+	// Verify higher priority wins
+	val, err := replica.Get(ctx, ds.NewKey("k3"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3-GreaterPriority"), val)
+	t.Logf("✓ State created: k3=%s (higher priority wins)", string(val))
+
+	// Phase 2: Trigger compaction to create snapshot with BOTH versions in CRDT history
+	t.Log("Phase 2: Creating snapshot with current state (k3=v3-GreaterPriority)")
+	t.Log("🔑 CRITICAL: Snapshot must contain BOTH v3-LowerPriority AND v3-GreaterPriority")
+
+	// Add 8 ops to exceed CompactDagSize=8 and trigger compaction logic
+	for i := 0; i < 8; i++ {
+		key := ds.NewKey(fmt.Sprintf("trigger-%d", i))
+		require.NoError(t, replica.Put(ctx, key, []byte("compact")))
+	}
+
+	// Wait for snapshot creation
+	require.Eventually(t, func() bool {
+		stats := replica.InternalStats(ctx)
+		m := stats.State.Members[replica.h.ID().String()]
+		if m != nil && m.Snapshot != nil {
+			t.Logf("✓ Snapshot created at height %d", m.Snapshot.Height)
+			return true
+		}
+		return false
+	}, 30*time.Second, 1*time.Second)
+
+	// Phase 3: The critical test - selective tombstone AFTER snapshot creation
+	t.Log("Phase 3: Applying selective tombstone of higher priority version")
+	t.Log("⚠️  This happens AFTER snapshot creation - this is key to exposing the bug")
+
+	// Here we need to simulate what would happen with selective tombstoning
+	// Since we can't easily do selective tombstones with the high-level API,
+
+	// Snapshot of the tombstone delta BEFORE the second Put. We use this to filter later.
+	rmvDelta, err := replica.set.Rmv(ctx, "k3")
+	require.NoError(t, err)
+
+	// Only keep the tombstone that removes the newer (v3-GreaterPriority) version of k3.
+	var filtered []*pb.Element
+	for _, tombstone := range rmvDelta.Tombstones {
+		if tombstone.Id != rmvTmpDelta.Tombstones[0].Id {
+			filtered = append(filtered, tombstone)
+		}
+	}
+
+	rmvDelta.Tombstones = filtered
+	_, height, err := replica.heads.List(ctx)
+	rmvDelta.Priority = height + 1
+	require.NoError(t, replica.publish(ctx, rmvDelta))
+	// For this test, we'll add a replica and see what it gets from the snapshot
+	// The key insight: the snapshot was created when k3=v3-GreaterPriority was visible
+	// If selective tombstoning happens after, the new replica needs to be able to
+	// compute the correct state from the full CRDT history
+
+	t.Log("Phase 4: Creating new replica from snapshot")
+	t.Log("🎯 This new replica will restore from the snapshot created in Phase 2")
+
 	env.AddReplica(opts)
 
-	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("k1"), []byte("v1")))
-	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("k1"), []byte("v1"))
-
-	br0 := env.replicas[0].broadcaster.(*mockBroadcaster)
-	br1 := env.replicas[1].broadcaster.(*mockBroadcaster)
-	br0.dropProb.Store(101)
-	br1.dropProb.Store(101)
-
-	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("k2"), []byte("v2")))
-	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("k3"), []byte("v3-GreaterPriority")))
-	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("k3"), []byte("v3-LowerPriority")))
-	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("k4"), []byte("v4")))
-
-	v, err := env.replicas[0].Get(ctx, ds.NewKey("k3"))
-	require.NoError(t, err)
-	require.Equal(t, []byte("v3-GreaterPriority"), v)
-
-	v, err = env.replicas[1].Get(ctx, ds.NewKey("k3"))
-	require.NoError(t, err)
-	require.Equal(t, []byte("v3-LowerPriority"), v)
-
-	// Partially restore communication
-	br0.dropProb.Store(0)
-	br1.dropProb.Store(101)
-
-	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("k3"), []byte("v3-GreaterPriority"))
-
-	br0.dropProb.Store(101)
-
-	require.NoError(t, env.replicas[0].Delete(ctx, ds.NewKey("k3")))
-
-	_, err = env.replicas[0].Get(ctx, ds.NewKey("k3"))
-	require.ErrorIs(t, err, ds.ErrNotFound)
-
-	v, err = env.replicas[1].Get(ctx, ds.NewKey("k3"))
-	require.NoError(t, err)
-	require.Equal(t, []byte("v3-GreaterPriority"), v)
-
-	// More writes
-	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("somekey-1"), []byte("somevalue-1")))
-	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("somekey-2"), []byte("somevalue-2")))
-	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("somekey-3"), []byte("somevalue-3")))
-	require.NoError(t, env.replicas[1].Put(ctx, ds.NewKey("somekey-4"), []byte("somevalue-4")))
-
-	br0.dropProb.Store(0)
-	br1.dropProb.Store(0)
-
-	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("k3"), []byte("v3-LowerPriority"))
-	requireReplicaHasKey(t, ctx, env.replicas[0], ds.NewKey("somekey-4"), []byte("somevalue-4"))
-
-	require.NoError(t, env.replicas[0].Put(ctx, ds.NewKey("final-key"), []byte("final-value")))
-	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("final-key"), []byte("final-value"))
-
 	require.Eventually(t, func() bool {
-		m := env.replicas[0].InternalStats(ctx).State.Members[env.replicas[0].h.ID().String()]
-		return m.Snapshot != nil
-	}, 25*time.Second, 500*time.Millisecond)
-
-	requireReplicaHasKey(t, ctx, env.replicas[0], ds.NewKey("k3"), []byte("v3-LowerPriority"))
-	requireReplicaHasKey(t, ctx, env.replicas[1], ds.NewKey("k3"), []byte("v3-LowerPriority"))
-
-	// Add replica 2
-	env.AddReplica(opts)
-
-	require.Eventually(t, func() bool {
-		m := env.replicas[2].InternalStats(ctx).State.Members[env.replicas[2].h.ID().String()]
+		m := env.replicas[1].InternalStats(ctx).State.Members[env.replicas[1].h.ID().String()]
 		return m != nil && m.Snapshot != nil
-	}, 25*time.Second, 500*time.Millisecond)
+	}, 30*time.Second, 500*time.Millisecond)
 
-	requireReplicaHasKey(t, ctx, env.replicas[2], ds.NewKey("k3"), []byte("v3-LowerPriority"))
+	t.Log("✓ New replica created and restored from snapshot")
+
+	// Phase 5: The moment of truth - verify what the new replica can see
+	t.Log("Phase 5: Verifying new replica can access full CRDT history")
+
+	// The new replica should have the same k3 state as the original
+	val0, err0 := env.replicas[0].Get(ctx, ds.NewKey("k3"))
+	val1, err1 := env.replicas[1].Get(ctx, ds.NewKey("k3"))
+
+	require.NoError(t, err0)
+	require.NoError(t, err1)
+	require.Equal(t, "v3-LowerPriority", string(val1))
+	require.Equal(t, val0, val1)
+
+	t.Logf("✓ Both replicas see k3=%s", string(val1))
 }
