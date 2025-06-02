@@ -429,14 +429,19 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			continue
 		}
 
-		// Get our snapshot for comparison
-		var mySnapshot *pb.Snapshot
-		participant := store.state.GetState().Members[store.h.ID().String()]
-		if participant != nil {
-			mySnapshot = participant.Snapshot
-		}
-
 		for peerID, participant := range broadcast.Members {
+			// Skip our own participant data - we don't need to fast-forward to ourselves
+			if peerID == store.h.ID().String() {
+				continue
+			}
+
+			// Get our snapshot for comparison
+			var mySnapshot *pb.Snapshot
+			myParticipant := store.GetState(ctx).Members[store.h.ID().String()]
+			if myParticipant != nil {
+				mySnapshot = myParticipant.Snapshot
+			}
+
 			if snapshotsEqual(mySnapshot, participant.Snapshot) {
 				// Snapshots match, we can safely process heads
 				store.processParticipantHeads(ctx, peerID, participant)
@@ -458,7 +463,6 @@ func (store *Datastore) handleNext(ctx context.Context) {
 				store.handleDivergence(ctx, participant.Snapshot)
 			}
 		}
-
 	}
 }
 
@@ -1661,7 +1665,7 @@ func (store *Datastore) compact() {
 		case <-timer.C:
 			err := store.triggerCompactionIfNeeded(store.ctx)
 			if err != nil {
-				store.logger.Errorf("Error during compaction: %v", err)
+				store.logger.Errorf("error during compaction: %v", err)
 				//todo
 			}
 		}

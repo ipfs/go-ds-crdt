@@ -15,6 +15,10 @@ func (store *Datastore) tryFastForwardToSnapshot(
 	mySnapshot *pb.Snapshot,
 	participant *pb.Participant,
 ) error {
+
+	store.compactMux.Lock()
+	defer store.compactMux.Unlock()
+
 	target := participant.Snapshot
 	var mySnapshotCID cid.Cid
 	if mySnapshot != nil {
@@ -105,6 +109,12 @@ func (store *Datastore) tryFastForwardToSnapshot(
 		store.logger.Warnf("failed to mark snapshot delta head as processed: %v", err)
 	}
 
+	store.logger.Debugf("setting snapshot %s", lastSnapinfo.WrapperCID)
+	// Persist snapshot pointer in our StateManager.
+	if err := store.state.SetSnapshot(ctx, store.h.ID(), lastSnapinfo); err != nil {
+		return fmt.Errorf("setting snapshot: %w", err)
+	}
+
 	// ---------------------------------------------------------------------
 	// 5.   Continue with normal operation: ingest the peer’s heads
 	// ---------------------------------------------------------------------
@@ -122,12 +132,6 @@ func (store *Datastore) tryFastForwardToSnapshot(
 			store.logger.Errorf("error handling block %s: %s", h.Cid, err)
 		}
 
-	}
-
-	store.logger.Debugf("setting snapshot %s", lastSnapinfo.WrapperCID)
-	// Persist snapshot pointer in our StateManager.
-	if err := store.state.SetSnapshot(ctx, store.h.ID(), lastSnapinfo); err != nil {
-		return fmt.Errorf("setting snapshot: %w", err)
 	}
 
 	return nil
