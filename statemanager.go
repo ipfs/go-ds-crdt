@@ -83,7 +83,9 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 	defer m.mu.Unlock()
 	member, ok := m.state.Members[id.String()]
 	if !ok {
-		member = &pb.Participant{}
+		member = &pb.Participant{
+			BestBefore: uint64(m.clock.Now().Add(m.ttl).Unix()),
+		}
 		m.state.Members[id.String()] = member
 	}
 
@@ -138,7 +140,9 @@ func (m *StateManager) SetSnapshot(ctx context.Context, selfID peer.ID, info *Sn
 
 	member, ok := m.state.Members[selfID.String()]
 	if !ok {
-		member = &pb.Participant{}
+		member = &pb.Participant{
+			BestBefore: uint64(m.clock.Now().Add(m.ttl).Unix()),
+		}
 		m.state.Members[selfID.String()] = member
 	}
 
