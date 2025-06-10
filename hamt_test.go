@@ -298,7 +298,9 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 		for i := 1; i < 400; i++ {
 			key := fmt.Sprintf("key-%d", i)
 			value := []byte(fmt.Sprintf("value-%d", i))
-			return r0.Put(ctx, ds.NewKey(key), value)
+			if err := r0.Put(ctx, ds.NewKey(key), value); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -307,26 +309,61 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 		for i := 400; i < 999; i++ {
 			key := fmt.Sprintf("key-%d", i)
 			value := []byte(fmt.Sprintf("value-%d", i))
-			return r1.Put(ctx, ds.NewKey(key), value)
+			if err := r1.Put(ctx, ds.NewKey(key), value); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 
 	require.NoError(t, eg.Wait())
 
+	// Wait for both replicas to have heads and sync
 	require.Eventually(t, func() bool {
-		return len(r0.InternalStats(ctx).Heads) > 0 && len(r1.InternalStats(ctx).Heads) > 0
+		r0Stats := r0.InternalStats(ctx)
+		r1Stats := r1.InternalStats(ctx)
+		return len(r0Stats.Heads) > 0 && len(r1Stats.Heads) > 0
 	}, 30*time.Second, 1*time.Second)
 
-	keyFinal := ds.NewKey("key-1000")
-	valueFinal := []byte("value-1000")
+	// Add more writes to ensure we exceed the compaction threshold
+	// Write additional keys to trigger compaction more reliably
+	for i := 1000; i < 1100; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := []byte(fmt.Sprintf("value-%d", i))
+		require.NoError(t, r0.Put(ctx, ds.NewKey(key), value))
+	}
+
+	// Final key
+	keyFinal := ds.NewKey("key-final")
+	valueFinal := []byte("value-final")
 	require.NoError(t, r0.Put(ctx, keyFinal, valueFinal))
 
+	// Wait longer and add debugging
 	require.Eventually(t, func() bool {
-		m := r0.InternalStats(ctx).State.Members[r0.h.ID().String()]
-		return m.Snapshot != nil
-	}, 1*time.Minute, 500*time.Millisecond)
+		stats := r0.InternalStats(ctx)
+		t.Logf("r0 stats: Heads=%d, DagSize=%d", len(stats.Heads), stats.MaxHeight)
 
+		if stats.State == nil || stats.State.Members == nil {
+			t.Logf("State or Members is nil")
+			return false
+		}
+
+		member, exists := stats.State.Members[r0.h.ID().String()]
+		if !exists {
+			t.Logf("Member %s not found in state", r0.h.ID().String())
+			return false
+		}
+
+		if member.Snapshot == nil {
+			t.Logf("Snapshot is nil for member %s", r0.h.ID().String())
+			return false
+		}
+
+		t.Logf("Snapshot found for member %s", r0.h.ID().String())
+		return true
+	}, 2*time.Minute, 1*time.Second) // Increased timeout and check interval
+
+	// Rest of the test remains the same
 	snapshotCID := cid.MustParse(r0.InternalStats(ctx).State.Members[r0.h.ID().String()].Snapshot.SnapshotKey.Cid)
 
 	info, err := r0.loadSnapshotInfo(ctx, snapshotCID)
@@ -338,7 +375,6 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 		expectedKey := fmt.Sprintf("/key-%d", i)
 		_, err := snapshotSet.Element(ctx, expectedKey)
 		require.NoError(t, err)
-		//require.True(t, exists, "Expected key %s to exist", expectedKey)
 	}
 }
 

@@ -180,6 +180,9 @@ func (m *StateManager) SetMeta(ctx context.Context, id peer.ID, metaData map[str
 		for k, v := range metaData {
 			if current, exists := member.Metadata[k]; !exists || v != current {
 				changesMade = true
+				if member.Metadata == nil {
+					member.Metadata = make(map[string]string)
+				}
 				member.Metadata[k] = v
 			}
 		}
