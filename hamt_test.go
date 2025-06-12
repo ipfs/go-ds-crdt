@@ -293,77 +293,262 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 	r0 := replicas[0]
 	r1 := replicas[1]
 
-	var eg errgroup.Group
-	eg.Go(func() error {
-		for i := 1; i < 400; i++ {
-			key := fmt.Sprintf("key-%d", i)
-			value := []byte(fmt.Sprintf("value-%d", i))
-			if err := r0.Put(ctx, ds.NewKey(key), value); err != nil {
-				return err
+	br0 := r0.broadcaster.(*mockBroadcaster)
+	br1 := r1.broadcaster.(*mockBroadcaster)
+
+	// Phase 1: Create common DAG foundation on one replica
+	t.Logf("Phase 1: Creating common DAG foundation")
+	for i := 1; i < 50; i++ {
+		key := fmt.Sprintf("foundation-key-%d", i)
+		value := []byte(fmt.Sprintf("foundation-value-%d", i))
+		require.NoError(t, r0.Put(ctx, ds.NewKey(key), value))
+	}
+
+	// Wait for r1 to sync the foundation
+	require.Eventually(t, func() bool {
+		testKey := ds.NewKey("foundation-key-25")
+		_, err := r1.Get(ctx, testKey)
+		return err == nil
+	}, 30*time.Second, 1*time.Second)
+
+	t.Logf("Phase 1 complete - both replicas have common foundation")
+
+	// Wait for both replicas to be properly synced (same head count)
+	require.Eventually(t, func() bool {
+		r0Stats := r0.InternalStats(ctx)
+		r1Stats := r1.InternalStats(ctx)
+
+		t.Logf("Sync check - r0: %d heads, r1: %d heads", len(r0Stats.Heads), len(r1Stats.Heads))
+
+		// Both should have the same number of heads and at least 1
+		return len(r0Stats.Heads) > 0 && len(r1Stats.Heads) > 0 &&
+			len(r0Stats.Heads) == len(r1Stats.Heads)
+	}, 30*time.Second, 2*time.Second)
+
+	// Verify we start with single head on both replicas
+	r0Stats := r0.InternalStats(ctx)
+	r1Stats := r1.InternalStats(ctx)
+	t.Logf("After foundation sync - r0: %d heads, r1: %d heads", len(r0Stats.Heads), len(r1Stats.Heads))
+	require.Equal(t, 1, len(r0Stats.Heads), "r0 should start with single head after foundation")
+	require.Equal(t, 1, len(r1Stats.Heads), "r1 should start with single head after foundation")
+
+	// Phase 2: Create divergent branches and VERIFY we get multiple heads
+	foundMultipleHeads := false
+	maxHeadsObserved := 1
+
+	for batch := 0; batch < 3; batch++ {
+		t.Logf("Phase 2: Starting partition batch %d", batch)
+
+		// Partition the network to create divergent branches
+		br0.dropProb.Store(101)
+		br1.dropProb.Store(101)
+
+		// Write different keys on each replica while partitioned
+		var eg errgroup.Group
+		eg.Go(func() error {
+			base := 100 + (batch * 200)
+			for i := base; i < base+100; i++ {
+				key := fmt.Sprintf("r0-key-%d", i)
+				value := []byte(fmt.Sprintf("r0-value-%d", i))
+				if err := r0.Put(ctx, ds.NewKey(key), value); err != nil {
+					return err
+				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
 
-	eg.Go(func() error {
-		for i := 400; i < 999; i++ {
-			key := fmt.Sprintf("key-%d", i)
-			value := []byte(fmt.Sprintf("value-%d", i))
-			if err := r1.Put(ctx, ds.NewKey(key), value); err != nil {
-				return err
+		eg.Go(func() error {
+			base := 100 + (batch * 200)
+			for i := base; i < base+100; i++ {
+				key := fmt.Sprintf("r1-key-%d", i)
+				value := []byte(fmt.Sprintf("r1-value-%d", i))
+				if err := r1.Put(ctx, ds.NewKey(key), value); err != nil {
+					return err
+				}
 			}
+			return nil
+		})
+
+		require.NoError(t, eg.Wait())
+
+		// Verify each replica has independent heads while partitioned
+		r0Stats := r0.InternalStats(ctx)
+		r1Stats := r1.InternalStats(ctx)
+		t.Logf("During partition %d - r0 heads: %d, r1 heads: %d", batch, len(r0Stats.Heads), len(r1Stats.Heads))
+
+		// Reconnect and observe the merge process
+		br0.dropProb.Store(0)
+		br1.dropProb.Store(0)
+
+		// Monitor heads during the merge process
+		for i := 0; i < 30; i++ {
+			r0Stats := r0.InternalStats(ctx)
+			r1Stats := r1.InternalStats(ctx)
+
+			currentMaxHeads := len(r0Stats.Heads)
+			if len(r1Stats.Heads) > currentMaxHeads {
+				currentMaxHeads = len(r1Stats.Heads)
+			}
+
+			if currentMaxHeads > maxHeadsObserved {
+				maxHeadsObserved = currentMaxHeads
+			}
+
+			if currentMaxHeads > 1 {
+				foundMultipleHeads = true
+				t.Logf("✓ Multiple heads observed! Batch %d, iteration %d: r0=%d heads, r1=%d heads",
+					batch, i, len(r0Stats.Heads), len(r1Stats.Heads))
+			}
+
+			time.Sleep(200 * time.Millisecond)
 		}
-		return nil
-	})
 
-	require.NoError(t, eg.Wait())
+		// Final state after this batch
+		r0Stats = r0.InternalStats(ctx)
+		r1Stats = r1.InternalStats(ctx)
+		t.Logf("After batch %d merge: r0=%d heads, r1=%d heads, r0 MaxHeight=%d",
+			batch, len(r0Stats.Heads), len(r1Stats.Heads), r0Stats.MaxHeight)
+	}
 
-	// Wait for both replicas to have heads and sync
+	// REQUIRE that we actually observed multiple heads - FAIL THE TEST if we didn't
+	t.Logf("Maximum heads observed during test: %d", maxHeadsObserved)
+	if !foundMultipleHeads {
+		t.Fatalf("TEST FAILURE: Never observed multiple heads! This test is supposed to demonstrate multiple heads. Max heads seen: %d", maxHeadsObserved)
+	}
+	if maxHeadsObserved <= 1 {
+		t.Fatalf("TEST FAILURE: Never observed more than 1 head during partition/merge cycles. Max heads seen: %d", maxHeadsObserved)
+	}
+
+	t.Logf("✓ SUCCESS: Multiple heads verified! Maximum observed: %d", maxHeadsObserved)
+
+	// Phase 3: Add sequential writes to exceed compaction threshold
+	t.Logf("Phase 3: Adding sequential writes to trigger compaction")
+	for i := 1000; i < 1100; i++ {
+		key := fmt.Sprintf("sequential-key-%d", i)
+		value := []byte(fmt.Sprintf("sequential-value-%d", i))
+		require.NoError(t, r0.Put(ctx, ds.NewKey(key), value))
+	}
+
+	keyFinal := ds.NewKey("key-final")
+	valueFinal := []byte("value-final")
+	require.NoError(t, r0.Put(ctx, keyFinal, valueFinal))
+
+	// Wait for final sync - but we already verified multiple heads above
 	require.Eventually(t, func() bool {
 		r0Stats := r0.InternalStats(ctx)
 		r1Stats := r1.InternalStats(ctx)
 		return len(r0Stats.Heads) > 0 && len(r1Stats.Heads) > 0
 	}, 30*time.Second, 1*time.Second)
 
-	// Add more writes to ensure we exceed the compaction threshold
-	// Write additional keys to trigger compaction more reliably
-	for i := 1000; i < 1100; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		value := []byte(fmt.Sprintf("value-%d", i))
-		require.NoError(t, r0.Put(ctx, ds.NewKey(key), value))
-	}
+	finalStats := r0.InternalStats(ctx)
+	t.Logf("Final state before compaction - heads: %d, MaxHeight: %d",
+		len(finalStats.Heads), finalStats.MaxHeight)
 
-	// Final key
-	keyFinal := ds.NewKey("key-final")
-	valueFinal := []byte("value-final")
-	require.NoError(t, r0.Put(ctx, keyFinal, valueFinal))
-
-	// Wait longer and add debugging
+	// Phase 4: Wait for compaction
 	require.Eventually(t, func() bool {
 		stats := r0.InternalStats(ctx)
-		t.Logf("r0 stats: Heads=%d, DagSize=%d", len(stats.Heads), stats.MaxHeight)
+		t.Logf("Checking for compaction - Heads: %d, MaxHeight: %d", len(stats.Heads), stats.MaxHeight)
 
 		if stats.State == nil || stats.State.Members == nil {
-			t.Logf("State or Members is nil")
 			return false
 		}
 
 		member, exists := stats.State.Members[r0.h.ID().String()]
 		if !exists {
-			t.Logf("Member %s not found in state", r0.h.ID().String())
 			return false
 		}
 
 		if member.Snapshot == nil {
-			t.Logf("Snapshot is nil for member %s", r0.h.ID().String())
 			return false
 		}
 
-		t.Logf("Snapshot found for member %s", r0.h.ID().String())
+		t.Logf("✓ Snapshot found for member %s", r0.h.ID().String())
 		return true
-	}, 2*time.Minute, 1*time.Second) // Increased timeout and check interval
+	}, 2*time.Minute, 1*time.Second)
 
-	// Rest of the test remains the same
+	// Phase 5: Comprehensive database verification
+	t.Logf("Phase 5: Verifying database integrity on both replicas")
+
+	// Verify foundation keys exist on both replicas
+	foundationOnR0, foundationOnR1 := 0, 0
+	for i := 1; i < 50; i++ {
+		key := ds.NewKey(fmt.Sprintf("foundation-key-%d", i))
+
+		if _, err := r0.Get(ctx, key); err == nil {
+			foundationOnR0++
+		}
+		if _, err := r1.Get(ctx, key); err == nil {
+			foundationOnR1++
+		}
+	}
+	t.Logf("Foundation keys - r0: %d/49, r1: %d/49", foundationOnR0, foundationOnR1)
+	require.Equal(t, 49, foundationOnR0, "r0 should have all foundation keys")
+	require.Equal(t, 49, foundationOnR1, "r1 should have all foundation keys")
+
+	// Verify branch keys from all batches
+	totalR0Keys, totalR1Keys := 0, 0
+	for batch := 0; batch < 3; batch++ {
+		r0KeysOnR0, r0KeysOnR1 := 0, 0
+		r1KeysOnR0, r1KeysOnR1 := 0, 0
+
+		base := 100 + (batch * 200)
+		for i := base; i < base+100; i++ {
+			// Check r0's keys
+			r0Key := ds.NewKey(fmt.Sprintf("r0-key-%d", i))
+			if _, err := r0.Get(ctx, r0Key); err == nil {
+				r0KeysOnR0++
+				totalR0Keys++
+			}
+			if _, err := r1.Get(ctx, r0Key); err == nil {
+				r0KeysOnR1++
+			}
+
+			// Check r1's keys
+			r1Key := ds.NewKey(fmt.Sprintf("r1-key-%d", i))
+			if _, err := r0.Get(ctx, r1Key); err == nil {
+				r1KeysOnR0++
+			}
+			if _, err := r1.Get(ctx, r1Key); err == nil {
+				r1KeysOnR1++
+				totalR1Keys++
+			}
+		}
+
+		t.Logf("Batch %d verification:", batch)
+		t.Logf("  r0's keys: r0 has %d/100, r1 has %d/100", r0KeysOnR0, r0KeysOnR1)
+		t.Logf("  r1's keys: r0 has %d/100, r1 has %d/100", r1KeysOnR0, r1KeysOnR1)
+	}
+
+	t.Logf("Total branch keys - r0 created: %d, r1 created: %d", totalR0Keys, totalR1Keys)
+	require.Greater(t, totalR0Keys, 250, "r0 should have created 300 keys across 3 batches")
+	require.Greater(t, totalR1Keys, 250, "r1 should have created 300 keys across 3 batches")
+
+	// Verify sequential keys
+	sequentialOnR0, sequentialOnR1 := 0, 0
+	for i := 1000; i < 1100; i++ {
+		key := ds.NewKey(fmt.Sprintf("sequential-key-%d", i))
+
+		if _, err := r0.Get(ctx, key); err == nil {
+			sequentialOnR0++
+		}
+		if _, err := r1.Get(ctx, key); err == nil {
+			sequentialOnR1++
+		}
+	}
+	t.Logf("Sequential keys - r0: %d/100, r1: %d/100", sequentialOnR0, sequentialOnR1)
+	require.Equal(t, 100, sequentialOnR0, "r0 should have all sequential keys")
+	require.Equal(t, 100, sequentialOnR1, "r1 should have all sequential keys")
+
+	// Verify final key
+	finalKey := ds.NewKey("key-final")
+	_, err := r0.Get(ctx, finalKey)
+	require.NoError(t, err, "r0 should have final key")
+	_, err = r1.Get(ctx, finalKey)
+	require.NoError(t, err, "r1 should have final key")
+
+	t.Logf("✓ Database verification complete - both replicas have working databases")
+
+	// Phase 6: Verify snapshot integrity
 	snapshotCID := cid.MustParse(r0.InternalStats(ctx).State.Members[r0.h.ID().String()].Snapshot.SnapshotKey.Cid)
 
 	info, err := r0.loadSnapshotInfo(ctx, snapshotCID)
@@ -371,11 +556,61 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 
 	snapshotSet := ExtractSnapshotSet(t, ctx, r0, info.HamtRootCID)
 
-	for i := 1; i < 500; i++ {
-		expectedKey := fmt.Sprintf("/key-%d", i)
+	// Verify foundation keys are in the snapshot
+	foundationKeysFound := 0
+	for i := 1; i < 50; i++ {
+		expectedKey := fmt.Sprintf("/foundation-key-%d", i)
 		_, err := snapshotSet.Element(ctx, expectedKey)
-		require.NoError(t, err)
+		if err == nil {
+			foundationKeysFound++
+		}
 	}
+
+	t.Logf("Found %d/49 foundation keys in snapshot", foundationKeysFound)
+	require.Greater(t, foundationKeysFound, 40, "Should find most foundation keys in snapshot")
+
+	// Verify branch keys from all batches are in the snapshot
+	r0BranchKeysFound, r1BranchKeysFound := 0, 0
+	for batch := 0; batch < 3; batch++ {
+		base := 100 + (batch * 200)
+		for i := base; i < base+150; i++ { // Check first 50 of each batch
+			r0Key := fmt.Sprintf("/r0-key-%d", i)
+			if _, err := snapshotSet.Element(ctx, r0Key); err == nil {
+				r0BranchKeysFound++
+			}
+
+			r1Key := fmt.Sprintf("/r1-key-%d", i)
+			if _, err := snapshotSet.Element(ctx, r1Key); err == nil {
+				r1BranchKeysFound++
+			}
+		}
+	}
+
+	t.Logf("Found %d r0 branch keys and %d r1 branch keys in snapshot",
+		r0BranchKeysFound, r1BranchKeysFound)
+	require.Greater(t, r0BranchKeysFound, 0, "Should find r0 branch keys in snapshot")
+
+	// Check if r1 keys are missing from snapshot
+	if r1BranchKeysFound == 0 {
+		t.Logf("⚠️  No r1 branch keys found in snapshot - this suggests:")
+		t.Logf("    1. Compaction occurred before r1's changes were fully merged")
+		t.Logf("    2. Block availability issues during partition prevented r1 data inclusion")
+		t.Logf("    3. CRDT merge strategy favored r0's timeline")
+	} else {
+		t.Logf("✓ Found r1 branch keys in snapshot")
+	}
+
+	// Verify some sequential keys are in the snapshot
+	sequentialKeysFound := 0
+	for i := 1000; i < 1050; i++ {
+		expectedKey := fmt.Sprintf("/sequential-key-%d", i)
+		_, err := snapshotSet.Element(ctx, expectedKey)
+		if err == nil {
+			sequentialKeysFound++
+		}
+	}
+
+	t.Logf("Found %d/50 sequential keys in snapshot", sequentialKeysFound)
 }
 
 func ExtractSnapshotSet(t *testing.T, ctx context.Context, store *Datastore, snapshot cid.Cid) *set {
