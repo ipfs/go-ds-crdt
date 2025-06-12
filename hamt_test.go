@@ -228,6 +228,8 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 
 	env.AddReplica(opts)
 
+	r0Id := env.replicas[0].h.ID().String()
+
 	ctx := context.Background()
 
 	k := ds.NewKey("k1")
@@ -248,21 +250,24 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 
 	// Wait for compaction to trigger automatically
 	require.Eventually(t, func() bool {
-		return env.replicas[0].InternalStats(ctx).State.Snapshot != nil &&
-			env.replicas[0].InternalStats(ctx).State.Snapshot.SnapshotKey != nil
+		s := env.replicas[0].InternalStats(ctx).State.Members[r0Id]
+		return s != nil && s.Snapshot != nil &&
+			s.Snapshot.SnapshotKey != nil
 	}, 1*time.Minute, 500*time.Millisecond, "Replica 0 should have created a snapshot")
 
 	// Fetch the snapshot that was created
 	s := env.replicas[0].InternalStats(ctx).State
-	require.NotNil(t, s.Snapshot, "Snapshot should have been triggered")
+
+	require.NotNil(t, s.Members[r0Id].Snapshot, "Snapshot should have been triggered")
 
 	// Add new replica, which should eventually restore the snapshot automatically
 	env.AddReplica(opts)
-
+	r1Id := env.replicas[1].h.ID().String()
 	// Wait for snapshot to be present in replica 1
 	require.Eventually(t, func() bool {
-		return env.replicas[1].InternalStats(ctx).State.Snapshot != nil &&
-			env.replicas[1].InternalStats(ctx).State.Snapshot.SnapshotKey != nil
+		s := env.replicas[1].InternalStats(ctx).State.Members[r1Id]
+		return s != nil && s.Snapshot != nil &&
+			s.Snapshot.SnapshotKey != nil
 	}, 1*time.Minute, 500*time.Millisecond, "Replica 1 should have gotten a snapshot")
 
 	// Verify that key `k1` now exists in Replica 1 with the last known value
