@@ -135,8 +135,10 @@ func (env *testEnv) AddReplica(opts *Options) {
 	env.replicas = append(env.replicas, replica)
 
 	// Update all replica broadcasters with new list of broadcast channels
-	for i := range env.broadcasters {
+	for i, b := range env.broadcasters {
+		b.mu.Lock()
 		env.broadcasters[i].chans = env.replicaBcastChans
+		b.mu.Unlock()
 	}
 
 	if debug {

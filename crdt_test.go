@@ -105,6 +105,7 @@ type mockBroadcaster struct {
 	myChan   chan []byte
 	dropProb *atomic.Int64 // probability of dropping a message instead of receiving it
 	t        testing.TB
+	mu       sync.RWMutex
 }
 
 func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFunc) {
@@ -126,6 +127,8 @@ func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFun
 }
 
 func (mb *mockBroadcaster) Broadcast(ctx context.Context, data []byte) error {
+	mb.mu.RLock()
+	defer mb.mu.RUnlock()
 	var wg sync.WaitGroup
 
 	randg := rand.New(rand.NewSource(time.Now().UnixNano()))
