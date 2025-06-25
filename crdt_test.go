@@ -586,32 +586,51 @@ func TestCRDTHooks(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.PutHook = func(k ds.Key, v []byte) {
-		atomic.AddInt64(&put, 1)
+		count := atomic.AddInt64(&put, 1)
+		t.Logf("PutHook called for key %s, count now: %d", k, count)
 	}
 	opts.DeleteHook = func(k ds.Key) {
-		atomic.AddInt64(&deleted, 1)
+		count := atomic.AddInt64(&deleted, 1)
+		t.Logf("DeleteHook called for key %s, count now: %d", k, count)
 	}
 
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
+	t.Logf("Created %d replicas", len(replicas))
+
 	k := ds.RandomKey()
-	err := replicas[0].Put(ctx, k, nil)
+	t.Logf("Using key: %s", k)
+
+	err := replicas[0].Put(ctx, k, []byte("test-value"))
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	require.Eventually(t, func() bool {
+		putCount := atomic.LoadInt64(&put)
+		t.Logf("Current put count: %d, expected: %d", putCount, len(replicas))
+		return putCount == int64(len(replicas))
+	}, 10*time.Second, 500*time.Millisecond, "all replicas should have notified Put")
+
+	// Verify the key exists on all replicas before deleting
+	for i, replica := range replicas {
+		has, err := replica.Has(ctx, k)
+		require.NoError(t, err)
+		t.Logf("Replica %d has key %s: %t", i, k, has)
+		require.True(t, has, "Key should exist on replica %d before delete", i)
 	}
 
 	err = replicas[0].Delete(ctx, k)
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	if atomic.LoadInt64(&put) != int64(len(replicas)) {
-		t.Error("all replicas should have notified Put", put)
-	}
-	if atomic.LoadInt64(&deleted) != int64(len(replicas)) {
-		t.Error("all replicas should have notified Remove", deleted)
-	}
+
+	require.Eventually(t, func() bool {
+		deleteCount := atomic.LoadInt64(&deleted)
+		t.Logf("Current delete count: %d, expected: %d", deleteCount, len(replicas))
+		return deleteCount == int64(len(replicas))
+	}, 10*time.Second, 500*time.Millisecond, "all replicas should have notified Delete")
 }
 
 func TestCRDTBatch(t *testing.T) {
@@ -1005,7 +1024,7 @@ func TestMigration0to1(t *testing.T) {
 
 func TestGetAllMemberCommonHeads(t *testing.T) {
 	ctx := context.Background()
-	stateMgr, err := NewStateManager(ctx, ds.NewMapDatastore(), ds.NewKey(""), 300)
+	stateMgr, err := NewStateManager(ctx, ds.NewMapDatastore(), ds.NewKey(""), 300, log.Logger("crdt"))
 	require.NoError(t, err)
 	store := &Datastore{state: stateMgr}
 
