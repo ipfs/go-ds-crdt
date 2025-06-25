@@ -18,7 +18,7 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-ds-crdt/pb"
 	format "github.com/ipfs/go-ipld-format"
-	log "github.com/ipfs/go-log/v2"
+	"github.com/ipfs/go-log"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -901,6 +901,7 @@ func TestSnapshotAllowsLowerPriorityValueToResurface(t *testing.T) {
 	rmvDelta.Tombstones = filtered
 	_, height, err := replica.heads.List(ctx)
 	rmvDelta.Priority = height + 1
+	require.NoError(t, err)
 	require.NoError(t, replica.publish(ctx, rmvDelta))
 	// For this test, we'll add a replica and see what it gets from the snapshot
 	// The key insight: the snapshot was created when k3=v3-GreaterPriority was visible
