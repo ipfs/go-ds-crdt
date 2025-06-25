@@ -2,6 +2,8 @@ package crdt
 
 import (
 	"context"
+	stdsync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -239,21 +241,27 @@ func TestStateManager_UpdateHeads(t *testing.T) {
 	})
 
 	t.Run("callback is triggered", func(t *testing.T) {
-		callbackTriggered := false
+		var triggered int32
 		var callbackMembers map[string]*pb.Participant
+		var mu stdsync.Mutex
 
 		manager.SetMembershipUpdateCallback(func(members map[string]*pb.Participant) {
-			callbackTriggered = true
+			mu.Lock()
 			callbackMembers = members
+			mu.Unlock()
+			atomic.StoreInt32(&triggered, 1)
 		})
 
 		err := manager.UpdateHeads(ctx, peerID, testCIDs, true)
 		require.NoError(t, err)
 
-		// Wait a bit for goroutine to execute
+		// Wait for callback to run
 		time.Sleep(10 * time.Millisecond)
 
-		assert.True(t, callbackTriggered)
+		assert.Equal(t, int32(1), atomic.LoadInt32(&triggered))
+
+		mu.Lock()
+		defer mu.Unlock()
 		assert.Contains(t, callbackMembers, peerID.String())
 	})
 }
@@ -362,9 +370,9 @@ func TestStateManager_MergeMembers(t *testing.T) {
 	})
 
 	t.Run("callback is triggered", func(t *testing.T) {
-		callbackTriggered := false
+		var callbackTriggered int32
 		manager.SetMembershipUpdateCallback(func(members map[string]*pb.Participant) {
-			callbackTriggered = true
+			atomic.StoreInt32(&callbackTriggered, 1)
 		})
 
 		broadcast := &pb.StateBroadcast{
@@ -380,7 +388,7 @@ func TestStateManager_MergeMembers(t *testing.T) {
 
 		// Wait for goroutine
 		time.Sleep(10 * time.Millisecond)
-		assert.True(t, callbackTriggered)
+		assert.Equal(t, int32(1), atomic.LoadInt32(&callbackTriggered))
 	})
 }
 
@@ -534,10 +542,13 @@ func TestStateManager_SetMembershipUpdateCallback(t *testing.T) {
 	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 
+	var mu stdsync.Mutex
 	callbackCount := 0
 	var lastMembers map[string]*pb.Participant
 
 	callback := func(members map[string]*pb.Participant) {
+		mu.Lock()
+		defer mu.Unlock()
 		callbackCount++
 		lastMembers = members
 	}
@@ -551,6 +562,8 @@ func TestStateManager_SetMembershipUpdateCallback(t *testing.T) {
 	// Wait for goroutine
 	time.Sleep(10 * time.Millisecond)
 
+	mu.Lock()
+	defer mu.Unlock()
 	assert.Equal(t, 1, callbackCount)
 	assert.Contains(t, lastMembers, peerID.String())
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	dag "github.com/ipfs/boxo/ipld/merkledag"
@@ -20,6 +21,7 @@ type HAMTDatastore struct {
 	hamtShard  *hamt.Shard
 	dagService ipld.DAGService
 	ctx        context.Context
+	mu         sync.RWMutex
 }
 
 // NewHAMTDatastore creates a new datastore backed by a HAMT
@@ -58,6 +60,8 @@ func NewHAMTDatastore(ctx context.Context, dagService ipld.DAGService, rootCID c
 
 // Get implements the datastore.Read interface
 func (hd *HAMTDatastore) Get(ctx context.Context, key ds.Key) ([]byte, error) {
+	hd.mu.RLock()
+	defer hd.mu.RUnlock()
 	link, err := hd.hamtShard.Find(ctx, key.String())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -81,6 +85,8 @@ func (hd *HAMTDatastore) Get(ctx context.Context, key ds.Key) ([]byte, error) {
 
 // Has implements the datastore.Read interface
 func (hd *HAMTDatastore) Has(ctx context.Context, key ds.Key) (bool, error) {
+	hd.mu.RLock()
+	defer hd.mu.RUnlock()
 	_, err := hd.hamtShard.Find(ctx, key.String())
 	if err != nil {
 		if err == os.ErrNotExist {
@@ -99,15 +105,26 @@ func (hd *HAMTDatastore) GetSize(ctx context.Context, key ds.Key) (size int, err
 
 // Query implements the datastore.Read interface
 func (hd *HAMTDatastore) Query(ctx context.Context, q query.Query) (query.Results, error) {
+	hd.mu.RLock()
+	defer hd.mu.RUnlock()
 	// This is a more complex operation for HAMTs
 	// We need to properly iterate and filter based on the query
+	node, err := hd.hamtShard.Node()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Node for shard: %w", err)
+	}
+	hamtShard, err := hamt.NewHamtFromDag(hd.dagService, node)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize HAMT shard: %w", err)
+	}
 
 	// Create and return results
 	return query.ResultsWithContext(q, func(ctx context.Context, results chan<- query.Result) {
 
 		prefix := ds.NewKey(q.Prefix)
+
 		// Use ForEach to iterate through all entries in the HAMT
-		err := hd.hamtShard.ForEachLink(ctx, func(link *ipld.Link) error {
+		err := hamtShard.ForEachLink(ctx, func(link *ipld.Link) error {
 			k := ds.NewKey(link.Name)
 
 			// Check if the key matches the query prefix
@@ -160,6 +177,8 @@ func (hd *HAMTDatastore) Query(ctx context.Context, q query.Query) (query.Result
 
 // Put implements the datastore.Write interface
 func (hd *HAMTDatastore) Put(ctx context.Context, key ds.Key, value []byte) error {
+	hd.mu.Lock()
+	defer hd.mu.Unlock()
 	// Create a raw node for the value
 	nd := dag.NodeWithData(value)
 	nd.SetCidBuilder(dag.V1CidPrefix())
@@ -181,6 +200,8 @@ func (hd *HAMTDatastore) Put(ctx context.Context, key ds.Key, value []byte) erro
 
 // Delete implements the datastore.Write interface
 func (hd *HAMTDatastore) Delete(ctx context.Context, key ds.Key) error {
+	hd.mu.Lock()
+	defer hd.mu.Unlock()
 	err := hd.hamtShard.Remove(ctx, key.String())
 	if err != nil && err != os.ErrNotExist {
 		return fmt.Errorf("failed to remove key from HAMT: %w", err)

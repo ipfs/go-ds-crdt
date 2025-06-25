@@ -10,6 +10,7 @@ import (
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
+	dssync "github.com/ipfs/go-datastore/sync"
 	"github.com/ipfs/go-ds-crdt/pb"
 
 	logging "github.com/ipfs/go-log/v2"
@@ -384,8 +385,9 @@ func TestCloneFrom_HookConsistency_AllScenarios(t *testing.T) {
 
 	// === BASE STATE ===
 	baseDS, err := NewHAMTDatastore(ctx, dagServ, cid.Undef)
+
 	require.NoError(t, err)
-	baseSet, err := newCRDTSet(ctx, baseDS, namespace, dagServ, logger, nil, nil)
+	baseSet, err := newCRDTSet(ctx, dssync.MutexWrap(baseDS), namespace, dagServ, logger, nil, nil)
 	require.NoError(t, err)
 
 	merge := func(s *set, d *pb.Delta, id string) { require.NoError(t, s.Merge(ctx, d, id)) }
