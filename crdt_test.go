@@ -476,7 +476,10 @@ func TestCRDTPriority(t *testing.T) {
 		}(r, i)
 	}
 	wg.Wait()
-	time.Sleep(5000 * time.Millisecond)
+
+	// Wait for convergence
+	RequireConvergence(t, replicas, ctx)
+
 	var v, lastv []byte
 	var err error
 	for i, r := range replicas {
@@ -511,6 +514,69 @@ func TestCRDTPriority(t *testing.T) {
 	//replicas[14].PrintDAG()
 	//fmt.Println("=======================================================")
 	//replicas[1].PrintDAG()
+}
+
+func RequireConvergence(t *testing.T, replicas []*Datastore, ctx context.Context) {
+	require.Eventually(t, func() bool {
+		// Check all adjacent replicas have the same state
+		for i := 0; i < len(replicas)-1; i++ {
+			j := i + 1
+			stateI := replicas[i].GetState(ctx)
+			stateJ := replicas[j].GetState(ctx)
+
+			// Check same number of members
+			if len(stateI.Members) != len(stateJ.Members) {
+				if debug {
+					t.Logf("Replica %d has %d members, replica %d has %d members",
+						i, len(stateI.Members), j, len(stateJ.Members))
+				}
+				return false
+			}
+
+			// Check all members from stateI exist in stateJ with same heads
+			for memberID, memberI := range stateI.Members {
+				memberJ, exists := stateJ.Members[memberID]
+				if !exists {
+					if debug {
+						t.Logf("Replica %d has member %s, replica %d does not", i, memberID, j)
+					}
+					return false
+				}
+
+				// Check same number of heads
+				if len(memberI.DagHeads) != len(memberJ.DagHeads) {
+					if debug {
+						t.Logf("Replica %d member %s has %d heads, replica %d has %d heads",
+							i, memberID, len(memberI.DagHeads), j, len(memberJ.DagHeads))
+					}
+					return false
+				}
+
+				// Convert heads to sets for comparison (order-independent)
+				headsI := make(map[string]bool)
+				for _, head := range memberI.DagHeads {
+					headsI[head.String()] = true
+				}
+
+				headsJ := make(map[string]bool)
+				for _, head := range memberJ.DagHeads {
+					headsJ[head.String()] = true
+				}
+
+				// Check all heads match
+				for cidI := range headsI {
+					if !headsJ[cidI] {
+						if debug {
+							t.Logf("Replica %d member %s has head %s, replica %d does not",
+								i, memberID, cidI, j)
+						}
+						return false
+					}
+				}
+			}
+		}
+		return true
+	}, 10*time.Second, 100*time.Millisecond)
 }
 
 func TestCRDTCatchUp(t *testing.T) {
