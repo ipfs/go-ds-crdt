@@ -243,9 +243,7 @@ type Datastore struct {
 	// child
 	queuedChildren *cidSafeSet
 	h              Peer
-	// old snapshot cid is the snapshot cid seen before the "current" one
-	oldProcessedCID []byte
-	seenSnapshots   *ringSnapshots
+	seenSnapshots  *ringSnapshots
 }
 
 type dagJob struct {
@@ -922,7 +920,7 @@ func (store *Datastore) isProcessed(ctx context.Context, c cid.Cid) (bool, error
 		}
 		return false, err
 	}
-	return o != nil && len(o) > 0 && o[0] == byte(ProcessedComplete), nil
+	return len(o) > 0 && o[0] == byte(ProcessedComplete), nil
 }
 
 func (store *Datastore) markProcessed(ctx context.Context, c cid.Cid) error {
@@ -1062,15 +1060,6 @@ func (store *Datastore) processNode(ctx context.Context, root cid.Cid, getter *c
 	}
 
 	return nil, nil
-}
-
-func (store *Datastore) hasProcessedAllLinks(ctx context.Context, links []*ipld.Link) bool {
-	for _, link := range links {
-		if processed, _ := store.isProcessed(ctx, link.Cid); !processed {
-			return false
-		}
-	}
-	return true
 }
 
 // RepairDAG is used to walk down the chain until a non-processed node is
