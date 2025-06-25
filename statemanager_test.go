@@ -10,6 +10,7 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/sync"
 	"github.com/ipfs/go-ds-crdt/pb"
+	"github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/assert"
@@ -39,7 +40,7 @@ func TestNewStateManager(t *testing.T) {
 	ttl := time.Hour
 
 	t.Run("successful initialization", func(t *testing.T) {
-		manager, err := NewStateManager(ctx, store, key, ttl)
+		manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 		require.NoError(t, err)
 		assert.NotNil(t, manager)
 		assert.Equal(t, store, manager.datastore)
@@ -64,7 +65,7 @@ func TestNewStateManager(t *testing.T) {
 		err = store.Put(ctx, key, data)
 		require.NoError(t, err)
 
-		manager, err := NewStateManager(ctx, store, key, ttl)
+		manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 		require.NoError(t, err)
 
 		state := manager.GetState()
@@ -146,7 +147,7 @@ func TestStateManager_Save(t *testing.T) {
 	key := ds.NewKey("/test/state")
 	ttl := time.Hour
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 
 	// Modify state
@@ -173,7 +174,7 @@ func TestStateManager_GetState(t *testing.T) {
 	key := ds.NewKey("/test/state")
 	ttl := time.Hour
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 
 	// Add member to internal state
@@ -200,7 +201,7 @@ func TestStateManager_UpdateHeads(t *testing.T) {
 	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	mockClock.Set(baseTime)
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 	manager.clock = mockClock
 
@@ -268,7 +269,7 @@ func TestStateManager_MergeMembers(t *testing.T) {
 	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	mockClock.Set(baseTime)
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 	manager.clock = mockClock
 
@@ -394,7 +395,7 @@ func TestStateManager_SetSnapshot(t *testing.T) {
 	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	mockClock.Set(baseTime)
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 	manager.clock = mockClock
 
@@ -451,7 +452,7 @@ func TestStateManager_SetMeta(t *testing.T) {
 	ttl := time.Hour
 	mockClock := clock.NewMock()
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 	manager.clock = mockClock
 
@@ -530,7 +531,7 @@ func TestStateManager_SetMembershipUpdateCallback(t *testing.T) {
 	key := ds.NewKey("/test/state")
 	ttl := time.Hour
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 
 	callbackCount := 0
@@ -560,7 +561,7 @@ func TestStateManager_ConcurrentAccess(t *testing.T) {
 	key := ds.NewKey("/test/state")
 	ttl := time.Hour
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(t, err)
 
 	// Test concurrent access doesn't cause race conditions
@@ -618,7 +619,7 @@ func TestStateManager_ErrorHandling(t *testing.T) {
 		key := ds.NewKey("/test/state")
 		ttl := time.Hour
 
-		manager, err := NewStateManager(ctx, store, key, ttl)
+		manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 		require.NoError(t, err)
 
 		peerID := createTestPeerID(t, "peer1")
@@ -633,7 +634,7 @@ func TestStateManager_ErrorHandling(t *testing.T) {
 		key := ds.NewKey("/test/state")
 		ttl := time.Hour
 
-		manager, err := NewStateManager(ctx, store, key, ttl)
+		manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 		require.NoError(t, err)
 
 		// This should handle nil gracefully
@@ -649,7 +650,7 @@ func BenchmarkStateManager_UpdateHeads(b *testing.B) {
 	key := ds.NewKey("/test/state")
 	ttl := time.Hour
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(b, err)
 
 	peerID := createTestPeerID(b, "peer1")
@@ -668,7 +669,7 @@ func BenchmarkStateManager_GetState(b *testing.B) {
 	key := ds.NewKey("/test/state")
 	ttl := time.Hour
 
-	manager, err := NewStateManager(ctx, store, key, ttl)
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
 	require.NoError(b, err)
 
 	// Add some state
