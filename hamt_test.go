@@ -287,10 +287,39 @@ func TestCRDTRemoveConvergesAfterRestoringSnapshot(t *testing.T) {
 func TestCompactionWithMultipleHeads(t *testing.T) {
 	ctx := context.Background()
 
+	/*
+		// for crazy debugging use the following
+		cfg := zap.NewDevelopmentConfig()
+		cfg.EncoderConfig = zapcore.EncoderConfig{
+			MessageKey: "M", // Just the message key
+			// Set everything else to empty or omit it
+			TimeKey:        "",
+			LevelKey:       "",
+			NameKey:        "",
+			CallerKey:      "",
+			FunctionKey:    "",
+			StacktraceKey:  "",
+			LineEnding:     zapcore.DefaultLineEnding,
+			EncodeLevel:    nil,
+			EncodeTime:     nil,
+			EncodeDuration: nil,
+			EncodeCaller:   nil,
+		}
+
+		logger, _ := cfg.Build()
+		logging.SetPrimaryCore(logger.Core())
+
+		// Now set log level
+		_ = logging.SetLogLevel("crdt", "debug")
+
+		_ = logging.Logger("crdt")
+		_ = logging.SetLogLevel("crdt", "debug")
+	*/
 	o := DefaultOptions()
 	o.CompactDagSize = 50
 	o.CompactRetainNodes = 10
 	o.CompactInterval = 5 * time.Second
+	o.RebroadcastInterval = 10 * time.Second
 
 	replicas, closeReplicas := makeNReplicas(t, 2, o)
 	defer closeReplicas()
@@ -301,8 +330,13 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 	br0 := r0.broadcaster.(*mockBroadcaster)
 	br1 := r1.broadcaster.(*mockBroadcaster)
 
-	// Phase 1: Create common DAG foundation on one replica
+	// Phase 1: Create common DAG foundation with both replicas connected
 	t.Logf("Phase 1: Creating common DAG foundation")
+
+	// Ensure both replicas are connected for foundation (needed for compaction consensus)
+	br0.dropProb.Store(0)
+	br1.dropProb.Store(0)
+
 	for i := 1; i < 50; i++ {
 		key := fmt.Sprintf("foundation-key-%d", i)
 		value := []byte(fmt.Sprintf("foundation-value-%d", i))
@@ -311,12 +345,41 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 
 	// Wait for r1 to sync the foundation
 	require.Eventually(t, func() bool {
-		testKey := ds.NewKey("foundation-key-25")
+		testKey := ds.NewKey("foundation-key-49")
 		_, err := r1.Get(ctx, testKey)
 		return err == nil
 	}, 30*time.Second, 1*time.Second)
 
 	t.Logf("Phase 1 complete - both replicas have common foundation")
+
+	// Wait for both replicas to see each other before continuing
+	require.Eventually(t, func() bool {
+		r0State := r0.GetState(ctx)
+		r1State := r1.GetState(ctx)
+
+		r0Members := len(r0State.Members)
+		r1Members := len(r1State.Members)
+
+		t.Logf("Membership sync check - r0 sees %d members, r1 sees %d members", r0Members, r1Members)
+
+		// Both should see both members (themselves + the other)
+		expectedMembers := 2
+		if r0Members >= expectedMembers && r1Members >= expectedMembers {
+			t.Logf("✓ Full membership achieved - both replicas see all %d members", expectedMembers)
+			return true
+		}
+
+		// Log details if not ready
+		t.Logf("Waiting for full membership:")
+		for id, member := range r0State.Members {
+			t.Logf("  r0 sees member %s: %d heads", id, len(member.DagHeads))
+		}
+		for id, member := range r1State.Members {
+			t.Logf("  r1 sees member %s: %d heads", id, len(member.DagHeads))
+		}
+
+		return false
+	}, 30*time.Second, 1*time.Second)
 
 	// Wait for both replicas to be properly synced (same head count)
 	require.Eventually(t, func() bool {
@@ -345,8 +408,8 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 		t.Logf("Phase 2: Starting partition batch %d", batch)
 
 		// Partition the network to create divergent branches
-		br0.dropProb.Store(101)
-		br1.dropProb.Store(101)
+		br0.dropProb.Store(100) // Fixed: ensure 100% drop, not 101
+		br1.dropProb.Store(100)
 
 		// Write different keys on each replica while partitioned
 		var eg errgroup.Group
@@ -381,12 +444,30 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 		r1Stats := r1.InternalStats(ctx)
 		t.Logf("During partition %d - r0 heads: %d, r1 heads: %d", batch, len(r0Stats.Heads), len(r1Stats.Heads))
 
+		// Verify they actually have different head CIDs while partitioned
+		require.Eventually(t, func() bool {
+			r0Stats := r0.InternalStats(ctx)
+			r1Stats := r1.InternalStats(ctx)
+
+			if len(r0Stats.Heads) == 0 || len(r1Stats.Heads) == 0 {
+				return false
+			}
+
+			// Check if they have different head CIDs
+			diverged := r0Stats.Heads[0] != r1Stats.Heads[0]
+			if diverged {
+				t.Logf("✓ Verified divergence - r0 head: %s, r1 head: %s",
+					r0Stats.Heads[0], r1Stats.Heads[0])
+			}
+			return diverged
+		}, 10*time.Second, 500*time.Millisecond)
+
 		// Reconnect and observe the merge process
 		br0.dropProb.Store(0)
 		br1.dropProb.Store(0)
 
-		// Monitor heads during the merge process
-		for i := 0; i < 30; i++ {
+		// Monitor heads during the merge process - increased window and frequency
+		for i := 0; i < 100; i++ { // Increased from 30 to 100
 			r0Stats := r0.InternalStats(ctx)
 			r1Stats := r1.InternalStats(ctx)
 
@@ -403,9 +484,13 @@ func TestCompactionWithMultipleHeads(t *testing.T) {
 				foundMultipleHeads = true
 				t.Logf("✓ Multiple heads observed! Batch %d, iteration %d: r0=%d heads, r1=%d heads",
 					batch, i, len(r0Stats.Heads), len(r1Stats.Heads))
+
+				// Log the actual head CIDs for debugging
+				t.Logf("  r0 heads: %v", r0Stats.Heads)
+				t.Logf("  r1 heads: %v", r1Stats.Heads)
 			}
 
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond) // Reduced from 200ms to 100ms for finer granularity
 		}
 
 		// Final state after this batch
