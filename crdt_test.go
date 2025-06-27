@@ -1135,3 +1135,62 @@ func TestGetAllMemberCommonHeads(t *testing.T) {
 	require.Contains(t, commonHeads, head1CID)
 	require.Contains(t, commonHeads, head2CID)
 }
+
+func TestReplayPathIncludesAllPredecessors(t *testing.T) {
+	ctx := context.Background()
+
+	// Use standard replica creation pattern
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+	datastore := replicas[0]
+
+	// Manually construct a DAG:
+	// head1 -> A -> B -> stopAt
+	// head2 -> C -> stopAt
+
+	// Create stopAt node
+	stopDelta := &pb.Delta{Priority: 5}
+	stopNode, err := makeNode(stopDelta, nil)
+	require.NoError(t, err)
+	require.NoError(t, datastore.dagService.Add(ctx, stopNode))
+	stopCid := stopNode.Cid()
+
+	// B -> stopAt
+	bDelta := &pb.Delta{Priority: 4}
+	bNode, err := makeNode(bDelta, []cid.Cid{stopCid})
+	require.NoError(t, err)
+	require.NoError(t, datastore.dagService.Add(ctx, bNode))
+	bCid := bNode.Cid()
+
+	// A -> B
+	aDelta := &pb.Delta{Priority: 3}
+	aNode, err := makeNode(aDelta, []cid.Cid{bCid})
+	require.NoError(t, err)
+	require.NoError(t, datastore.dagService.Add(ctx, aNode))
+	aCid := aNode.Cid()
+
+	// C -> stopAt
+	cDelta := &pb.Delta{Priority: 2}
+	cNode, err := makeNode(cDelta, []cid.Cid{stopCid})
+	require.NoError(t, err)
+	require.NoError(t, datastore.dagService.Add(ctx, cNode))
+	cCid := cNode.Cid()
+
+	// Run walkReplayPath through the attached method
+	path, err := datastore.walkReplayPath(ctx, []cid.Cid{aCid, cCid}, stopCid)
+	require.NoError(t, err)
+
+	// Ensure node B appears before stopAt
+	var seenB, seenStopAt bool
+	for _, c := range path {
+		if c.Equals(bCid) {
+			seenB = true
+		}
+		if c.Equals(stopCid) {
+			seenStopAt = true
+			break
+		}
+	}
+	require.True(t, seenB, "expected node B to appear before stopAt in the replay path")
+	require.True(t, seenStopAt, "expected stopAt to appear in the replay path")
+}
