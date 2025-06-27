@@ -181,7 +181,9 @@ func (hd *HAMTDatastore) Put(ctx context.Context, key ds.Key, value []byte) erro
 	defer hd.mu.Unlock()
 	// Create a raw node for the value
 	nd := dag.NodeWithData(value)
-	nd.SetCidBuilder(dag.V1CidPrefix())
+	if err := nd.SetCidBuilder(dag.V1CidPrefix()); err != nil {
+		return fmt.Errorf("failed to set cid builder: %w", err)
+	}
 
 	// Add the node to the DAG service
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
