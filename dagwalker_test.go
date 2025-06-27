@@ -35,28 +35,16 @@ func TestWalkReplayPath(t *testing.T) {
 					require.Contains(t, seen, node, "missing expected node: %s", node.String())
 				}
 
-				// Verify topological ordering: B specifically depends on stopAt
-				var bCid cid.Cid
+				// The key invariant: stopAt position determines what gets processed
+				// In reverse topo order, dependencies come first, then dependents
+				// So stopAt should come before nodes that depend on it
+				stopAtIndex := seen[stopAt]
 				for _, node := range expectedNodes {
-					// Find B (priority 4) - it has stopAt as parent
-					if node != stopAt {
-						testNode, err := datastore.dagService.Get(context.Background(), node)
-						require.NoError(t, err)
-						for _, link := range testNode.Links() {
-							if link.Cid.Equals(stopAt) {
-								bCid = node
-								break
-							}
-						}
-						if bCid.Defined() {
-							break
-						}
+					if !node.Equals(stopAt) {
+						require.Greater(t, seen[node], stopAtIndex,
+							"dependent node %s must appear after stopAt %s in reverse topo order",
+							node.String(), stopAt.String())
 					}
-				}
-
-				if bCid.Defined() {
-					require.Less(t, seen[stopAt], seen[bCid],
-						"stopAt must appear before dependent node %s", bCid.String())
 				}
 			},
 		},
@@ -161,7 +149,6 @@ func TestWalkReplayPath(t *testing.T) {
 	}
 }
 
-// Helper function to create and add a node
 func makeAndAdd(datastore *Datastore, ctx context.Context, priority int, parents []cid.Cid) cid.Cid {
 	node, err := makeNode(&pb.Delta{Priority: uint64(priority)}, parents)
 	if err != nil {
