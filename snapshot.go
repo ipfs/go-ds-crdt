@@ -81,6 +81,7 @@ func (store *Datastore) buildSnapshot(
 			return nil, fmt.Errorf("failed to merge delta into snapshot: %w", err)
 		}
 	}
+
 	// 2) Get the new HAMT root CID
 	hamtRootCID, err := hamtDS.GetRoot(ctx)
 	if err != nil {
