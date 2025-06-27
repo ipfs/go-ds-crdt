@@ -131,7 +131,6 @@ func (store *Datastore) createSnapshotWrapper(
 
 	// 2) create node with that data
 	w := dag.NodeWithData(data)
-	w.SetCidBuilder(dag.V1CidPrefix())
 	if err := w.SetCidBuilder(dag.V1CidPrefix()); err != nil {
 		return nil, err
 	}
