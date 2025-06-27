@@ -1194,3 +1194,106 @@ func TestReplayPathIncludesAllPredecessors(t *testing.T) {
 	require.True(t, seenB, "expected node B to appear before stopAt in the replay path")
 	require.True(t, seenStopAt, "expected stopAt to appear in the replay path")
 }
+
+func TestReplayPathFailsIfStopAtAppearsTooEarly(t *testing.T) {
+	ctx := context.Background()
+
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+	datastore := replicas[0]
+
+	// DAG layout:
+	// head1 → A → B → stopAt
+	// head2 → C → stopAt
+
+	// Create stopAt
+	stopNode, err := makeNode(&pb.Delta{Priority: 5}, nil)
+	require.NoError(t, err)
+	require.NoError(t, datastore.dagService.Add(ctx, stopNode))
+	stopCid := stopNode.Cid()
+
+	// B → stopAt
+	bNode, err := makeNode(&pb.Delta{Priority: 4}, []cid.Cid{stopCid})
+	require.NoError(t, err)
+	require.NoError(t, datastore.dagService.Add(ctx, bNode))
+	bCid := bNode.Cid()
+
+	// A → B
+	aNode, err := makeNode(&pb.Delta{Priority: 3}, []cid.Cid{bCid})
+	require.NoError(t, err)
+	require.NoError(t, datastore.dagService.Add(ctx, aNode))
+	aCid := aNode.Cid()
+
+	// C → stopAt
+	cNode, err := makeNode(&pb.Delta{Priority: 2}, []cid.Cid{stopCid})
+	require.NoError(t, err)
+	require.NoError(t, datastore.dagService.Add(ctx, cNode))
+	cCid := cNode.Cid()
+
+	// Get replay path
+	path, err := datastore.walkReplayPath(ctx, []cid.Cid{aCid, cCid}, stopCid)
+	require.NoError(t, err)
+
+	// Fail the test if stopAt is seen before B
+	var foundStopAt, foundB bool
+	for _, c := range path {
+		if c.Equals(stopCid) {
+			foundStopAt = true
+		}
+		if c.Equals(bCid) {
+			foundB = true
+		}
+		if c.Equals(stopCid) && !foundB {
+			t.Fatalf("FAIL: stopAt appeared in the path before B, violating replay ordering")
+		}
+	}
+	require.True(t, foundStopAt, "stopAt should be in the replay path")
+	require.True(t, foundB, "B should be in the replay path")
+}
+
+func TestReplayPathIncludesAllPredecessors_DeepBranch(t *testing.T) {
+	ctx := context.Background()
+
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+	datastore := replicas[0]
+
+	// Construct deep DAG: A → B → D → E → F → stopAt
+	// Short DAG:         C → stopAt
+
+	make := func(priority int, parents []cid.Cid) cid.Cid {
+		node, err := makeNode(&pb.Delta{Priority: uint64(priority)}, parents)
+		require.NoError(t, err)
+		require.NoError(t, datastore.dagService.Add(ctx, node))
+		return node.Cid()
+	}
+
+	stopCid := make(99, nil)
+	fCid := make(6, []cid.Cid{stopCid})
+	eCid := make(5, []cid.Cid{fCid})
+	dCid := make(4, []cid.Cid{eCid})
+	bCid := make(3, []cid.Cid{dCid})
+	aCid := make(2, []cid.Cid{bCid})
+	cCid := make(1, []cid.Cid{stopCid})
+
+	// Heads are aCid and cCid
+	path, err := datastore.walkReplayPath(ctx, []cid.Cid{aCid, cCid}, stopCid)
+	require.NoError(t, err)
+
+	// Ensure all long path nodes appear before stopAt
+	seen := map[string]bool{}
+
+	for _, c := range path {
+		s := c.String()
+		if c.Equals(stopCid) {
+			// If any required node not seen yet, fail
+			for _, need := range []cid.Cid{fCid, eCid, dCid, bCid} {
+				if ok := seen[need.String()]; ok {
+					t.Fatalf("FAIL: stopAt appeared before %s in replay path", need.String())
+				}
+			}
+			break
+		}
+		seen[s] = true
+	}
+}
