@@ -18,7 +18,7 @@ func NewDAGWalker(dagService ipld.DAGService) *DAGWalker {
 }
 
 // WalkReverseTopo performs a reverse topological walk from the given heads to the stopAt CID.
-// It ensures all ancestors of stopAt are visited before stopAt itself.
+// Traversal will stop at the stopAt node — its parents will not be visited.
 func (w *DAGWalker) WalkReverseTopo(ctx context.Context, heads []cid.Cid, stopAt cid.Cid) ([]cid.Cid, error) {
 	visited := cid.NewSet()
 	tempMark := cid.NewSet()
@@ -27,6 +27,14 @@ func (w *DAGWalker) WalkReverseTopo(ctx context.Context, heads []cid.Cid, stopAt
 	var visit func(cid.Cid) error
 	visit = func(current cid.Cid) error {
 		if !current.Defined() {
+			return nil
+		}
+		if current.Equals(stopAt) {
+			// Treat stopAt as a traversal boundary (included, but not traversed past)
+			if !visited.Has(current) {
+				visited.Add(current)
+				order = append(order, current)
+			}
 			return nil
 		}
 		if visited.Has(current) {
@@ -54,13 +62,6 @@ func (w *DAGWalker) WalkReverseTopo(ctx context.Context, heads []cid.Cid, stopAt
 
 	for _, h := range heads {
 		if err := visit(h); err != nil {
-			return nil, err
-		}
-	}
-
-	// Ensure stopAt is included, even if not explicitly linked
-	if stopAt.Defined() && !visited.Has(stopAt) {
-		if err := visit(stopAt); err != nil {
 			return nil, err
 		}
 	}

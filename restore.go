@@ -170,9 +170,9 @@ func (store *Datastore) walkBackSnapshots(ctx context.Context, from cid.Cid, unt
 // walkReplayPath walks the DAG backwards starting from the given heads
 // and collects the deltas needed to replay up to the target snapshotDagHead.
 // Returns a list of CIDs to replay in topological order (parents before children).
-func (store *Datastore) walkReplayPath(ctx context.Context, heads []cid.Cid, snapshotDagHead cid.Cid) ([]cid.Cid, error) {
+func (store *Datastore) walkReplayPath(ctx context.Context, heads []cid.Cid, stopAt cid.Cid) ([]cid.Cid, error) {
 	walker := NewDAGWalker(store.dagService)
-	return walker.WalkReverseTopo(ctx, heads, snapshotDagHead)
+	return walker.WalkReverseTopo(ctx, heads, stopAt)
 }
 
 func (store *Datastore) replayDAGPath(ctx context.Context, path []cid.Cid, stopAt cid.Cid, hamtDS *HAMTDatastore) (cid.Cid, []cid.Cid, error) {
