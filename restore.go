@@ -171,45 +171,8 @@ func (store *Datastore) walkBackSnapshots(ctx context.Context, from cid.Cid, unt
 // and collects the deltas needed to replay up to the target snapshotDagHead.
 // Returns a list of CIDs to replay in topological order (parents before children).
 func (store *Datastore) walkReplayPath(ctx context.Context, heads []cid.Cid, snapshotDagHead cid.Cid) ([]cid.Cid, error) {
-	visited := cid.NewSet()
-	var replayOrder []cid.Cid
-
-	queue := make([]cid.Cid, len(heads))
-	copy(queue, heads)
-
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-
-		if !current.Defined() {
-			continue
-		}
-
-		if !visited.Visit(current) {
-			continue
-		}
-
-		replayOrder = append(replayOrder, current)
-
-		if current.Equals(snapshotDagHead) {
-			// We reached the known snapshot DAG Head
-			continue
-		}
-
-		node, err := store.dagService.Get(ctx, current)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load DAG node %s: %w", current, err)
-		}
-
-		// Walk all links backward
-		for _, link := range node.Links() {
-			if link.Cid.Defined() {
-				queue = append(queue, link.Cid)
-			}
-		}
-	}
-
-	return replayOrder, nil
+	walker := NewDAGWalker(store.dagService)
+	return walker.WalkReverseTopo(ctx, heads, snapshotDagHead)
 }
 
 func (store *Datastore) replayDAGPath(ctx context.Context, path []cid.Cid, stopAt cid.Cid, hamtDS *HAMTDatastore) (cid.Cid, []cid.Cid, error) {
