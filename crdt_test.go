@@ -98,7 +98,7 @@ type mockBroadcaster struct {
 	ctx      context.Context
 	chans    []chan []byte
 	myChan   chan []byte
-	dropProb *atomic.Int64 // probability of dropping a message instead of receiving it
+	dropProb *atomic.Int64 // probability of dropping a message instead of broadcasting it
 	t        testing.TB
 }
 
@@ -106,8 +106,8 @@ func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFun
 	ctx, cancel := context.WithCancel(context.Background())
 	broadcasters := make([]*mockBroadcaster, n)
 	chans := make([]chan []byte, n)
-	dropP := &atomic.Int64{}
 	for i := range chans {
+		dropP := &atomic.Int64{}
 		chans[i] = make(chan []byte, 300)
 		broadcasters[i] = &mockBroadcaster{
 			ctx:      ctx,
