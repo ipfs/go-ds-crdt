@@ -1,0 +1,63 @@
+run:
+  timeout: 10m
+  tests: true
+  modules-download-mode: readonly
+linters:
+  presets:
+    - bugs
+    - error
+    - unused
+    - sql
+  enable:
+    # Manually enabled linters are mostly stylistic choices
+    - containedctx
+    - dogsled
+    - errname
+    - forcetypeassert
+    - gochecknoglobals
+    - gochecknoinits
+    - godot
+    - gofmt
+    - mnd
+    - goprintffuncname
+    - gosimple
+    - gocyclo
+    - ireturn
+    - misspell
+    - nakedret
+    - nestif
+    - nilnil
+    - nolintlint
+    - nosprintfhostport
+    - predeclared
+    - promlinter
+    - revive
+    - tenv
+    - testpackage
+    - thelper
+    - unconvert
+    - usestdlibvars
+    - wastedassign
+    - whitespace
+  disable:
+    # Only disable deprecated linters that are replaced by an alternative linter that we are using.
+    - gosec
+    - govet
+linters-settings:
+  nolintlint:
+    require-explanation: true
+    require-specific: true
+  exhaustive:
+    # Presence of "default" case in switch statements satisfies exhaustiveness,
+    # even if all enum members are not listed.
+    # Default: false
+    default-signifies-exhaustive: true
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+severity:
+  default-severity: error
+  rules:
+    - linters:
+        - gocyclo
+      severity: info
