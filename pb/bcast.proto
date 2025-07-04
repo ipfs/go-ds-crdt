@@ -4,14 +4,14 @@ package crdt.pb;
 option go_package=".;pb";
 
 message StateBroadcast {
-  Snapshot Snapshot = 1;  // latest HAMT snapshot head
-  map<string,Participant>  Members = 2; // Map of participants
+  map<string,Participant>  Members = 1; // Map of participants
 }
 
 message Participant {
   uint64 BestBefore = 1;        // Timestamp for garbage collection
   repeated Head DagHeads = 2;   // List of DAG heads
   map<string,string> metadata = 3;   // A map to hold arbitrary metadata about the participant
+  Snapshot Snapshot = 4;  // latest HAMT snapshot head
 }
 
 message Head {
@@ -19,7 +19,7 @@ message Head {
 }
 
 message Snapshot {
-  Head SnapshotKey = 1;  // latest HAMT snapshot head
-  Head DagHead = 2; // the cid that was compacted
-  uint64 Height = 3; // the height at compaction
+  Head SnapshotKey = 1;         // HAMT wrapper root
+  Head DagHead     = 2;         // DAG node that was compacted
+  uint64 Height    = 3;         // DAG height at compaction
 }

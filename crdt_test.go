@@ -23,10 +23,12 @@ import (
 	dssync "github.com/ipfs/go-datastore/sync"
 	dstest "github.com/ipfs/go-datastore/test"
 	badgerds "github.com/ipfs/go-ds-badger"
+	"github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/stretchr/testify/require"
 )
 
 var numReplicas = 15
@@ -103,6 +105,7 @@ type mockBroadcaster struct {
 	myChan   chan []byte
 	dropProb *atomic.Int64 // probability of dropping a message instead of receiving it
 	t        testing.TB
+	mu       sync.RWMutex
 }
 
 func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFunc) {
@@ -124,6 +127,8 @@ func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFun
 }
 
 func (mb *mockBroadcaster) Broadcast(ctx context.Context, data []byte) error {
+	mb.mu.RLock()
+	defer mb.mu.RUnlock()
 	var wg sync.WaitGroup
 
 	randg := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -474,7 +479,10 @@ func TestCRDTPriority(t *testing.T) {
 		}(r, i)
 	}
 	wg.Wait()
-	time.Sleep(5000 * time.Millisecond)
+
+	// Wait for convergence
+	RequireConvergence(t, replicas, ctx)
+
 	var v, lastv []byte
 	var err error
 	for i, r := range replicas {
@@ -509,6 +517,69 @@ func TestCRDTPriority(t *testing.T) {
 	//replicas[14].PrintDAG()
 	//fmt.Println("=======================================================")
 	//replicas[1].PrintDAG()
+}
+
+func RequireConvergence(t *testing.T, replicas []*Datastore, ctx context.Context) {
+	require.Eventually(t, func() bool {
+		// Check all adjacent replicas have the same state
+		for i := 0; i < len(replicas)-1; i++ {
+			j := i + 1
+			stateI := replicas[i].GetState(ctx)
+			stateJ := replicas[j].GetState(ctx)
+
+			// Check same number of members
+			if len(stateI.Members) != len(stateJ.Members) {
+				if debug {
+					t.Logf("Replica %d has %d members, replica %d has %d members",
+						i, len(stateI.Members), j, len(stateJ.Members))
+				}
+				return false
+			}
+
+			// Check all members from stateI exist in stateJ with same heads
+			for memberID, memberI := range stateI.Members {
+				memberJ, exists := stateJ.Members[memberID]
+				if !exists {
+					if debug {
+						t.Logf("Replica %d has member %s, replica %d does not", i, memberID, j)
+					}
+					return false
+				}
+
+				// Check same number of heads
+				if len(memberI.DagHeads) != len(memberJ.DagHeads) {
+					if debug {
+						t.Logf("Replica %d member %s has %d heads, replica %d has %d heads",
+							i, memberID, len(memberI.DagHeads), j, len(memberJ.DagHeads))
+					}
+					return false
+				}
+
+				// Convert heads to sets for comparison (order-independent)
+				headsI := make(map[string]bool)
+				for _, head := range memberI.DagHeads {
+					headsI[head.String()] = true
+				}
+
+				headsJ := make(map[string]bool)
+				for _, head := range memberJ.DagHeads {
+					headsJ[head.String()] = true
+				}
+
+				// Check all heads match
+				for cidI := range headsI {
+					if !headsJ[cidI] {
+						if debug {
+							t.Logf("Replica %d member %s has head %s, replica %d does not",
+								i, memberID, cidI, j)
+						}
+						return false
+					}
+				}
+			}
+		}
+		return true
+	}, 10*time.Second, 100*time.Millisecond)
 }
 
 func TestCRDTCatchUp(t *testing.T) {
@@ -584,32 +655,51 @@ func TestCRDTHooks(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.PutHook = func(k ds.Key, v []byte) {
-		atomic.AddInt64(&put, 1)
+		count := atomic.AddInt64(&put, 1)
+		t.Logf("PutHook called for key %s, count now: %d", k, count)
 	}
 	opts.DeleteHook = func(k ds.Key) {
-		atomic.AddInt64(&deleted, 1)
+		count := atomic.AddInt64(&deleted, 1)
+		t.Logf("DeleteHook called for key %s, count now: %d", k, count)
 	}
 
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
+	t.Logf("Created %d replicas", len(replicas))
+
 	k := ds.RandomKey()
-	err := replicas[0].Put(ctx, k, nil)
+	t.Logf("Using key: %s", k)
+
+	err := replicas[0].Put(ctx, k, []byte("test-value"))
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	require.Eventually(t, func() bool {
+		putCount := atomic.LoadInt64(&put)
+		t.Logf("Current put count: %d, expected: %d", putCount, len(replicas))
+		return putCount == int64(len(replicas))
+	}, 10*time.Second, 500*time.Millisecond, "all replicas should have notified Put")
+
+	// Verify the key exists on all replicas before deleting
+	for i, replica := range replicas {
+		has, err := replica.Has(ctx, k)
+		require.NoError(t, err)
+		t.Logf("Replica %d has key %s: %t", i, k, has)
+		require.True(t, has, "Key should exist on replica %d before delete", i)
 	}
 
 	err = replicas[0].Delete(ctx, k)
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	if atomic.LoadInt64(&put) != int64(len(replicas)) {
-		t.Error("all replicas should have notified Put", put)
-	}
-	if atomic.LoadInt64(&deleted) != int64(len(replicas)) {
-		t.Error("all replicas should have notified Remove", deleted)
-	}
+
+	require.Eventually(t, func() bool {
+		deleteCount := atomic.LoadInt64(&deleted)
+		t.Logf("Current delete count: %d, expected: %d", deleteCount, len(replicas))
+		return deleteCount == int64(len(replicas))
+	}, 10*time.Second, 500*time.Millisecond, "all replicas should have notified Delete")
 }
 
 func TestCRDTBatch(t *testing.T) {
@@ -999,4 +1089,49 @@ func TestMigration0to1(t *testing.T) {
 			t.Fatalf("value for elem %d should be final value: %s", i, string(v))
 		}
 	}
+}
+
+func TestGetAllMemberCommonHeads(t *testing.T) {
+	ctx := context.Background()
+	stateMgr, err := NewStateManager(ctx, ds.NewMapDatastore(), ds.NewKey(""), 300, log.Logger("crdt"))
+	require.NoError(t, err)
+	store := &Datastore{state: stateMgr}
+
+	// Generate three valid dummy CIDs:
+	head1CID := cid.MustParse("bafybeigdyrzt6xjftfs3m76psn3fupk7zvj7jl5p5zfw5v4ic22fxh45pe")
+	head2CID := cid.MustParse("bafybeia6z6rlvqfwtknx7br7dxes5gj32rhrcprdz7sw5kxjdlkbkoqvfa")
+	head3CID := cid.MustParse("bafybeig5jt5xfx4tn7zqomwqxg7tq6cphg7h5wr64p4quzpsolhx5ypmpu")
+
+	snapshotA := &pb.Snapshot{SnapshotKey: &pb.Head{Cid: head1CID.Bytes()}}
+	snapshotB := &pb.Snapshot{SnapshotKey: &pb.Head{Cid: head3CID.Bytes()}}
+
+	stateMgr.state = &pb.StateBroadcast{
+		Members: map[string]*pb.Participant{
+			"peer1": {
+				Snapshot: snapshotA,
+				DagHeads: []*pb.Head{
+					{Cid: head1CID.Bytes()},
+					{Cid: head2CID.Bytes()},
+				},
+			},
+			"peer2": {
+				Snapshot: snapshotA,
+				DagHeads: []*pb.Head{
+					{Cid: head1CID.Bytes()},
+					{Cid: head2CID.Bytes()},
+				},
+			},
+			"peer3": {
+				Snapshot: snapshotB,
+				DagHeads: []*pb.Head{
+					{Cid: head3CID.Bytes()},
+				},
+			},
+		},
+	}
+
+	commonHeads := store.getAllMemberCommonHeads()
+	require.Len(t, commonHeads, 2)
+	require.Contains(t, commonHeads, head1CID)
+	require.Contains(t, commonHeads, head2CID)
 }

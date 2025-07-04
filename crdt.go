@@ -20,6 +20,7 @@ package crdt
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -34,7 +35,6 @@ import (
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 	"github.com/ipfs/boxo/exchange/offline"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
-	"github.com/ipfs/boxo/ipld/unixfs/hamt"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"go.uber.org/multierr"
@@ -50,6 +50,8 @@ import (
 var _ ds.Datastore = (*Datastore)(nil)
 var _ ds.Batching = (*Datastore)(nil)
 
+var jobTimeout = 24 * time.Hour
+
 // datastore namespace keys. Short keys save space and memory.
 const (
 	headsNs           = "h" // state
@@ -59,6 +61,23 @@ const (
 	dirtyBitKey       = "d" // dirty
 	versionKey        = "crdt_version"
 	snapshotKey       = "g"
+	jobsNs            = "j" // jobs
+)
+
+type ProcessedState byte
+
+const (
+	ProcessedComplete ProcessedState = iota
+	FetchRequested
+	Fetched
+)
+
+// Child status constants
+const (
+	ChildPending byte = iota
+	ChildRequested
+	ChildFetched
+	ChildProcessed
 )
 
 // Common errors.
@@ -224,8 +243,7 @@ type Datastore struct {
 	// child
 	queuedChildren *cidSafeSet
 	h              Peer
-	// old snapshot cid is the snapshot cid seen before the "current" one
-	oldProcessedCID []byte
+	seenSnapshots  *ringSnapshots
 }
 
 type dagJob struct {
@@ -236,7 +254,6 @@ type dagJob struct {
 	rootPrio   uint64          // the priority of the root delta
 	delta      *pb.Delta       // the current delta
 	node       ipld.Node       // the current ipld Node
-
 }
 
 type Peer interface {
@@ -307,7 +324,7 @@ func New(h Peer, store ds.Datastore, bs blockstore.Blockstore, namespace ds.Key,
 	}
 
 	// load the state
-	sm, err := NewStateManager(ctx, store, stateNs, opts.TTL)
+	sm, err := NewStateManager(ctx, store, stateNs, opts.TTL, opts.Logger)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("error building statemanager: %w", err)
@@ -333,6 +350,7 @@ func New(h Peer, store ds.Datastore, bs blockstore.Blockstore, namespace ds.Key,
 		jobQueue:       make(chan *dagJob, opts.NumWorkers),
 		sendJobs:       make(chan *dagJob),
 		queuedChildren: newCidSafeSet(),
+		seenSnapshots:  newRingSnapshots(10),
 	}
 
 	err = dstore.applyMigrations(ctx)
@@ -394,6 +412,19 @@ func New(h Peer, store ds.Datastore, bs blockstore.Blockstore, namespace ds.Key,
 		defer dstore.wg.Done()
 	}()
 
+	// Restore persisted jobs on startup
+	if err := dstore.restorePersistedJobs(ctx); err != nil {
+		cancel()
+		return nil, fmt.Errorf("error restoring persisted jobs: %w", err)
+	}
+
+	// Start job cleanup goroutine
+	dstore.wg.Add(1)
+	go func() {
+		defer dstore.wg.Done()
+		dstore.jobCleanup(ctx)
+	}()
+
 	return dstore, nil
 }
 
@@ -423,145 +454,112 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			continue
 		}
 
-		processHead := func(ctx context.Context, c cid.Cid) {
-			err = store.handleBlock(ctx, c) //handleBlock blocks
-			if err != nil {
-				store.logger.Errorf("error processing new head: %s", err)
-				// For posterity: do not mark the store as
-				// Dirty if we could not handle a block. If an
-				// error happens here, it means the node could
-				// not be fetched, thus it could not be
-				// processed, thus it did not leave a branch
-				// half-processed and there's nothign to
-				// recover.
-				// disabled: store.MarkDirty()
-			}
+		store.logger.Debugf("Received broadcast with %d members", len(broadcast.Members))
+		for id, member := range broadcast.Members {
+			headCount := len(member.DagHeads)
+			store.logger.Debugf("  Received member %s: %d heads, bestBefore=%d", id, headCount, member.BestBefore)
 		}
 
-		// merge the state with our state
+		// Always merge member metadata, even if we diverge
 		if err := store.state.MergeMembers(ctx, broadcast); err != nil {
-			// TODO log and continue
 			store.logger.Errorf("failed to merge broadcast: %v", err)
 			continue
 		}
-		state := store.state.GetState()
 
-		if !store.state.IsNew() && broadcast.Snapshot != nil &&
-			broadcast.Snapshot.DagHead != state.Snapshot.DagHead &&
-			!bytes.Equal(broadcast.Snapshot.DagHead.Cid, store.oldProcessedCID) {
-
-			start, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
-			if err != nil {
-				store.logger.Errorf("failed to parse broadcast snapshot cid: %v", err)
-				continue
-
-			}
-			end, err := cid.Cast(state.Snapshot.DagHead.Cid)
-			if err != nil {
-				store.logger.Errorf("failed to parse state snapshot cid: %v", err)
+		for peerID, participant := range broadcast.Members {
+			// Skip our own participant data - we don't need to fast-forward to ourselves
+			if peerID == store.h.ID().String() {
 				continue
 			}
-			store.compactMux.Lock()
-			newSS, err := store.compactAndTruncate(ctx, start, end)
-			if err != nil {
-				store.logger.Errorf("failed to compact the dag: %v", err)
-				store.compactMux.Unlock()
+
+			// Get our snapshot for comparison
+			var mySnapshot *pb.Snapshot
+			myParticipant := store.GetState(ctx).Members[store.h.ID().String()]
+			if myParticipant != nil {
+				mySnapshot = myParticipant.Snapshot
+			}
+
+			if snapshotsEqual(mySnapshot, participant.Snapshot) {
+				// Snapshots match, we can safely process heads
+				store.processParticipantHeads(ctx, peerID, participant)
 				continue
 			}
-			store.compactMux.Unlock()
 
-			store.oldProcessedCID = state.Snapshot.DagHead.Cid
-			err = store.state.SetSnapshot(ctx, newSS, start, broadcast.Snapshot.Height)
+			if participant.Snapshot == nil {
+				continue // No snapshot, skip
+			}
+
+			if store.hasProcessedSnapshot(cidFromBytes(participant.Snapshot.DagHead.Cid)) {
+				continue // Already seen, skip
+			}
+
+			// Snapshots differ, attempt fast-forward
+			err := store.tryFastForwardToSnapshot(ctx, mySnapshot, participant)
 			if err != nil {
-				store.logger.Errorf("failed to set the snapshot: %v", err)
-				continue
-			}
-			err = store.broadcast(ctx)
-			if err != nil {
-				store.logger.Errorf("failed to broadcast: %v", err)
-				continue
+				store.logger.Warnf("divergence detected with %s: %v", peerID, err)
+				store.handleDivergence(ctx, participant.Snapshot)
 			}
 		}
-
-		// if we have no snapshot head then we're probably a fresh database or node
-		// we should process the snapshot before doing anything else
-		if store.state.IsNew() && broadcast.Snapshot != nil {
-			c, err := cid.Cast(broadcast.Snapshot.SnapshotKey.Cid)
-			if err != nil {
-				store.logger.Errorf("failed to parse broadcasat snapshot cid: %v", err)
-				continue
-			}
-			if c != cid.Undef {
-				dc, err := cid.Cast(broadcast.Snapshot.DagHead.Cid)
-				if err != nil {
-					store.logger.Errorf("failed to parse broadcast dag head cid: %v", err)
-					continue
-				}
-				err = store.restoreSnapshot(ctx, store.dagService, c, dc, broadcast.Snapshot.Height)
-				if err != nil {
-					store.logger.Errorf("failed to restore snapshot: %v", err)
-					continue
-				}
-			}
-		}
-
-		// if we have no state, make seen-state state immediately.  On
-		// a fresh start, this allows us to start building on top of
-		// recent state, even if we have not fully synced rather than
-		// creating new orphan branches.
-		curHeadCount, err := store.heads.Len(ctx)
-		if err != nil {
-			store.logger.Error(err)
-			continue
-		}
-
-		bcastHeads := map[cid.Cid]cid.Cid{}
-
-		for _, member := range broadcast.Members {
-			for _, h := range member.DagHeads {
-				c, err := cid.Cast(h.Cid)
-				if err == nil && c != cid.Undef {
-					bcastHeads[c] = c
-				}
-			}
-		}
-
-		if curHeadCount == 0 {
-			dg := &crdtNodeGetter{NodeGetter: store.dagService}
-			for _, bCastHead := range bcastHeads {
-				prio, err := dg.GetPriority(ctx, bCastHead)
-				if err != nil {
-					store.logger.Error(err)
-					continue
-				}
-				err = store.heads.Add(ctx, bCastHead, head{height: prio})
-				if err != nil {
-					store.logger.Error(err)
-				}
-			}
-		}
-
-		// For each head, we process it.
-		for _, head := range bcastHeads {
-			// A thing to try here would be to process state in
-			// the same broadcast in parallel, but do not process
-			// state from multiple broadcasts in parallel.
-			if store.opts.MultiHeadProcessing {
-				go processHead(ctx, head)
-			} else {
-				processHead(ctx, head)
-			}
-			store.seenHeadsMux.Lock()
-			store.seenHeads[head] = struct{}{}
-			store.seenHeadsMux.Unlock()
-		}
-
-		// TODO: We should store trusted-peer signatures associated to
-		// each head in a timecache. When we broadcast, attach the
-		// signatures (along with our own) to the broadcast.
-		// Other peers can use the signatures to verify that the
-		// received CIDs have been issued by a trusted peer.
 	}
+}
+
+func (store *Datastore) hasProcessedSnapshot(c cid.Cid) bool {
+	if c == cid.Undef {
+		return false
+	}
+	return store.seenSnapshots.Contains(c)
+}
+
+func (store *Datastore) processHead(ctx context.Context, c cid.Cid) {
+	err := store.handleBlock(ctx, c) // handleBlock blocks
+	if err != nil {
+		store.logger.Errorf("error processing new head: %s", err)
+		// Do NOT mark dirty here — see previous logic notes
+	}
+}
+
+func (store *Datastore) processParticipantHeads(ctx context.Context, peerID string, participant *pb.Participant) {
+	bcastHeads := map[cid.Cid]cid.Cid{}
+
+	for _, h := range participant.DagHeads {
+		c, err := cid.Cast(h.Cid)
+		if err == nil && c != cid.Undef {
+			bcastHeads[c] = c
+		}
+	}
+
+	for head := range bcastHeads {
+		// Same logic as before
+		store.seenHeadsMux.Lock()
+		store.seenHeads[head] = struct{}{}
+		store.seenHeadsMux.Unlock()
+
+		if store.opts.MultiHeadProcessing {
+			go store.processHead(ctx, head)
+		} else {
+			store.processHead(ctx, head)
+		}
+	}
+}
+
+func (store *Datastore) handleDivergence(ctx context.Context, target *pb.Snapshot) {
+	// TODO: Apply divergence policy
+	store.logger.Warn("divergence handling not implemented")
+}
+
+func snapshotsEqual(a, b *pb.Snapshot) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return bytes.Equal(a.SnapshotKey.Cid, b.SnapshotKey.Cid)
+}
+
+func cidFromBytes(b []byte) cid.Cid {
+	c, _ := cid.Cast(b)
+	return c
 }
 
 func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) (*pb.StateBroadcast, error) {
@@ -719,7 +717,29 @@ func (store *Datastore) handleBlock(ctx context.Context, c cid.Cid) error {
 // send job starting at the given CID in a branch headed by a given head.
 // this can be used to continue branch processing from a certain point.
 func (store *Datastore) handleBranch(ctx context.Context, head, c cid.Cid) error {
-	// Walk down from this block
+	// Check if this should be a persistent job (from network/broadcast)
+
+	// Check if job already exists
+	exists, err := store.jobExists(ctx, head)
+	if err != nil {
+		return fmt.Errorf("error checking existing job: %w", err)
+	}
+
+	if !exists {
+		// Create new persistent job
+		if err := store.createJob(ctx, head); err != nil {
+			return fmt.Errorf("error creating job: %w", err)
+		}
+
+		// Add initial child as pending
+		if err := store.setChildStatus(ctx, head, c, ChildPending); err != nil {
+			return fmt.Errorf("error adding initial child: %w", err)
+		}
+
+		store.logger.Debugf("created persistent job for head %s", head)
+	}
+
+	// Use existing logic but with persistence awareness
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -729,7 +749,7 @@ func (store *Datastore) handleBranch(ctx context.Context, head, c cid.Cid) error
 	}
 
 	var session sync.WaitGroup
-	err := store.sendNewJobs(ctx, &session, dg, head, 0, []cid.Cid{c})
+	err = store.sendNewJobs(ctx, &session, dg, head, 0, []cid.Cid{c})
 	session.Wait()
 	return err
 }
@@ -747,14 +767,7 @@ func (store *Datastore) dagWorker() {
 		default:
 		}
 
-		children, err := store.processNode(
-			ctx,
-			job.nodeGetter,
-			job.root,
-			job.rootPrio,
-			job.delta,
-			job.node,
-		)
+		children, err := store.processNode(ctx, job.root, job.nodeGetter, job.rootPrio, job.delta, job.node)
 
 		if err != nil {
 			store.logger.Error(err)
@@ -781,10 +794,20 @@ func (store *Datastore) sendNewJobs(ctx context.Context, session *sync.WaitGroup
 		return nil
 	}
 
+	// Update job children status if persistent
+	for _, child := range children {
+		// Only add if not already in job
+		if status, _ := store.getChildStatus(ctx, root, child); status == 255 {
+			if err := store.setChildStatus(ctx, root, child, ChildPending); err != nil {
+				store.logger.Errorf("error setting job child status: %s", err)
+			}
+		}
+	}
+
 	cctx, cancel := context.WithTimeout(ctx, store.opts.DAGSyncerTimeout)
 	defer cancel()
 
-	// Special case for root
+	// Special case for root priority
 	if rootPrio == 0 {
 		prio, err := ng.GetPriority(cctx, children[0])
 		if err != nil {
@@ -794,8 +817,20 @@ func (store *Datastore) sendNewJobs(ctx context.Context, session *sync.WaitGroup
 	}
 
 	goodDeltas := make(map[cid.Cid]struct{})
-
 	var err error
+
+	// Mark children as requested
+	for _, child := range children {
+		err := store.setChildStatus(ctx, root, child, ChildRequested)
+		if err != nil {
+			return fmt.Errorf("error adding child to job: %w", err)
+		}
+		err = store.setBlockState(ctx, child, FetchRequested)
+		if err != nil {
+			return fmt.Errorf("error setting block state: %w", err)
+		}
+	}
+
 loop:
 	for deltaOpt := range ng.GetDeltas(cctx, children) {
 		// we abort whenever we a delta comes back in error.
@@ -803,7 +838,19 @@ loop:
 			err = fmt.Errorf("error getting delta: %w", deltaOpt.err)
 			break
 		}
-		goodDeltas[deltaOpt.node.Cid()] = struct{}{}
+
+		childCID := deltaOpt.node.Cid()
+		goodDeltas[childCID] = struct{}{}
+
+		// Update persistence state
+		err = store.setChildStatus(ctx, root, childCID, ChildFetched)
+		if err != nil {
+			return fmt.Errorf("error setting job child to status: %w", err)
+		}
+		err = store.setBlockState(ctx, childCID, Fetched)
+		if err != nil {
+			return fmt.Errorf("error setting block state: %w", err)
+		}
 
 		session.Add(1)
 		job := &dagJob{
@@ -865,11 +912,19 @@ func (store *Datastore) processedBlockKey(c cid.Cid) ds.Key {
 }
 
 func (store *Datastore) isProcessed(ctx context.Context, c cid.Cid) (bool, error) {
-	return store.store.Has(ctx, store.processedBlockKey(c))
+	o, err := store.store.Get(ctx, store.processedBlockKey(c))
+
+	if err != nil {
+		if errors.Is(err, ds.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return len(o) > 0 && o[0] == byte(ProcessedComplete), nil
 }
 
 func (store *Datastore) markProcessed(ctx context.Context, c cid.Cid) error {
-	return store.store.Put(ctx, store.processedBlockKey(c), nil)
+	return store.store.Put(ctx, store.processedBlockKey(c), []byte{byte(ProcessedComplete)})
 }
 
 func (store *Datastore) dirtyKey() ds.Key {
@@ -905,110 +960,106 @@ func (store *Datastore) MarkClean(ctx context.Context) {
 
 // processNode merges the delta in a node and has the logic about what to do
 // then.
-func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
-	// First,  merge the delta in this node.
-	current := node.Cid()
-	blockKey := dshelp.MultihashToDsKey(current.Hash()).String()
-	err := store.set.Merge(ctx, delta, blockKey)
-	if err != nil {
-		return nil, fmt.Errorf("error merging delta from %s: %w", current, err)
-	}
+func (store *Datastore) processNode(ctx context.Context, root cid.Cid, getter *crdtNodeGetter, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
+	// Check if all ancestors (children in DAG) are processed
+	AllAncestorsReady := true
+	var unprocessedAncestors []cid.Cid
+	var headsToReplace []cid.Cid
 
-	// Record that we have processed the node so that any other worker
-	// can skip it.
-	err = store.markProcessed(ctx, current)
-	if err != nil {
-		return nil, fmt.Errorf("error recording %s as processed: %w", current, err)
-	}
+	for _, link := range node.Links() {
+		ancestorCID := link.Cid
 
-	// Remove from the set that has the children which are queued for
-	// processing.
-	store.queuedChildren.Remove(node.Cid())
-
-	// Some informative logging
-	if prio := delta.GetPriority(); prio%50 == 0 {
-		store.logger.Infof("merged delta from node %s (priority: %d)", current, prio)
-	} else {
-		store.logger.Debugf("merged delta from node %s (priority: %d)", current, prio)
-	}
-
-	links := node.Links()
-	children := []cid.Cid{}
-
-	// We reached the bottom. Our head must become a new head.
-	if len(links) == 0 {
-		err := store.heads.Add(ctx, root, head{height: rootPrio})
+		bs, err := store.getBlockState(ctx, ancestorCID)
 		if err != nil {
+			return nil, fmt.Errorf("error checking ancestor state %s: %w", ancestorCID, err)
+		}
+
+		isFetching := bs == FetchRequested
+		isProcessed := bs == ProcessedComplete
+		if !isFetching && !isProcessed {
+			AllAncestorsReady = false
+			unprocessedAncestors = append(unprocessedAncestors, ancestorCID)
+		}
+		if ok, _, err := store.heads.IsHead(ctx, ancestorCID); err == nil && ok {
+			headsToReplace = append(headsToReplace, ancestorCID)
+		} else if err != nil {
+			return nil, fmt.Errorf("error checking ancestor is head %s: %w", ancestorCID, err)
+		}
+	}
+
+	if !AllAncestorsReady {
+		current := node.Cid()
+		// Some ancestors not processed, mark as pending
+		store.logger.Debugf("Block %s has unready ancestors", current)
+
+		// Return unprocessed ancestors for continued processing
+		return unprocessedAncestors, nil
+	}
+
+	jobNodes, ready, err := store.isJobReady(ctx, root)
+	if err != nil {
+		return nil, fmt.Errorf("error checking if job is ready: %w", err)
+	}
+
+	if !ready {
+		store.logger.Debugf("Job '%s' is not yet ready", root)
+		return unprocessedAncestors, nil
+	}
+
+	store.logger.Debugf("Job '%s' is ready, processing %d nodes", root, len(jobNodes))
+	for _, child := range jobNodes {
+		blockKey := dshelp.MultihashToDsKey(child.Hash()).String()
+		// Get the specific delta for this child node
+		_, childDelta, err := getter.GetDelta(ctx, child)
+		if err != nil {
+			return nil, fmt.Errorf("error getting delta for %s: %w", child, err)
+		}
+
+		if err := store.set.Merge(ctx, childDelta, blockKey); err != nil {
+			return nil, fmt.Errorf("error merging delta from %s: %w", child, err)
+		}
+		// Mark as processed globally
+		if err := store.markProcessed(ctx, child); err != nil {
+			return nil, fmt.Errorf("error recording %s as processed: %w", child, err)
+		}
+
+		store.queuedChildren.Remove(child)
+
+		err = store.setChildStatus(ctx, root, child, ChildProcessed)
+		if err != nil {
+			return nil, fmt.Errorf("error recording %s as processed: %w", child, err)
+		}
+
+		// Logging
+		if prio := childDelta.GetPriority(); prio%50 == 0 {
+			store.logger.Infof("merged delta from node %s (priority: %d)", child, prio)
+		} else {
+			store.logger.Debugf("merged delta from node %s (priority: %d)", child, prio)
+		}
+
+	}
+
+	if err := store.completeJob(ctx, root); err != nil {
+		store.logger.Errorf("error updating job progress: %s", err)
+	}
+
+	if len(headsToReplace) > 0 {
+		for _, child := range headsToReplace {
+			// Replace the existing head
+			store.logger.Debugf("replacing head %s -> %s", child, root)
+			if err := store.heads.Replace(ctx, child, root, head{height: rootPrio}); err != nil {
+				return nil, fmt.Errorf("error replacing head: %s->%s: %w", child, root, err)
+			}
+		}
+	} else {
+		// Add new head
+		store.logger.Debugf("adding new head %s", root)
+		if err := store.heads.Add(ctx, root, head{height: rootPrio}); err != nil {
 			return nil, fmt.Errorf("error adding head %s: %w", root, err)
 		}
 	}
 
-	// Return children that:
-	// a) Are not processed
-	// b) Are not going to be processed by someone else.
-	//
-	// For every other child, add our node as Head.
-
-	addedAsHead := false // small optimization to avoid adding as head multiple times.
-	for _, l := range links {
-		child := l.Cid
-
-		isHead, _, err := store.heads.IsHead(ctx, child)
-		if err != nil {
-			return nil, fmt.Errorf("error checking if %s is head: %w", child, err)
-		}
-
-		isProcessed, err := store.isProcessed(ctx, child)
-		if err != nil {
-			return nil, fmt.Errorf("error checking for known block %s: %w", child, err)
-		}
-
-		if isHead {
-			// reached one of the current state. Replace it with
-			// the tip of this branch
-			err := store.heads.Replace(ctx, child, root, head{height: rootPrio})
-			if err != nil {
-				return nil, fmt.Errorf("error replacing head: %s->%s: %w", child, root, err)
-			}
-			addedAsHead = true
-
-			// If this head was already processed, continue this
-			// protects the case when something is a head but was
-			// not processed (potentially could happen during
-			// first sync when state are set before processing, a
-			// both a node and its child are state - which I'm not
-			// sure if it can happen at all, but good to safeguard
-			// for it).
-			if isProcessed {
-				continue
-			}
-		}
-
-		// If the child has already been processed or someone else has
-		// reserved it for processing, then we can make ourselves a
-		// head right away because we are not meant to replace an
-		// existing head. Otherwise, mark it for processing and
-		// keep going down this branch.
-		if isProcessed || !store.queuedChildren.Visit(child) {
-			if !addedAsHead {
-				err = store.heads.Add(ctx, root, head{height: rootPrio})
-				if err != nil {
-					// Don't let this failure prevent us
-					// from processing the other links.
-					store.logger.Error(fmt.Errorf("error adding head %s: %w", root, err))
-				}
-			}
-			addedAsHead = true
-			continue
-		}
-
-		// We can return this child because it is not processed and we
-		// reserved it in the queue.
-		children = append(children, child)
-
-	}
-
-	return children, nil
+	return nil, nil
 }
 
 // RepairDAG is used to walk down the chain until a non-processed node is
@@ -1381,14 +1432,7 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta *pb.Delta) (cid.Ci
 	// returning. Since our block references current state, children
 	// should be empty
 	store.logger.Debugf("processing generated block %s", nd.Cid())
-	children, err := store.processNode(
-		ctx,
-		&crdtNodeGetter{store.dagService},
-		nd.Cid(),
-		height,
-		delta,
-		nd,
-	)
+	children, err := store.processNode(ctx, nd.Cid(), &crdtNodeGetter{store.dagService}, height, delta, nd)
 	if err != nil {
 		store.MarkDirty(ctx) // not sure if this will fix much if this happens.
 		return cid.Undef, fmt.Errorf("error processing new block: %w", err)
@@ -1411,9 +1455,14 @@ func (store *Datastore) broadcast(ctx context.Context) error {
 	default:
 	}
 
-	store.logger.Debugf("broadcasting state")
+	currentState := store.state.GetState()
+	store.logger.Debugf("Broadcasting state with %d members", len(currentState.Members))
+	for id, member := range currentState.Members {
+		headCount := len(member.DagHeads)
+		store.logger.Debugf("  Broadcasting member %s: %d heads, bestBefore=%d", id, headCount, member.BestBefore)
+	}
 
-	bcastBytes, err := store.encodeBroadcast(ctx, store.state.GetState())
+	bcastBytes, err := store.encodeBroadcast(ctx, currentState)
 	if err != nil {
 		return err
 	}
@@ -1589,51 +1638,6 @@ func (store *Datastore) GetState(ctx context.Context) *pb.StateBroadcast {
 	return store.state.GetState()
 }
 
-func (store *Datastore) restoreSnapshot(ctx context.Context, getter ipld.DAGService, snapshotRoot cid.Cid, dagHead cid.Cid, dagHeight uint64) error {
-	hamtNode, err := getter.Get(ctx, snapshotRoot)
-	if err != nil {
-		return fmt.Errorf("getting root node: %w", err)
-	}
-
-	// Load the root HAMT shard
-	rootShard, err := hamt.NewHamtFromDag(getter, hamtNode) // Adjust bit width as necessary
-	if err != nil {
-		return fmt.Errorf("failed to load HAMT root shard: %w", err)
-	}
-
-	// Process each link in the current shard
-	err = rootShard.ForEachLink(ctx, func(link *ipld.Link) error {
-		node, err := link.GetNode(ctx, getter)
-		if err != nil {
-			return fmt.Errorf("failed to retrieve node %s: %w", link.Cid.String(), err)
-		}
-
-		protoNode, ok := node.(*dag.ProtoNode)
-		if !ok {
-			return fmt.Errorf("unexpected node type '%t'", node)
-		}
-		delta := &pb.Delta{
-			Elements: []*pb.Element{{Key: strings.TrimPrefix(link.Name, "/"), Value: protoNode.Data()}},
-		}
-		id := dshelp.MultihashToDsKey(link.Cid.Hash()).String()
-		if err := store.set.Merge(ctx, delta, id); err != nil {
-			return fmt.Errorf("failed to merge delta: %w", err)
-
-		}
-
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("error processing shard: %w", err)
-	}
-
-	err = store.state.SetSnapshot(ctx, snapshotRoot, dagHead, dagHeight)
-	if err != nil {
-		return fmt.Errorf("setting snapshot: %w", err)
-	}
-	return nil
-}
-
 type cidSafeSet struct {
 	set map[cid.Cid]struct{}
 	mux sync.RWMutex
@@ -1749,7 +1753,7 @@ func (store *Datastore) compact() {
 		case <-timer.C:
 			err := store.triggerCompactionIfNeeded(store.ctx)
 			if err != nil {
-				store.logger.Errorf("Error during compaction: %v", err)
+				store.logger.Errorf("error during compaction: %v", err)
 				//todo
 			}
 		}
@@ -1758,56 +1762,88 @@ func (store *Datastore) compact() {
 
 }
 
-// triggerCompactionIfNeeded handles compaction logic directly within the datastore
+// triggerCompactionIfNeeded handles snapshot creation logic if the DAG grows too large.
+// triggerCompactionIfNeeded checks if compaction is needed and creates a new snapshot lagging behind current heads.
 func (store *Datastore) triggerCompactionIfNeeded(ctx context.Context) error {
-	// Ensure all members agree on the DAG head before compacting
-	commonCid, height, err := store.getHighestCommonCid(ctx)
-	if err != nil {
-		return err
-	}
 
-	if height == 0 {
-		return nil
-	}
-
+	store.logger.Debugf("Compaction triggered")
 	state := store.state.GetState()
-	snapshotHeight := uint64(0)
-	if state.Snapshot != nil {
-		snapshotHeight = state.Snapshot.Height
+	myParticipant := state.Members[store.h.ID().String()]
+
+	// ADD: Log all member states
+	store.logger.Debugf("=== Compaction Analysis ===")
+	for memberID, participant := range state.Members {
+		headCount := len(participant.DagHeads)
+		var headCIDs []string
+		for _, head := range participant.DagHeads {
+			if c, err := cid.Cast(head.Cid); err == nil {
+				headCIDs = append(headCIDs, c.String())
+			}
+		}
+		store.logger.Debugf("Member %s: %d heads %v, snapshot=%v",
+			memberID, headCount, headCIDs, participant.Snapshot != nil)
 	}
 
-	dagSize := height - snapshotHeight
+	var lastDagHead cid.Cid
+	var snapshotHeight uint64
+	if myParticipant != nil && myParticipant.Snapshot != nil {
+		lastDagHead = cidFromBytes(myParticipant.Snapshot.DagHead.Cid)
+		snapshotHeight = myParticipant.Snapshot.Height
+		store.logger.Debugf("My snapshot: height=%d, dagHead=%s", snapshotHeight, lastDagHead.String())
+	} else {
+		store.logger.Debugf("My snapshot: none")
+	}
 
-	// Check if DAG size exceeds the threshold for compaction
+	commonCID, highestPriority, err := store.getHighestCommonCid(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get highest common cid: %w", err)
+	}
+
+	if highestPriority == 0 {
+		store.logger.Debugf("No common CID found - aborting compaction")
+		return nil // Nothing to compact
+	}
+
+	store.logger.Debugf("Common analysis: highestPriority=%d, commonCID=%s",
+		highestPriority, commonCID.String())
+
+	dagSize := highestPriority - snapshotHeight
+	store.logger.Debugf("DAG size check: %d - %d = %d (threshold: %d)",
+		highestPriority, snapshotHeight, dagSize, store.opts.CompactDagSize)
+
 	if dagSize < store.opts.CompactDagSize {
-		return nil
+		store.logger.Debugf("DAG size %d below threshold %d - no compaction needed",
+			dagSize, store.opts.CompactDagSize)
+		return nil // DAG still small enough
 	}
+
+	store.logger.Debugf("=== PROCEEDING WITH COMPACTION ===")
+	// ... rest of function
 
 	store.compactMux.Lock()
 	defer store.compactMux.Unlock()
-	// Extract DAG content and walk back CompactRetainNodes steps to determine the target CID
-	startCID, height, err := store.walkBackDAG(ctx, commonCid, store.opts.CompactRetainNodes)
+
+	store.logger.Debugf("Dag Size %d Common SID for compaction %s", dagSize, commonCID.String())
+
+	// Walk back from common head to a stable point lagging behind
+	targetCID, h, err := store.walkBackDAG(ctx, commonCID, store.opts.CompactRetainNodes)
 	if err != nil {
-		return fmt.Errorf("failed to determine target CID for compaction: %w", err)
+		return fmt.Errorf("failed to walk back DAG for compaction: %w", err)
 	}
 
-	var lastSnapshotCid cid.Cid
-
-	if state.Snapshot != nil {
-		lastSnapshotCid, err = cid.Cast(state.Snapshot.DagHead.Cid)
-		if err != nil {
-			return fmt.Errorf("parsing last snapshot cid: %w", err)
-		}
+	if !targetCID.Defined() {
+		return fmt.Errorf("could not determine stable compaction point")
 	}
 
-	// Run compaction from start CID
-	compactCID, err := store.compactAndTruncate(ctx, startCID, lastSnapshotCid)
+	store.logger.Debugf("Target SID %s, Priority %d", targetCID.String(), h)
+
+	latestSnapshotInfo, err := store.compactAndSnapshot(ctx, targetCID, lastDagHead)
 	if err != nil {
-		return fmt.Errorf("error during DAG compaction: %w", err)
+		return fmt.Errorf("failed to create snapshot at compaction point: %w", err)
 	}
 
-	// Update the snapshot if compaction changes the state
-	if err := store.state.SetSnapshot(ctx, compactCID, startCID, height); err != nil {
+	// Update our snapshot pointer
+	if err := store.state.SetSnapshot(ctx, store.h.ID(), latestSnapshotInfo); err != nil {
 		return fmt.Errorf("failed to update snapshot after compaction: %w", err)
 	}
 
@@ -1837,25 +1873,46 @@ func (store *Datastore) getHighestCommonCid(ctx context.Context) (cid.Cid, uint6
 	return c, h, nil
 }
 
-// getAllMemberCommonHeads retrieves the DAG heads from all peers
+// getAllMemberCommonHeads retrieves the DAG heads from all peers who share our snapshot
 func (store *Datastore) getAllMemberCommonHeads() []cid.Cid {
-	var cids []cid.Cid
-	cidCount := map[cid.Cid]int{}
-	var members int
+	snapshotHeads := make(map[string]map[cid.Cid]int)
+	snapshotMembers := make(map[string]int)
 
-	for _, v := range store.state.GetState().Members {
-		members++
-		for _, c := range v.DagHeads {
+	for _, member := range store.state.GetState().Members {
+		var snapshotKey string
+		if member.Snapshot != nil {
+			snapshotKey = cidFromBytes(member.Snapshot.SnapshotKey.Cid).String()
+		} else {
+			snapshotKey = "no_snapshot"
+		}
+
+		snapshotMembers[snapshotKey]++
+		if snapshotHeads[snapshotKey] == nil {
+			snapshotHeads[snapshotKey] = make(map[cid.Cid]int)
+		}
+
+		for _, c := range member.DagHeads {
 			id, err := cid.Cast(c.Cid)
 			if err != nil {
-				// TODO
+				continue
 			}
-			cidCount[id]++
+			snapshotHeads[snapshotKey][id]++
 		}
 	}
 
-	for k, v := range cidCount {
-		if v == members {
+	// Choose the most recent snapshotKey with full membership
+	var chosenKey string
+	var maxMembers int
+	for k, count := range snapshotMembers {
+		if count > maxMembers {
+			maxMembers = count
+			chosenKey = k
+		}
+	}
+
+	var cids []cid.Cid
+	for k, v := range snapshotHeads[chosenKey] {
+		if v == snapshotMembers[chosenKey] {
 			cids = append(cids, k)
 		}
 	}
@@ -1951,4 +2008,327 @@ func (store *Datastore) selectStableChild(ctx context.Context, links []*ipld.Lin
 // UpdateMeta returns the current membership state
 func (store *Datastore) UpdateMeta(ctx context.Context, meta map[string]string) error {
 	return store.state.SetMeta(ctx, store.h.ID(), meta)
+}
+
+// Minimal job persistence functions
+func (store *Datastore) jobKey(rootCID cid.Cid) ds.Key {
+	return store.namespace.ChildString(jobsNs).ChildString(rootCID.String())
+}
+
+func (store *Datastore) jobChildKey(rootCID, childCID cid.Cid) ds.Key {
+	return store.namespace.ChildString(jobsNs).ChildString(rootCID.String()).ChildString(childCID.String())
+}
+
+func (store *Datastore) createJob(ctx context.Context, rootCID cid.Cid) error {
+	timestamp := make([]byte, 8)
+	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()))
+	return store.store.Put(ctx, store.jobKey(rootCID), timestamp)
+}
+
+func (store *Datastore) jobExists(ctx context.Context, rootCID cid.Cid) (bool, error) {
+	return store.store.Has(ctx, store.jobKey(rootCID))
+}
+
+func (store *Datastore) setChildStatus(ctx context.Context, rootCID, childCID cid.Cid, status byte) error {
+	return store.store.Put(ctx, store.jobChildKey(rootCID, childCID), []byte{status})
+}
+
+func (store *Datastore) getChildStatus(ctx context.Context, rootCID, childCID cid.Cid) (byte, error) {
+	data, err := store.store.Get(ctx, store.jobChildKey(rootCID, childCID))
+	if err != nil {
+		if errors.Is(err, ds.ErrNotFound) {
+			return 255, nil // Unknown
+		}
+		return 255, err
+	}
+	if len(data) == 0 {
+		return 255, nil
+	}
+	return data[0], nil
+}
+
+func (store *Datastore) setBlockState(ctx context.Context, c cid.Cid, state ProcessedState) error {
+	return store.store.Put(ctx, store.processedBlockKey(c), []byte{byte(state)})
+}
+
+func (store *Datastore) getBlockState(ctx context.Context, c cid.Cid) (ProcessedState, error) {
+	data, err := store.store.Get(ctx, store.processedBlockKey(c))
+	if err != nil {
+		if errors.Is(err, ds.ErrNotFound) {
+			return ProcessedState(255), nil
+		}
+		return ProcessedState(255), err
+	}
+	if len(data) == 0 {
+		return ProcessedState(255), nil
+	}
+	return ProcessedState(data[0]), nil
+}
+
+func (store *Datastore) restorePersistedJobs(ctx context.Context) error {
+	// First cleanup old jobs
+	if err := store.cleanupOldJobs(ctx); err != nil {
+		store.logger.Errorf("error during job cleanup: %s", err)
+		// Continue anyway
+	}
+
+	// Then get remaining jobs to resume
+	jobRoots, err := store.listActiveJobs(ctx)
+	if err != nil {
+		return fmt.Errorf("error listing active jobs: %w", err)
+	}
+
+	if len(jobRoots) == 0 {
+		store.logger.Info("no persisted jobs found")
+		return nil
+	}
+
+	store.logger.Infof("restoring %d persisted jobs", len(jobRoots))
+
+	// Resume each job
+	for _, rootCID := range jobRoots {
+		go func(root cid.Cid) {
+			if err := store.resumePersistedJob(ctx, root); err != nil {
+				store.logger.Errorf("error resuming job %s: %s", root, err)
+			}
+		}(rootCID)
+	}
+
+	return nil
+}
+
+func (store *Datastore) listActiveJobs(ctx context.Context) ([]cid.Cid, error) {
+	prefix := store.namespace.ChildString(jobsNs).String()
+	q := query.Query{Prefix: prefix}
+
+	results, err := store.store.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("error querying jobs: %w", err)
+	}
+	defer results.Close()
+
+	var jobRoots []cid.Cid
+	for result := range results.Next() {
+		if result.Error != nil {
+			continue
+		}
+
+		key := ds.NewKey(result.Key)
+		namespaces := key.Namespaces()
+		if len(namespaces) > 2 { // Skip child entries
+			continue
+		}
+
+		rootCIDStr := namespaces[1]
+		rootCID, err := cid.Decode(rootCIDStr)
+		if err != nil {
+			store.logger.Errorf("invalid root CID in job: %s", err)
+			continue
+		}
+
+		jobRoots = append(jobRoots, rootCID)
+	}
+
+	return jobRoots, nil
+}
+
+func (store *Datastore) resumePersistedJob(ctx context.Context, rootCID cid.Cid) error {
+	// Find pending children to resume fetching
+	pendingChildren, err := store.getPendingChildren(ctx, rootCID)
+	if err != nil {
+		return fmt.Errorf("error getting pending children: %w", err)
+	}
+
+	if len(pendingChildren) == 0 {
+		// No pending work, job might be complete already
+		store.logger.Debugf("job %s has no pending work, may already be complete", rootCID)
+		return nil
+	}
+
+	store.logger.Debugf("resuming job %s with %d pending children", rootCID, len(pendingChildren))
+
+	// Just pass off to existing machinery
+	dg := &crdtNodeGetter{NodeGetter: store.dagService}
+	if sessionMaker, ok := store.dagService.(SessionDAGService); ok {
+		dg = &crdtNodeGetter{NodeGetter: sessionMaker.Session(ctx)}
+	}
+
+	var session sync.WaitGroup
+	err = store.sendNewJobs(ctx, &session, dg, rootCID, 0, pendingChildren)
+	session.Wait()
+
+	return err
+}
+
+func (store *Datastore) getPendingChildren(ctx context.Context, rootCID cid.Cid) ([]cid.Cid, error) {
+	prefix := store.jobKey(rootCID).String() + "/"
+	q := query.Query{Prefix: prefix}
+
+	results, err := store.store.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("error querying job children: %w", err)
+	}
+	defer results.Close()
+
+	var pendingChildren []cid.Cid
+	for result := range results.Next() {
+		if result.Error != nil || len(result.Value) == 0 {
+			continue
+		}
+
+		status := result.Value[0]
+		if status == ChildPending || status == ChildRequested {
+			key := ds.NewKey(result.Key)
+			namespaces := key.Namespaces()
+			if len(namespaces) >= 3 {
+				childCIDStr := namespaces[2]
+				if childCID, err := cid.Decode(childCIDStr); err == nil {
+					pendingChildren = append(pendingChildren, childCID)
+				}
+			}
+		}
+	}
+
+	return pendingChildren, nil
+}
+
+func (store *Datastore) cleanupOldJobs(ctx context.Context) error {
+	prefix := store.namespace.ChildString(jobsNs).String()
+	q := query.Query{Prefix: prefix}
+
+	results, err := store.store.Query(ctx, q)
+	if err != nil {
+		return err
+	}
+	defer results.Close()
+
+	for result := range results.Next() {
+		if result.Error != nil {
+			continue
+		}
+
+		key := ds.NewKey(result.Key)
+		namespaces := key.Namespaces()
+		if len(namespaces) > 2 { // Skip child entries
+			continue
+		}
+
+		if len(result.Value) == 8 {
+			timestamp := int64(binary.BigEndian.Uint64(result.Value))
+			created := time.Unix(timestamp, 0)
+			if time.Since(created) > jobTimeout {
+				rootCIDStr := namespaces[1]
+				if rootCID, err := cid.Decode(rootCIDStr); err == nil {
+					store.logger.Debugf("cleaning up old job %s", rootCID)
+					if err := store.completeJob(ctx, rootCID); err != nil {
+						store.logger.Errorf("error deleting old job %s: %s", rootCID, err)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// Simplified job cleanup that just calls cleanupOldJobs
+func (store *Datastore) jobCleanup(ctx context.Context) {
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := store.cleanupOldJobs(ctx); err != nil {
+				store.logger.Errorf("error during job cleanup: %s", err)
+			}
+		}
+	}
+}
+
+func (store *Datastore) isJobReady(ctx context.Context, root cid.Cid) ([]cid.Cid, bool, error) {
+	// Get all children in this job
+	prefix := store.jobKey(root).String() + "/"
+	q := query.Query{Prefix: prefix}
+
+	results, err := store.store.Query(ctx, q)
+	if err != nil {
+		return nil, false, fmt.Errorf("error querying job children: %w", err)
+	}
+	defer results.Close()
+
+	var allNodes []cid.Cid
+	allFetched := true
+	hasChildren := false
+
+	for result := range results.Next() {
+		if result.Error != nil || len(result.Value) == 0 {
+			continue
+		}
+		hasChildren = true
+		status := result.Value[0]
+
+		// Extract child CID from key
+		key := ds.NewKey(strings.TrimPrefix(result.Key, prefix))
+		store.logger.Debugf("  child key %s", key)
+		namespaces := key.Namespaces()
+		if len(namespaces) < 1 {
+			continue
+		}
+
+		childCIDStr := namespaces[0] // /j/{root}/{child}
+		childCID, err := cid.Decode(childCIDStr)
+		if err != nil {
+			continue
+		}
+
+		allNodes = append(allNodes, childCID)
+
+		// If any node is not fetched or processed, job is not ready
+		if status != ChildFetched && status != ChildProcessed {
+			allFetched = false
+		}
+	}
+
+	if !hasChildren {
+		return []cid.Cid{root}, true, nil
+	}
+
+	// Only return nodes if ALL are fetched
+	if allFetched && len(allNodes) > 0 {
+		return allNodes, true, nil
+	}
+
+	return nil, false, nil
+}
+
+func (store *Datastore) completeJob(ctx context.Context, root cid.Cid) error {
+	// Delete child keys first
+	prefix := store.jobKey(root).String() + "/"
+	q := query.Query{Prefix: prefix}
+
+	results, err := store.store.Query(ctx, q)
+	if err != nil {
+		return fmt.Errorf("error querying job children for deletion: %w", err)
+	}
+	defer results.Close()
+
+	// Delete all child keys
+	for result := range results.Next() {
+		if result.Error != nil {
+			continue
+		}
+		if err := store.store.Delete(ctx, ds.NewKey(result.Key)); err != nil {
+			store.logger.Errorf("error deleting child key %s: %s", result.Key, err)
+		}
+	}
+
+	// Then delete the job metadata
+	if err := store.store.Delete(ctx, store.jobKey(root)); err != nil && !errors.Is(err, ds.ErrNotFound) {
+		return fmt.Errorf("error deleting job metadata: %w", err)
+	}
+
+	return nil
 }
