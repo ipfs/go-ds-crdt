@@ -114,7 +114,7 @@ func (store *Datastore) buildSnapshot(
 }
 
 func (store *Datastore) createSnapshotWrapper(
-	ctx context.Context,
+	_ context.Context,
 	hamtRootCID, prevSnapshotCID cid.Cid,
 	height uint64,
 	deltaHeadCID cid.Cid,

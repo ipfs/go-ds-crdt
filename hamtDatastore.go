@@ -104,7 +104,7 @@ func (hd *HAMTDatastore) GetSize(ctx context.Context, key ds.Key) (size int, err
 }
 
 // Query implements the datastore.Read interface
-func (hd *HAMTDatastore) Query(ctx context.Context, q query.Query) (query.Results, error) {
+func (hd *HAMTDatastore) Query(_ context.Context, q query.Query) (query.Results, error) {
 	hd.mu.RLock()
 	defer hd.mu.RUnlock()
 	// This is a more complex operation for HAMTs
@@ -212,7 +212,7 @@ func (hd *HAMTDatastore) Delete(ctx context.Context, key ds.Key) error {
 }
 
 // Sync is a no-op for HAMTDatastore
-func (hd *HAMTDatastore) Sync(ctx context.Context, prefix ds.Key) error {
+func (hd *HAMTDatastore) Sync(_ context.Context, _ ds.Key) error {
 	// No-op - HAMT changes are only persisted when Root() is called
 	return nil
 }
@@ -233,7 +233,7 @@ func (hd *HAMTDatastore) Batch(ctx context.Context) (ds.Batch, error) {
 }
 
 // GetRoot returns the current root CID of the HAMT
-func (hd *HAMTDatastore) GetRoot(ctx context.Context) (cid.Cid, error) {
+func (hd *HAMTDatastore) GetRoot(_ context.Context) (cid.Cid, error) {
 	rootNode, err := hd.hamtShard.Node()
 	if err != nil {
 		return cid.Undef, fmt.Errorf("failed to retrieve HAMT root node: %w", err)
@@ -253,12 +253,12 @@ type batchOp struct {
 	delete bool
 }
 
-func (b *hamtBatch) Put(ctx context.Context, key ds.Key, value []byte) error {
+func (b *hamtBatch) Put(_ context.Context, key ds.Key, value []byte) error {
 	b.ops[key] = batchOp{value: value, delete: false}
 	return nil
 }
 
-func (b *hamtBatch) Delete(ctx context.Context, key ds.Key) error {
+func (b *hamtBatch) Delete(_ context.Context, key ds.Key) error {
 	b.ops[key] = batchOp{delete: true}
 	return nil
 }
