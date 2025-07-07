@@ -593,11 +593,11 @@ func TestStateManager_ConcurrentAccess(t *testing.T) {
 				// Mix different operations
 				switch j % 4 {
 				case 0:
-					manager.UpdateHeads(ctx, peerID, []cid.Cid{createTestCID(t, "test")}, true)
+					_ = manager.UpdateHeads(ctx, peerID, []cid.Cid{createTestCID(t, "test")}, true)
 				case 1:
-					manager.SetMeta(ctx, peerID, map[string]string{"iter": string(rune('0' + j))})
+					_ = manager.SetMeta(ctx, peerID, map[string]string{"iter": string(rune('0' + j))})
 				case 2:
-					manager.GetState()
+					_ = manager.GetState()
 				case 3:
 					broadcast := &pb.StateBroadcast{
 						Members: map[string]*pb.Participant{
@@ -607,7 +607,7 @@ func TestStateManager_ConcurrentAccess(t *testing.T) {
 							},
 						},
 					}
-					manager.MergeMembers(ctx, broadcast)
+					_ = manager.MergeMembers(ctx, broadcast)
 				}
 			}
 		}(i)
@@ -688,7 +688,7 @@ func BenchmarkStateManager_GetState(b *testing.B) {
 	// Add some state
 	for i := 0; i < 100; i++ {
 		peerID := createTestPeerID(b, string(rune('A'+i)))
-		manager.UpdateHeads(ctx, peerID, []cid.Cid{createTestCID(b, string(rune('A'+i)))}, true)
+		_ = manager.UpdateHeads(ctx, peerID, []cid.Cid{createTestCID(b, string(rune('A'+i)))}, true)
 	}
 
 	b.ResetTimer()

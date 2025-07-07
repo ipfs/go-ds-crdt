@@ -266,7 +266,9 @@ func TestHAMTDatastore(t *testing.T) {
 		q := query.Query{Prefix: prefix}
 		results, err := hamtDS.Query(ctx, q)
 		require.NoError(t, err, "Failed to execute query")
-		defer results.Close()
+		defer func() {
+			_ = results.Close()
+		}()
 
 		// Collect and verify results
 		var entries []query.Entry

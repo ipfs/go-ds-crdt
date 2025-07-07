@@ -33,7 +33,9 @@ func TestDatastoreSuite(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer results.Close()
+		defer func() {
+			_ = results.Close()
+		}()
 		rest, err := results.Rest()
 		if err != nil {
 			t.Fatal(err)

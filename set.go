@@ -95,7 +95,7 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer results.Close()
+	defer func() { _ = results.Close() }()
 
 	for r := range results.Next() {
 		if r.Error != nil {
@@ -220,7 +220,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			sendResult(ctx, qctx, query.Result{Error: err}, out)
 			return
 		}
-		defer results.Close()
+		defer func() { _ = results.Close() }()
 
 		var entry query.Entry
 		for r := range results.Next() {
@@ -390,7 +390,7 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 	if err != nil {
 		return nil, 0, err
 	}
-	defer results.Close()
+	defer func() { _ = results.Close() }()
 
 	var bestValue []byte
 	var bestPriority uint64
@@ -533,14 +533,20 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 			return err
 		}
 		if v == nil {
-			store.Delete(ctx, valueK)
-			store.Delete(ctx, s.priorityKey(key))
+			if err := store.Delete(ctx, valueK); err != nil {
+				return err
+			}
+			if err := store.Delete(ctx, s.priorityKey(key)); err != nil {
+				return err
+			}
 		} else {
 			candidateEncoded := encodeValue(p, v)
 			if err := store.Put(ctx, valueK, candidateEncoded); err != nil {
 				return err
 			}
-			s.setPriority(ctx, store, key, p)
+			if err := s.setPriority(ctx, store, key, p); err != nil {
+				return err
+			}
 		}
 
 		// Write tomb into store.
@@ -666,7 +672,7 @@ func (s *set) CloneFrom(ctx context.Context, src *set, priorityHint uint64) erro
 			s.logger.Infof("CloneFrom: Adding to old map: %s = %s (prio=%d)", key, string(val), prio)
 		}
 	}
-	results.Close()
+	defer func() { _ = results.Close() }()
 
 	s.logger.Debugf("CloneFrom: Initial old map: %v", old)
 
@@ -705,7 +711,7 @@ func (s *set) CloneFrom(ctx context.Context, src *set, priorityHint uint64) erro
 			s.putHook(key, newVal)
 		}
 	}
-	results2.Close()
+	defer func() { _ = results2.Close() }()
 
 	s.logger.Debugf("CloneFrom: Final old map before delete hooks: %v", old)
 
@@ -748,7 +754,9 @@ func (s *set) clearNamespace(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("clearNamespace: query failed: %w", err)
 	}
-	defer res.Close()
+	defer func() {
+		_ = res.Close()
+	}()
 
 	// batch if supported
 	var batch ds.Batch
@@ -795,7 +803,9 @@ func (s *set) cloneDataOnly(ctx context.Context, src *set) error {
 	if err != nil {
 		return fmt.Errorf("cloneDataOnly: query src: %w", err)
 	}
-	defer res.Close()
+	defer func() {
+		_ = res.Close()
+	}()
 
 	// batch the writes if possible
 	var batch ds.Batch

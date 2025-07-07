@@ -142,7 +142,7 @@ func (env *testEnv) AddReplica(opts *Options) {
 	}
 
 	if debug {
-		log.SetLogLevel("crdt", "debug")
+		_ = log.SetLogLevel("crdt", "debug")
 	}
 }
 
@@ -153,7 +153,7 @@ func (env *testEnv) Cleanup() {
 		if err != nil {
 			env.t.Error(err)
 		}
-		os.RemoveAll(storeFolder(i))
+		_ = os.RemoveAll(storeFolder(i))
 	}
 }
 

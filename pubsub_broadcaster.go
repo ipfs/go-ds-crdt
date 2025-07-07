@@ -45,7 +45,7 @@ func NewPubSubBroadcaster(ctx context.Context, psub *pubsub.PubSub, topic string
 		for err == nil {
 			_, err = subs.Next(ctx)
 		}
-		psubTopic.Close()
+		_ = psubTopic.Close()
 	}(ctx, subs)
 
 	return &PubSubBroadcaster{
