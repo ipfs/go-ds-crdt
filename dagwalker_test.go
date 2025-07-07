@@ -59,7 +59,7 @@ func TestWalkReplayPath(t *testing.T) {
 				return []cid.Cid{aCid, cCid}, stopCid, []cid.Cid{bCid}
 			},
 			validate: func(t *testing.T, path []cid.Cid, stopAt cid.Cid, expectedNodes []cid.Cid, datastore *Datastore) {
-				var stopAtIndex, bIndex int = -1, -1
+				stopAtIndex, bIndex := -1, -1
 				bCid := expectedNodes[0] // B is the specific node we're testing
 
 				for i, c := range path {
