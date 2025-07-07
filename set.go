@@ -533,20 +533,14 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 			return err
 		}
 		if v == nil {
-			if err := store.Delete(ctx, valueK); err != nil {
-				return err
-			}
-			if err := store.Delete(ctx, s.priorityKey(key)); err != nil {
-				return err
-			}
+			_ = store.Delete(ctx, valueK)
+			_ = store.Delete(ctx, s.priorityKey(key))
 		} else {
 			candidateEncoded := encodeValue(p, v)
 			if err := store.Put(ctx, valueK, candidateEncoded); err != nil {
 				return err
 			}
-			if err := s.setPriority(ctx, store, key, p); err != nil {
-				return err
-			}
+			_ = s.setPriority(ctx, store, key, p)
 		}
 
 		// Write tomb into store.

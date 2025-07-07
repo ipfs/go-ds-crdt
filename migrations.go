@@ -137,20 +137,14 @@ func (store *Datastore) migrate0to1(ctx context.Context) error {
 		}
 
 		if v == nil {
-			if err := wStore.Delete(ctx, valueK); err != nil {
-				return err
-			}
-			if err := wStore.Delete(ctx, s.priorityKey(key)); err != nil {
-				return err
-			}
+			_ = wStore.Delete(ctx, valueK)
+			_ = wStore.Delete(ctx, s.priorityKey(key))
 		} else {
 			candidateEncoded := encodeValue(p, v)
 			if err := wStore.Put(ctx, valueK, candidateEncoded); err != nil {
 				return err
 			}
-			if err := s.setPriority(ctx, wStore, key, p); err != nil {
-				return err
-			}
+			_ = s.setPriority(ctx, wStore, key, p)
 		}
 		total++
 	}
