@@ -771,7 +771,7 @@ func (s *set) clearNamespace(ctx context.Context) error {
 		if r.Error != nil {
 			return fmt.Errorf("clearNamespace: scan error: %w", r.Error)
 		}
-		key := ds.NewKey(r.Entry.Key)
+		key := ds.NewKey(r.Key)
 		if batch != nil {
 			if err := batch.Delete(ctx, key); err != nil {
 				return fmt.Errorf("clearNamespace: batch delete %s: %w", key, err)
@@ -821,16 +821,16 @@ func (s *set) cloneDataOnly(ctx context.Context, src *set) error {
 			return fmt.Errorf("cloneDataOnly: scan error: %w", r.Error)
 		}
 		// drop the src.namespace prefix, rebase under s.namespace
-		rel := strings.TrimPrefix(r.Entry.Key, prefix)
+		rel := strings.TrimPrefix(r.Key, prefix)
 		rel = strings.TrimPrefix(rel, "/")
 		targetKey := s.namespace.ChildString(rel)
 
 		if batch != nil {
-			if err := batch.Put(ctx, targetKey, r.Entry.Value); err != nil {
+			if err := batch.Put(ctx, targetKey, r.Value); err != nil {
 				return fmt.Errorf("cloneDataOnly: batch put %s: %w", targetKey, err)
 			}
 		} else {
-			if err := s.store.Put(ctx, targetKey, r.Entry.Value); err != nil {
+			if err := s.store.Put(ctx, targetKey, r.Value); err != nil {
 				return fmt.Errorf("cloneDataOnly: put %s: %w", targetKey, err)
 			}
 		}
