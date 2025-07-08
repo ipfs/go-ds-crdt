@@ -242,7 +242,7 @@ func (hh *heads) primeCache(ctx context.Context) (ret error) {
 	if err != nil {
 		return err
 	}
-	defer results.Close()
+	defer func() { _ = results.Close() }()
 
 	for r := range results.Next() {
 		if r.Error != nil {

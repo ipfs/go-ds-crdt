@@ -104,7 +104,7 @@ func (store *Datastore) migrate0to1(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer results.Close()
+	defer func() { _ = results.Close() }()
 
 	// Results are not going to be ordered per key (I tested). Therefore,
 	// we can keep a list of keys in memory to avoid findingBestValue for
@@ -137,14 +137,14 @@ func (store *Datastore) migrate0to1(ctx context.Context) error {
 		}
 
 		if v == nil {
-			wStore.Delete(ctx, valueK)
-			wStore.Delete(ctx, s.priorityKey(key))
+			_ = wStore.Delete(ctx, valueK)
+			_ = wStore.Delete(ctx, s.priorityKey(key))
 		} else {
 			candidateEncoded := encodeValue(p, v)
 			if err := wStore.Put(ctx, valueK, candidateEncoded); err != nil {
 				return err
 			}
-			s.setPriority(ctx, wStore, key, p)
+			_ = s.setPriority(ctx, wStore, key, p)
 		}
 		total++
 	}

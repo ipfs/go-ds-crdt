@@ -2105,7 +2105,9 @@ func (store *Datastore) listActiveJobs(ctx context.Context) ([]cid.Cid, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error querying jobs: %w", err)
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 
 	var jobRoots []cid.Cid
 	for result := range results.Next() {
@@ -2168,7 +2170,9 @@ func (store *Datastore) getPendingChildren(ctx context.Context, rootCID cid.Cid)
 	if err != nil {
 		return nil, fmt.Errorf("error querying job children: %w", err)
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 
 	var pendingChildren []cid.Cid
 	for result := range results.Next() {
@@ -2200,7 +2204,9 @@ func (store *Datastore) cleanupOldJobs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 
 	for result := range results.Next() {
 		if result.Error != nil {
@@ -2257,7 +2263,9 @@ func (store *Datastore) isJobReady(ctx context.Context, root cid.Cid) ([]cid.Cid
 	if err != nil {
 		return nil, false, fmt.Errorf("error querying job children: %w", err)
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 
 	var allNodes []cid.Cid
 	allFetched := true
@@ -2313,7 +2321,9 @@ func (store *Datastore) completeJob(ctx context.Context, root cid.Cid) error {
 	if err != nil {
 		return fmt.Errorf("error querying job children for deletion: %w", err)
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 
 	// Delete all child keys
 	for result := range results.Next() {

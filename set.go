@@ -95,7 +95,7 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer results.Close()
+	defer func() { _ = results.Close() }()
 
 	for r := range results.Next() {
 		if r.Error != nil {
@@ -220,7 +220,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			sendResult(ctx, qctx, query.Result{Error: err}, out)
 			return
 		}
-		defer results.Close()
+		defer func() { _ = results.Close() }()
 
 		var entry query.Entry
 		for r := range results.Next() {
@@ -390,7 +390,7 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 	if err != nil {
 		return nil, 0, err
 	}
-	defer results.Close()
+	defer func() { _ = results.Close() }()
 
 	var bestValue []byte
 	var bestPriority uint64
@@ -533,14 +533,14 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 			return err
 		}
 		if v == nil {
-			store.Delete(ctx, valueK)
-			store.Delete(ctx, s.priorityKey(key))
+			_ = store.Delete(ctx, valueK)
+			_ = store.Delete(ctx, s.priorityKey(key))
 		} else {
 			candidateEncoded := encodeValue(p, v)
 			if err := store.Put(ctx, valueK, candidateEncoded); err != nil {
 				return err
 			}
-			s.setPriority(ctx, store, key, p)
+			_ = s.setPriority(ctx, store, key, p)
 		}
 
 		// Write tomb into store.
@@ -666,7 +666,7 @@ func (s *set) CloneFrom(ctx context.Context, src *set, priorityHint uint64) erro
 			s.logger.Infof("CloneFrom: Adding to old map: %s = %s (prio=%d)", key, string(val), prio)
 		}
 	}
-	results.Close()
+	defer func() { _ = results.Close() }()
 
 	s.logger.Debugf("CloneFrom: Initial old map: %v", old)
 
@@ -705,7 +705,7 @@ func (s *set) CloneFrom(ctx context.Context, src *set, priorityHint uint64) erro
 			s.putHook(key, newVal)
 		}
 	}
-	results2.Close()
+	defer func() { _ = results2.Close() }()
 
 	s.logger.Debugf("CloneFrom: Final old map before delete hooks: %v", old)
 
@@ -748,7 +748,9 @@ func (s *set) clearNamespace(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("clearNamespace: query failed: %w", err)
 	}
-	defer res.Close()
+	defer func() {
+		_ = res.Close()
+	}()
 
 	// batch if supported
 	var batch ds.Batch
@@ -763,7 +765,7 @@ func (s *set) clearNamespace(ctx context.Context) error {
 		if r.Error != nil {
 			return fmt.Errorf("clearNamespace: scan error: %w", r.Error)
 		}
-		key := ds.NewKey(r.Entry.Key)
+		key := ds.NewKey(r.Key)
 		if batch != nil {
 			if err := batch.Delete(ctx, key); err != nil {
 				return fmt.Errorf("clearNamespace: batch delete %s: %w", key, err)
@@ -795,7 +797,9 @@ func (s *set) cloneDataOnly(ctx context.Context, src *set) error {
 	if err != nil {
 		return fmt.Errorf("cloneDataOnly: query src: %w", err)
 	}
-	defer res.Close()
+	defer func() {
+		_ = res.Close()
+	}()
 
 	// batch the writes if possible
 	var batch ds.Batch
@@ -811,16 +815,16 @@ func (s *set) cloneDataOnly(ctx context.Context, src *set) error {
 			return fmt.Errorf("cloneDataOnly: scan error: %w", r.Error)
 		}
 		// drop the src.namespace prefix, rebase under s.namespace
-		rel := strings.TrimPrefix(r.Entry.Key, prefix)
+		rel := strings.TrimPrefix(r.Key, prefix)
 		rel = strings.TrimPrefix(rel, "/")
 		targetKey := s.namespace.ChildString(rel)
 
 		if batch != nil {
-			if err := batch.Put(ctx, targetKey, r.Entry.Value); err != nil {
+			if err := batch.Put(ctx, targetKey, r.Value); err != nil {
 				return fmt.Errorf("cloneDataOnly: batch put %s: %w", targetKey, err)
 			}
 		} else {
-			if err := s.store.Put(ctx, targetKey, r.Entry.Value); err != nil {
+			if err := s.store.Put(ctx, targetKey, r.Value); err != nil {
 				return fmt.Errorf("cloneDataOnly: put %s: %w", targetKey, err)
 			}
 		}

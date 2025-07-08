@@ -299,7 +299,7 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 		}
 	}
 	if debug {
-		log.SetLogLevel("crdt", "debug")
+		_ = log.SetLogLevel("crdt", "debug")
 	}
 
 	closeReplicas := func() {
@@ -309,7 +309,7 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 			if err != nil {
 				t.Error(err)
 			}
-			os.RemoveAll(storeFolder(i))
+			_ = os.RemoveAll(storeFolder(i))
 		}
 	}
 
@@ -372,7 +372,9 @@ func TestCRDTReplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 	rest, err := results.Rest()
 	if err != nil {
 		t.Fatal(err)
@@ -410,7 +412,9 @@ func TestCRDTReplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 
 	total := 0
 	for r := range results.Next() {
@@ -616,7 +620,9 @@ func TestCRDTCatchUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 	rest, err := results.Rest()
 	if err != nil {
 		t.Fatal(err)
@@ -924,7 +930,9 @@ func BenchmarkQueryElements(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer results.Close()
+	defer func() {
+		_ = results.Close()
+	}()
 
 	totalSize := 0
 	for r := range results.Next() {
@@ -1005,10 +1013,10 @@ func TestCRDTPutPutDelete(t *testing.T) {
 	if string(r0Res) != string(r1Res) {
 		fmt.Printf("r0Res: %s\nr1Res: %s\n", string(r0Res), string(r1Res))
 		t.Log("r0 dag")
-		replicas[0].PrintDAG(ctx)
+		_ = replicas[0].PrintDAG(ctx)
 
 		t.Log("r1 dag")
-		replicas[1].PrintDAG(ctx)
+		_ = replicas[1].PrintDAG(ctx)
 
 		t.Fatal("r0 and r1 should have the same value")
 	}
