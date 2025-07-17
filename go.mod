@@ -12,7 +12,7 @@ require (
 	github.com/ipfs/go-ds-badger v0.3.4
 	github.com/ipfs/go-ipld-format v0.6.2
 	github.com/ipfs/go-log/v2 v2.6.0
-	github.com/libp2p/go-libp2p-pubsub v0.13.0
+	github.com/libp2p/go-libp2p-pubsub v0.14.2
 	github.com/multiformats/go-multihash v0.2.3
 	go.uber.org/multierr v1.11.0
 	google.golang.org/protobuf v1.36.6
