@@ -18,7 +18,7 @@ import (
 
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
-	badger "github.com/ipfs/go-ds-badger"
+	badger4 "github.com/ipfs/go-ds-badger4"
 	crdt "github.com/ipfs/go-ds-crdt"
 	logging "github.com/ipfs/go-log/v2"
 
@@ -82,7 +82,7 @@ func main() {
 		data = *dataDir + "/" + config
 	}
 
-	store, err := badger.NewDatastore(data, &badger.DefaultOptions)
+	store, err := badger4.NewDatastore(data, &badger4.DefaultOptions)
 	if err != nil {
 		logger.Fatal(err)
 	}
