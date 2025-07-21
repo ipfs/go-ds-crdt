@@ -12,6 +12,7 @@ message Participant {
   repeated Head DagHeads = 2;   // List of DAG heads
   map<string,string> metadata = 3;   // A map to hold arbitrary metadata about the participant
   Snapshot Snapshot = 4;  // latest HAMT snapshot head
+  uint32 StateSeq = 5;  // State sequence number for ordering updates
 }
 
 message Head {

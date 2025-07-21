@@ -71,6 +71,7 @@ type Participant struct {
 	DagHeads      []*Head                `protobuf:"bytes,2,rep,name=DagHeads,proto3" json:"DagHeads,omitempty"`                                                                           // List of DAG heads
 	Metadata      map[string]string      `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // A map to hold arbitrary metadata about the participant
 	Snapshot      *Snapshot              `protobuf:"bytes,4,opt,name=Snapshot,proto3" json:"Snapshot,omitempty"`                                                                           // latest HAMT snapshot head
+	StateSeq      uint32                 `protobuf:"varint,5,opt,name=StateSeq,proto3" json:"StateSeq,omitempty"`                                                                          // State sequence number for ordering updates
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -131,6 +132,13 @@ func (x *Participant) GetSnapshot() *Snapshot {
 		return x.Snapshot
 	}
 	return nil
+}
+
+func (x *Participant) GetStateSeq() uint32 {
+	if x != nil {
+		return x.StateSeq
+	}
+	return 0
 }
 
 type Head struct {
@@ -246,14 +254,15 @@ const file_bcast_proto_rawDesc = "" +
 	"\aMembers\x18\x01 \x03(\v2$.crdt.pb.StateBroadcast.MembersEntryR\aMembers\x1aP\n" +
 	"\fMembersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
-	"\x05value\x18\x02 \x01(\v2\x14.crdt.pb.ParticipantR\x05value:\x028\x01\"\x84\x02\n" +
+	"\x05value\x18\x02 \x01(\v2\x14.crdt.pb.ParticipantR\x05value:\x028\x01\"\xa0\x02\n" +
 	"\vParticipant\x12\x1e\n" +
 	"\n" +
 	"BestBefore\x18\x01 \x01(\x04R\n" +
 	"BestBefore\x12)\n" +
 	"\bDagHeads\x18\x02 \x03(\v2\r.crdt.pb.HeadR\bDagHeads\x12>\n" +
 	"\bmetadata\x18\x03 \x03(\v2\".crdt.pb.Participant.MetadataEntryR\bmetadata\x12-\n" +
-	"\bSnapshot\x18\x04 \x01(\v2\x11.crdt.pb.SnapshotR\bSnapshot\x1a;\n" +
+	"\bSnapshot\x18\x04 \x01(\v2\x11.crdt.pb.SnapshotR\bSnapshot\x12\x1a\n" +
+	"\bStateSeq\x18\x05 \x01(\rR\bStateSeq\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x18\n" +

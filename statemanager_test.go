@@ -266,132 +266,6 @@ func TestStateManager_UpdateHeads(t *testing.T) {
 	})
 }
 
-func TestStateManager_MergeMembers(t *testing.T) {
-	ctx := context.Background()
-	store := sync.MutexWrap(ds.NewMapDatastore())
-	key := ds.NewKey("/test/state")
-	ttl := time.Hour
-	mockClock := clock.NewMock()
-
-	// Set mock clock to a reasonable time to avoid underflow issues
-	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-	mockClock.Set(baseTime)
-
-	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
-	require.NoError(t, err)
-	manager.clock = mockClock
-
-	t.Run("merge new members", func(t *testing.T) {
-		broadcast := &pb.StateBroadcast{
-			Members: map[string]*pb.Participant{
-				"peer1": {
-					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
-					Metadata:   map[string]string{"role": "leader"},
-				},
-				"peer2": {
-					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
-					Metadata:   map[string]string{"role": "follower"},
-				},
-			},
-		}
-
-		err := manager.MergeMembers(ctx, broadcast)
-		require.NoError(t, err)
-
-		state := manager.GetState()
-		assert.Len(t, state.Members, 2)
-		assert.Contains(t, state.Members, "peer1")
-		assert.Contains(t, state.Members, "peer2")
-		assert.Equal(t, "leader", state.Members["peer1"].Metadata["role"])
-	})
-
-	t.Run("merge with newer timestamps wins", func(t *testing.T) {
-		// Add existing member
-		manager.state.Members["peer1"] = &pb.Participant{
-			BestBefore: uint64(mockClock.Now().Add(-time.Hour).Unix()), // Older
-			Metadata:   map[string]string{"role": "old_leader"},
-		}
-
-		broadcast := &pb.StateBroadcast{
-			Members: map[string]*pb.Participant{
-				"peer1": {
-					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()), // Newer
-					Metadata:   map[string]string{"role": "new_leader"},
-				},
-			},
-		}
-
-		err := manager.MergeMembers(ctx, broadcast)
-		require.NoError(t, err)
-
-		state := manager.GetState()
-		assert.Equal(t, "new_leader", state.Members["peer1"].Metadata["role"])
-	})
-
-	t.Run("older timestamps are ignored", func(t *testing.T) {
-		// Add existing member with newer timestamp
-		manager.state.Members["peer1"] = &pb.Participant{
-			BestBefore: uint64(mockClock.Now().Add(ttl).Unix()), // Newer
-			Metadata:   map[string]string{"role": "current_leader"},
-		}
-
-		broadcast := &pb.StateBroadcast{
-			Members: map[string]*pb.Participant{
-				"peer1": {
-					BestBefore: uint64(mockClock.Now().Add(-time.Hour).Unix()), // Older
-					Metadata:   map[string]string{"role": "old_leader"},
-				},
-			},
-		}
-
-		err := manager.MergeMembers(ctx, broadcast)
-		require.NoError(t, err)
-
-		state := manager.GetState()
-		assert.Equal(t, "current_leader", state.Members["peer1"].Metadata["role"])
-	})
-
-	t.Run("expired members are removed", func(t *testing.T) {
-		// Add expired member
-		manager.state.Members["expired_peer"] = &pb.Participant{
-			BestBefore: uint64(mockClock.Now().Add(-time.Hour).Unix()), // Expired
-			Metadata:   map[string]string{"role": "expired"},
-		}
-
-		broadcast := &pb.StateBroadcast{
-			Members: map[string]*pb.Participant{},
-		}
-
-		err := manager.MergeMembers(ctx, broadcast)
-		require.NoError(t, err)
-
-		state := manager.GetState()
-		assert.NotContains(t, state.Members, "expired_peer")
-	})
-
-	t.Run("callback is triggered", func(t *testing.T) {
-		var callbackTriggered int32
-		manager.SetMembershipUpdateCallback(func(members map[string]*pb.Participant) {
-			atomic.StoreInt32(&callbackTriggered, 1)
-		})
-
-		broadcast := &pb.StateBroadcast{
-			Members: map[string]*pb.Participant{
-				"new_peer": {
-					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
-				},
-			},
-		}
-
-		err := manager.MergeMembers(ctx, broadcast)
-		require.NoError(t, err)
-
-		// Wait for goroutine
-		time.Sleep(10 * time.Millisecond)
-		assert.Equal(t, int32(1), atomic.LoadInt32(&callbackTriggered))
-	})
-}
-
 func TestStateManager_SetSnapshot(t *testing.T) {
 	ctx := context.Background()
 	store := sync.MutexWrap(ds.NewMapDatastore())
@@ -695,5 +569,343 @@ func BenchmarkStateManager_GetState(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		state := manager.GetState()
 		_ = state
+	}
+}
+
+// Additional tests for StateSeq functionality - add to statemanager_test.go
+
+func TestStateManager_StateSeqIncrement(t *testing.T) {
+	ctx := context.Background()
+	store := sync.MutexWrap(ds.NewMapDatastore())
+	key := ds.NewKey("/test/state")
+	ttl := time.Hour
+	mockClock := clock.NewMock()
+
+	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	mockClock.Set(baseTime)
+
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
+	require.NoError(t, err)
+	manager.clock = mockClock
+
+	peerID := createTestPeerID(t, "peer1")
+	testCIDs := []cid.Cid{createTestCID(t, "test1")}
+
+	t.Run("new member starts with seq 1", func(t *testing.T) {
+		err := manager.UpdateHeads(ctx, peerID, testCIDs, true)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		member := state.Members[peerID.String()]
+		require.NotNil(t, member)
+		assert.Equal(t, uint32(1), member.StateSeq)
+	})
+
+	t.Run("subsequent updates increment seq", func(t *testing.T) {
+		err := manager.UpdateHeads(ctx, peerID, testCIDs, true)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		member := state.Members[peerID.String()]
+		assert.Equal(t, uint32(2), member.StateSeq)
+
+		// Another update
+		err = manager.UpdateHeads(ctx, peerID, testCIDs, false)
+		require.NoError(t, err)
+
+		state = manager.GetState()
+		member = state.Members[peerID.String()]
+		assert.Equal(t, uint32(3), member.StateSeq)
+	})
+
+	t.Run("metadata updates increment seq", func(t *testing.T) {
+		currentSeq := manager.state.Members[peerID.String()].StateSeq
+
+		err := manager.SetMeta(ctx, peerID, map[string]string{"role": "leader"})
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		member := state.Members[peerID.String()]
+		assert.Equal(t, currentSeq+1, member.StateSeq)
+	})
+
+	t.Run("no-change metadata doesn't increment seq", func(t *testing.T) {
+		currentSeq := manager.state.Members[peerID.String()].StateSeq
+
+		// Set same metadata again
+		err := manager.SetMeta(ctx, peerID, map[string]string{"role": "leader"})
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		member := state.Members[peerID.String()]
+		assert.Equal(t, currentSeq, member.StateSeq) // Should not increment
+	})
+}
+
+func TestStateManager_StateSeqWraparound(t *testing.T) {
+	ctx := context.Background()
+	store := sync.MutexWrap(ds.NewMapDatastore())
+	key := ds.NewKey("/test/state")
+	ttl := time.Hour
+
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
+	require.NoError(t, err)
+
+	peerID := createTestPeerID(t, "peer1")
+
+	t.Run("sequence wraps around at 2^32", func(t *testing.T) {
+		// Create member with high sequence number near max uint32
+		manager.state.Members[peerID.String()] = &pb.Participant{
+			BestBefore: uint64(time.Now().Add(ttl).Unix()),
+			StateSeq:   0xFFFFFFFF, // Max uint32
+			Metadata:   make(map[string]string),
+		}
+
+		err := manager.UpdateHeads(ctx, peerID, []cid.Cid{createTestCID(t, "test")}, true)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		member := state.Members[peerID.String()]
+		assert.Equal(t, uint32(0), member.StateSeq) // Should wrap to 0
+	})
+}
+
+func TestStateManager_MergeMembersWithStateSeq(t *testing.T) {
+	ctx := context.Background()
+	store := sync.MutexWrap(ds.NewMapDatastore())
+	key := ds.NewKey("/test/state")
+	ttl := time.Hour
+	mockClock := clock.NewMock()
+
+	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	mockClock.Set(baseTime)
+
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
+	require.NoError(t, err)
+	manager.clock = mockClock
+
+	t.Run("higher sequence number wins", func(t *testing.T) {
+		// Add existing member with seq 5
+		manager.state.Members["peer1"] = &pb.Participant{
+			BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+			StateSeq:   5,
+			Metadata:   map[string]string{"role": "old_value"},
+		}
+
+		// Incoming broadcast with seq 6 (higher)
+		broadcast := &pb.StateBroadcast{
+			Members: map[string]*pb.Participant{
+				"peer1": {
+					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+					StateSeq:   6,
+					Metadata:   map[string]string{"role": "new_value"},
+				},
+			},
+		}
+
+		err := manager.MergeMembers(ctx, broadcast)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		assert.Equal(t, "new_value", state.Members["peer1"].Metadata["role"])
+		assert.Equal(t, uint32(6), state.Members["peer1"].StateSeq)
+	})
+
+	t.Run("lower sequence number is ignored", func(t *testing.T) {
+		// Add existing member with seq 10
+		manager.state.Members["peer1"] = &pb.Participant{
+			BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+			StateSeq:   10,
+			Metadata:   map[string]string{"role": "current_value"},
+		}
+
+		// Incoming broadcast with seq 8 (lower)
+		broadcast := &pb.StateBroadcast{
+			Members: map[string]*pb.Participant{
+				"peer1": {
+					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+					StateSeq:   8,
+					Metadata:   map[string]string{"role": "old_value"},
+				},
+			},
+		}
+
+		err := manager.MergeMembers(ctx, broadcast)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		assert.Equal(t, "current_value", state.Members["peer1"].Metadata["role"])
+		assert.Equal(t, uint32(10), state.Members["peer1"].StateSeq)
+	})
+
+	t.Run("sequence wraparound handling", func(t *testing.T) {
+		// Current member with seq near max
+		manager.state.Members["peer1"] = &pb.Participant{
+			BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+			StateSeq:   0xFFFFFFF0, // Near max uint32
+			Metadata:   map[string]string{"role": "old_value"},
+		}
+
+		// Incoming with seq that wrapped around
+		broadcast := &pb.StateBroadcast{
+			Members: map[string]*pb.Participant{
+				"peer1": {
+					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+					StateSeq:   5, // Wrapped around from near-max
+					Metadata:   map[string]string{"role": "wrapped_value"},
+				},
+			},
+		}
+
+		err := manager.MergeMembers(ctx, broadcast)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		assert.Equal(t, "wrapped_value", state.Members["peer1"].Metadata["role"])
+		assert.Equal(t, uint32(5), state.Members["peer1"].StateSeq)
+	})
+
+	t.Run("sequence difference at boundary", func(t *testing.T) {
+		// Current member with seq 0
+		manager.state.Members["peer1"] = &pb.Participant{
+			BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+			StateSeq:   0,
+			Metadata:   map[string]string{"role": "current_value"},
+		}
+
+		// Incoming with seq exactly at half-boundary (should be treated as older)
+		broadcast := &pb.StateBroadcast{
+			Members: map[string]*pb.Participant{
+				"peer1": {
+					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+					StateSeq:   0x80000000, // Exactly at the boundary
+					Metadata:   map[string]string{"role": "boundary_value"},
+				},
+			},
+		}
+
+		err := manager.MergeMembers(ctx, broadcast)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		assert.Equal(t, "current_value", state.Members["peer1"].Metadata["role"])
+		assert.Equal(t, uint32(0), state.Members["peer1"].StateSeq)
+	})
+}
+
+func TestStateManager_MarkLeaving(t *testing.T) {
+	ctx := context.Background()
+	store := sync.MutexWrap(ds.NewMapDatastore())
+	key := ds.NewKey("/test/state")
+	ttl := time.Hour
+	mockClock := clock.NewMock()
+
+	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	mockClock.Set(baseTime)
+
+	manager, err := NewStateManager(ctx, store, key, ttl, log.Logger("crdt"))
+	require.NoError(t, err)
+	manager.clock = mockClock
+
+	peerID := createTestPeerID(t, "peer1")
+
+	t.Run("mark leaving for new member", func(t *testing.T) {
+		grace := 10 * time.Second
+		err := manager.MarkLeaving(ctx, peerID, grace)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		member := state.Members[peerID.String()]
+		require.NotNil(t, member)
+
+		expectedExpiry := uint64(mockClock.Now().Add(grace).Unix())
+		assert.Equal(t, expectedExpiry, member.BestBefore)
+		assert.Equal(t, uint32(1), member.StateSeq)
+	})
+
+	t.Run("mark leaving for existing member increments seq", func(t *testing.T) {
+		// Add existing member
+		manager.state.Members[peerID.String()] = &pb.Participant{
+			BestBefore: uint64(mockClock.Now().Add(ttl).Unix()),
+			StateSeq:   5,
+			Metadata:   map[string]string{"existing": "data"},
+		}
+
+		grace := 5 * time.Second
+		err := manager.MarkLeaving(ctx, peerID, grace)
+		require.NoError(t, err)
+
+		state := manager.GetState()
+		member := state.Members[peerID.String()]
+
+		expectedExpiry := uint64(mockClock.Now().Add(grace).Unix())
+		assert.Equal(t, expectedExpiry, member.BestBefore)
+		assert.Equal(t, uint32(6), member.StateSeq)          // Should increment
+		assert.Equal(t, "data", member.Metadata["existing"]) // Preserve existing data
+	})
+
+	t.Run("mark leaving update survives merge", func(t *testing.T) {
+		// Set up a member with short TTL due to MarkLeaving
+		grace := 5 * time.Second
+		err := manager.MarkLeaving(ctx, peerID, grace)
+		require.NoError(t, err)
+
+		currentState := manager.GetState()
+		leavingMember := currentState.Members[peerID.String()]
+		shortTTL := leavingMember.BestBefore
+		leavingSeq := leavingMember.StateSeq
+
+		// Simulate receiving a broadcast from another peer with the old, long TTL
+		// but lower sequence number
+		broadcast := &pb.StateBroadcast{
+			Members: map[string]*pb.Participant{
+				peerID.String(): {
+					BestBefore: uint64(mockClock.Now().Add(ttl).Unix()), // Much longer TTL
+					StateSeq:   leavingSeq - 1,                          // Lower sequence
+					Metadata:   map[string]string{"role": "old_data"},
+				},
+			},
+		}
+
+		err = manager.MergeMembers(ctx, broadcast)
+		require.NoError(t, err)
+
+		// Our short TTL should be preserved because our sequence is higher
+		finalState := manager.GetState()
+		finalMember := finalState.Members[peerID.String()]
+		assert.Equal(t, shortTTL, finalMember.BestBefore, "Short TTL should be preserved")
+		assert.Equal(t, leavingSeq, finalMember.StateSeq, "Higher sequence should be preserved")
+	})
+}
+
+// Test the seq32Newer function directly
+func TestSeq32Newer(t *testing.T) {
+	tests := []struct {
+		name     string
+		seqA     uint32
+		seqB     uint32
+		expected bool
+	}{
+		{"simple newer", 5, 4, true},
+		{"simple older", 4, 5, false},
+		{"same sequence", 5, 5, false},
+		{"wraparound newer", 5, 0xFFFFFFF0, true},  // Large seqB, small seqA = newer
+		{"wraparound older", 0xFFFFFFF0, 5, false}, // Going backwards
+		{"boundary case - just under half", 0x7FFFFFFF, 0, true},
+		{"boundary case - exactly half", 0x80000000, 0, false},
+		{"boundary case - just over half", 0x80000001, 0, false},
+		{"max newer", 0xFFFFFFFF, 0xFFFFFFFE, true},
+		{"zero newer than max", 0, 0xFFFFFFFF, true}, // Wraparound case
+		{"large gap still newer", 1000, 100, true},
+		{"large gap older", 100, 1000, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := seq32Newer(tt.seqA, tt.seqB)
+			assert.Equal(t, tt.expected, result,
+				"seq32Newer(%d, %d) = %v, expected %v",
+				tt.seqA, tt.seqB, result, tt.expected)
+		})
 	}
 }

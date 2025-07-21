@@ -81,6 +81,13 @@ func (m *StateManager) GetState() *pb.StateBroadcast {
 	return proto.Clone(m.state).(*pb.StateBroadcast)
 }
 
+// seq32Newer reports whether seqA is *later* than seqB
+// in a 32‑bit modulo‑2³² sequence space (RFC 1982 / TCP rule).
+func seq32Newer(seqA, seqB uint32) bool {
+	diff := seqA - seqB // unsigned subtraction, wraps mod 2³²
+	return diff != 0 && diff < 0x80000000
+}
+
 func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.Cid, updateTTL bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -94,10 +101,12 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 		m.logger.Debugf("Creating new member %s", idStr)
 		member = &pb.Participant{
 			BestBefore: uint64(m.clock.Now().Add(m.ttl).Unix()),
+			StateSeq:   1,
 		}
 		m.state.Members[idStr] = member
 	} else {
 		m.logger.Debugf("Updating existing member %s (had %d heads)", idStr, len(member.DagHeads))
+		member.StateSeq++
 	}
 
 	member.DagHeads = make([]*pb.Head, 0, len(heads))
@@ -130,31 +139,30 @@ func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroa
 	m.logger.Debugf("Before merge: %d local members", len(m.state.Members))
 	for id, member := range m.state.Members {
 		headCount := len(member.DagHeads)
-		m.logger.Debugf("  Local member %s: %d heads, bestBefore=%d", id, headCount, member.BestBefore)
+		m.logger.Debugf("  Local member %s: %d heads, bestBefore=%d, seq=%d", id, headCount, member.BestBefore, member.StateSeq)
 	}
 
 	m.logger.Debugf("Incoming broadcast: %d members", len(broadcast.Members))
 	for id, member := range broadcast.Members {
 		headCount := len(member.DagHeads)
-		m.logger.Debugf("  Broadcast member %s: %d heads, bestBefore=%d", id, headCount, member.BestBefore)
+		m.logger.Debugf("  Broadcast member %s: %d heads, bestBefore=%d, seq=%d", id, headCount, member.BestBefore, member.StateSeq)
 	}
 
 	changesTracker := make(map[string]string)
 
 	for k, v := range broadcast.Members {
-		// if our state is missing this member or the update is newer than the one we have
-		// take theirs
+		// if our state is missing this member or the incoming sequence is newer
 		if ov, ok := m.state.Members[k]; !ok {
 			m.state.Members[k] = v
 			changesTracker[k] = "ADDED"
-			m.logger.Debugf("ADDED member %s (bestBefore=%d)", k, v.BestBefore)
-		} else if v.BestBefore > ov.BestBefore {
+			m.logger.Debugf("ADDED member %s (bestBefore=%d, seq=%d)", k, v.BestBefore, v.StateSeq)
+		} else if seq32Newer(v.StateSeq, ov.StateSeq) {
 			m.state.Members[k] = v
 			changesTracker[k] = "UPDATED"
-			m.logger.Debugf("UPDATED member %s: %d -> %d", k, ov.BestBefore, v.BestBefore)
+			m.logger.Debugf("UPDATED member %s: seq %d -> %d", k, ov.StateSeq, v.StateSeq)
 		} else {
 			changesTracker[k] = "IGNORED"
-			m.logger.Debugf("IGNORED member %s: incoming %d <= existing %d", k, v.BestBefore, ov.BestBefore)
+			m.logger.Debugf("IGNORED member %s: incoming seq %d <= existing seq %d", k, v.StateSeq, ov.StateSeq)
 		}
 	}
 
@@ -177,9 +185,44 @@ func (m *StateManager) MergeMembers(ctx context.Context, broadcast *pb.StateBroa
 		if action == "" {
 			action = "UNCHANGED"
 		}
-		m.logger.Debugf("  Final member %s: %d heads, bestBefore=%d [%s]", id, headCount, member.BestBefore, action)
+		m.logger.Debugf("  Final member %s: %d heads, bestBefore=%d, seq=%d [%s]", id, headCount, member.BestBefore, member.StateSeq, action)
 	}
 
+	if m.onMembershipUpdate != nil {
+		go func() {
+			m.onMembershipUpdate(m.GetState().Members)
+		}()
+	}
+
+	return m.Save(ctx)
+}
+
+// MarkLeaving sets a short TTL for the specified peer to signal imminent departure
+func (m *StateManager) MarkLeaving(ctx context.Context, id peer.ID, grace time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	idStr := id.String()
+	member, ok := m.state.Members[idStr]
+	if !ok {
+		// Create new participant if doesn't exist
+		member = &pb.Participant{
+			Metadata: make(map[string]string),
+			StateSeq: 1,
+		}
+		m.state.Members[idStr] = member
+	} else {
+		// Increment sequence number to ensure this update propagates
+		member.StateSeq++
+	}
+
+	// Set the short TTL
+	member.BestBefore = uint64(m.clock.Now().Add(grace).Unix())
+
+	m.logger.Infof("marked peer %s as leaving with grace period %v (expires at %d, seq=%d)",
+		idStr, grace, member.BestBefore, member.StateSeq)
+
+	// Trigger membership update callback if set
 	if m.onMembershipUpdate != nil {
 		go func() {
 			m.onMembershipUpdate(m.GetState().Members)
@@ -197,8 +240,12 @@ func (m *StateManager) SetSnapshot(ctx context.Context, selfID peer.ID, info *Sn
 	if !ok {
 		member = &pb.Participant{
 			BestBefore: uint64(m.clock.Now().Add(m.ttl).Unix()),
+			StateSeq:   1,
 		}
 		m.state.Members[selfID.String()] = member
+	} else {
+		// Increment sequence number for snapshot updates
+		member.StateSeq++
 	}
 
 	member.Snapshot = &pb.Snapshot{
@@ -229,6 +276,7 @@ func (m *StateManager) SetMeta(ctx context.Context, id peer.ID, metaData map[str
 		changesMade = true
 		member = &pb.Participant{
 			Metadata: metaData,
+			StateSeq: 1,
 		}
 		m.state.Members[id.String()] = member
 	} else {
@@ -246,6 +294,7 @@ func (m *StateManager) SetMeta(ctx context.Context, id peer.ID, metaData map[str
 	if !changesMade {
 		return nil
 	}
+	member.StateSeq++
 	member.BestBefore = uint64(m.clock.Now().Add(m.ttl).Unix())
 
 	return m.Save(ctx)
