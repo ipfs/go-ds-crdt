@@ -81,6 +81,32 @@ func (m *StateManager) GetState() *pb.StateBroadcast {
 	return proto.Clone(m.state).(*pb.StateBroadcast)
 }
 
+// getOrCreateMember gets an existing member or creates a new one.
+// This consolidates the member initialization pattern used throughout the codebase.
+// Note: This method assumes the caller holds the mutex lock.
+func (m *StateManager) getOrCreateMember(idStr string) *pb.Participant {
+	member, ok := m.state.Members[idStr]
+	if !ok {
+		m.logger.Debugf("Creating new member %s", idStr)
+		member = &pb.Participant{
+			BestBefore: uint64(m.clock.Now().Add(m.ttl).Unix()),
+			StateSeq:   1,
+			Metadata:   make(map[string]string),
+		}
+		m.state.Members[idStr] = member
+	} else {
+		m.logger.Debugf("Updating existing member %s", idStr)
+		member.StateSeq++
+	}
+	return member
+}
+
+// updateMemberTTL updates the TTL for an existing member.
+// Note: This method assumes the caller holds the mutex lock.
+func (m *StateManager) updateMemberTTL(member *pb.Participant) {
+	member.BestBefore = uint64(m.clock.Now().Add(m.ttl).Unix())
+}
+
 // seq32Newer reports whether seqA is *later* than seqB
 // in a 32‑bit modulo‑2³² sequence space (RFC 1982 / TCP rule).
 func seq32Newer(seqA, seqB uint32) bool {
@@ -96,18 +122,7 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 	m.logger.Debugf("=== HEAD UPDATE for %s ===", idStr)
 	m.logger.Debugf("Updating %d heads, updateTTL=%t", len(heads), updateTTL)
 
-	member, ok := m.state.Members[idStr]
-	if !ok {
-		m.logger.Debugf("Creating new member %s", idStr)
-		member = &pb.Participant{
-			BestBefore: uint64(m.clock.Now().Add(m.ttl).Unix()),
-			StateSeq:   1,
-		}
-		m.state.Members[idStr] = member
-	} else {
-		m.logger.Debugf("Updating existing member %s (had %d heads)", idStr, len(member.DagHeads))
-		member.StateSeq++
-	}
+	member := m.getOrCreateMember(idStr)
 
 	member.DagHeads = make([]*pb.Head, 0, len(heads))
 	for i, h := range heads {
@@ -117,7 +132,7 @@ func (m *StateManager) UpdateHeads(ctx context.Context, id peer.ID, heads []cid.
 
 	if updateTTL {
 		oldTTL := member.BestBefore
-		member.BestBefore = uint64(m.clock.Now().Add(m.ttl).Unix())
+		m.updateMemberTTL(member)
 		m.logger.Debugf("Updated TTL: %d -> %d", oldTTL, member.BestBefore)
 	}
 

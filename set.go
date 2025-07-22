@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/ipfs/go-ds-crdt/internal/utils"
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
@@ -91,16 +92,7 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 		KeysOnly: true,
 	}
 
-	results, err := s.store.Query(ctx, q)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = results.Close() }()
-
-	for r := range results.Next() {
-		if r.Error != nil {
-			return nil, r.Error
-		}
+	err := utils.QueryAndIterate(ctx, s.store, q, func(r query.Result) error {
 		id := strings.TrimPrefix(r.Key, prefix.String())
 		if !ds.RawKey(id).IsTopLevel() {
 			// our prefix matches blocks from other keys i.e. our
@@ -108,14 +100,14 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 			// "hello/bye" so we have a block id like
 			// "bye/<block>". If we got the right key, then the id
 			// should be the block id only.
-			continue
+			return nil // continue
 		}
 
 		// check if its already tombed, which case don't add it to the
 		// Rmv delta set.
 		deleted, err := s.inTombsKeyID(ctx, key, id)
 		if err != nil {
-			return nil, err
+			return utils.WrapErrorf(err, "failed to check tombstone for key %s id %s", key, id)
 		}
 		if !deleted {
 			delta.Tombstones = append(delta.Tombstones, &pb.Element{
@@ -123,6 +115,11 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 				Id:  id,
 			})
 		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
 	}
 	return delta, nil
 }
@@ -465,40 +462,27 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 		return nil
 	}
 
-	var store ds.Write = s.store
-	var err error
-	if batchingDs, ok := store.(ds.Batching); ok {
-		store, err = batchingDs.Batch(ctx)
-		if err != nil {
-			return err
+	return utils.WithBatch(ctx, s.store, func(store ds.Write) error {
+		for _, e := range elems {
+			e.Id = id // overwrite the identifier if not set
+			key := e.GetKey()
+			// Write into /namespace/elems/<key>/<id> the encoded candidate value.
+			k := s.elemsPrefix(key).ChildString(id)
+
+			v := e.GetValue()
+
+			candidateEncoded := encodeValue(prio, v)
+			if err := store.Put(ctx, k, candidateEncoded); err != nil {
+				return utils.WrapErrorf(err, "failed to put element for key %s", key)
+			}
+
+			// Update the best value for this key if needed.
+			if err := s.setValue(ctx, store, key, id, e.GetValue(), prio); err != nil {
+				return utils.WrapErrorf(err, "failed to set value for key %s", key)
+			}
 		}
-	}
-
-	for _, e := range elems {
-		e.Id = id // overwrite the identifier if not set
-		key := e.GetKey()
-		// Write into /namespace/elems/<key>/<id> the encoded candidate value.
-		k := s.elemsPrefix(key).ChildString(id)
-
-		v := e.GetValue()
-
-		candidateEncoded := encodeValue(prio, v)
-		if err := store.Put(ctx, k, candidateEncoded); err != nil {
-			return err
-		}
-
-		// Update the best value for this key if needed.
-		if err := s.setValue(ctx, store, key, id, e.GetValue(), prio); err != nil {
-			return err
-		}
-	}
-
-	if batchingDs, ok := store.(ds.Batch); ok {
-		if err := batchingDs.Commit(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
@@ -506,55 +490,45 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		return nil
 	}
 
-	var store ds.Write = s.store
-	var err error
-	batchingDs, batching := store.(ds.Batching)
-	if batching {
-		store, err = batchingDs.Batch(ctx)
-		if err != nil {
-			return err
-		}
-	}
-
 	// key -> tombstonedBlockID. Carries the tombstoned blocks for each
 	// element in this delta.
 	deletedElems := make(map[string][]string)
 
-	for _, e := range tombs {
-		// /namespace/tombs/<key>/<id>
-		key := e.GetKey()
-		id := e.GetId()
-		valueK := s.valueKey(key)
-		deletedElems[key] = append(deletedElems[key], id)
+	err := utils.WithBatch(ctx, s.store, func(store ds.Write) error {
+		for _, e := range tombs {
+			// /namespace/tombs/<key>/<id>
+			key := e.GetKey()
+			id := e.GetId()
+			valueK := s.valueKey(key)
+			deletedElems[key] = append(deletedElems[key], id)
 
-		// Find best value for element that we are going to delete
-		v, p, err := s.findBestValue(ctx, key, deletedElems[key])
-		if err != nil {
-			return err
-		}
-		if v == nil {
-			_ = store.Delete(ctx, valueK)
-			_ = store.Delete(ctx, s.priorityKey(key))
-		} else {
-			candidateEncoded := encodeValue(p, v)
-			if err := store.Put(ctx, valueK, candidateEncoded); err != nil {
-				return err
+			// Find best value for element that we are going to delete
+			v, p, err := s.findBestValue(ctx, key, deletedElems[key])
+			if err != nil {
+				return utils.WrapErrorf(err, "failed to find best value for key %s", key)
 			}
-			_ = s.setPriority(ctx, store, key, p)
-		}
+			if v == nil {
+				_ = store.Delete(ctx, valueK)
+				_ = store.Delete(ctx, s.priorityKey(key))
+			} else {
+				candidateEncoded := encodeValue(p, v)
+				if err := store.Put(ctx, valueK, candidateEncoded); err != nil {
+					return utils.WrapErrorf(err, "failed to put value for key %s", key)
+				}
+				_ = s.setPriority(ctx, store, key, p)
+			}
 
-		// Write tomb into store.
-		err = s.recordTombstone(ctx, key, id, store)
-		if err != nil {
-			return err
+			// Write tomb into store.
+			err = s.recordTombstone(ctx, key, id, store)
+			if err != nil {
+				return utils.WrapErrorf(err, "failed to record tombstone for key %s", key)
+			}
 		}
-	}
+		return nil
+	})
 
-	if batching {
-		err := store.(ds.Batch).Commit(ctx)
-		if err != nil {
-			return err
-		}
+	if err != nil {
+		return err
 	}
 
 	if s.deleteHook == nil {
