@@ -2255,7 +2255,6 @@ func (store *Datastore) jobCleanup(ctx context.Context) {
 }
 
 func (store *Datastore) isJobReady(ctx context.Context, root cid.Cid) ([]cid.Cid, bool, error) {
-	// Get all children in this job
 	prefix := store.jobKey(root).String() + "/"
 	q := query.Query{Prefix: prefix}
 
@@ -2268,7 +2267,6 @@ func (store *Datastore) isJobReady(ctx context.Context, root cid.Cid) ([]cid.Cid
 	}()
 
 	var allNodes []cid.Cid
-	allFetched := true
 	hasChildren := false
 
 	for result := range results.Next() {
@@ -2280,23 +2278,23 @@ func (store *Datastore) isJobReady(ctx context.Context, root cid.Cid) ([]cid.Cid
 
 		// Extract child CID from key
 		key := ds.NewKey(strings.TrimPrefix(result.Key, prefix))
-		store.logger.Debugf("  child key %s", key)
 		namespaces := key.Namespaces()
 		if len(namespaces) < 1 {
 			continue
 		}
 
-		childCIDStr := namespaces[0] // /j/{root}/{child}
+		childCIDStr := namespaces[0]
 		childCID, err := cid.Decode(childCIDStr)
 		if err != nil {
 			continue
 		}
 
-		allNodes = append(allNodes, childCID)
-
-		// If any node is not fetched or processed, job is not ready
-		if status != ChildFetched && status != ChildProcessed {
-			allFetched = false
+		// Only consider fetched nodes for processing
+		if status == ChildFetched {
+			allNodes = append(allNodes, childCID)
+		} else if status != ChildProcessed {
+			// If any node is not fetched (and not already processed), job not ready
+			return nil, false, nil
 		}
 	}
 
@@ -2304,12 +2302,66 @@ func (store *Datastore) isJobReady(ctx context.Context, root cid.Cid) ([]cid.Cid
 		return []cid.Cid{root}, true, nil
 	}
 
-	// Only return nodes if ALL are fetched
-	if allFetched && len(allNodes) > 0 {
-		return allNodes, true, nil
+	// Additional check: ensure we have complete branches
+	// For each fetched node, verify all its dependencies are either:
+	// 1. Already processed globally, OR
+	// 2. Part of this job and fetched
+	if len(allNodes) > 0 {
+		complete, err := store.verifyBranchCompleteness(ctx, allNodes)
+		if err != nil {
+			return nil, false, err
+		}
+		if !complete {
+			store.logger.Debugf("job %s not ready - incomplete branches", root)
+			return nil, false, nil
+		}
 	}
 
-	return nil, false, nil
+	return allNodes, len(allNodes) > 0, nil
+}
+
+// verifyBranchCompleteness ensures all dependencies are available before processing
+func (store *Datastore) verifyBranchCompleteness(ctx context.Context, nodes []cid.Cid) (bool, error) {
+	dg := &crdtNodeGetter{NodeGetter: store.dagService}
+
+	nodeSet := make(map[cid.Cid]bool)
+	for _, node := range nodes {
+		nodeSet[node] = true
+	}
+
+	for _, nodeCID := range nodes {
+		node, _, err := dg.GetDelta(ctx, nodeCID)
+		if err != nil {
+			return false, fmt.Errorf("error getting node %s: %w", nodeCID, err)
+		}
+
+		// Check each dependency
+		for _, link := range node.Links() {
+			depCID := link.Cid
+
+			// Is this dependency already processed globally?
+			isProcessed, err := store.isProcessed(ctx, depCID)
+			if err != nil {
+				return false, fmt.Errorf("error checking if %s is processed: %w", depCID, err)
+			}
+
+			if isProcessed {
+				continue // This dependency is satisfied
+			}
+
+			// Is this dependency part of our current job?
+			if nodeSet[depCID] {
+				continue // This dependency will be processed with us
+			}
+
+			// Dependency is missing - branch is incomplete
+			store.logger.Debugf("incomplete branch: node %s depends on %s which is not processed or in current job",
+				nodeCID, depCID)
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 func (store *Datastore) completeJob(ctx context.Context, root cid.Cid) error {
