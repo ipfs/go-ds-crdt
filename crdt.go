@@ -29,7 +29,6 @@ import (
 
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 	pb "github.com/ipfs/go-ds-crdt/pb"
-	"go.uber.org/multierr"
 	"google.golang.org/protobuf/proto"
 
 	cid "github.com/ipfs/go-cid"
@@ -1112,7 +1111,7 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 	// set entries related to the given prefix.
 	err := store.set.datastoreSync(ctx, prefix)
 	err2 := store.store.Sync(ctx, store.heads.namespace)
-	return multierr.Combine(err, err2)
+	return errors.Join(err, err2)
 }
 
 // Close shuts down the CRDT datastore. It should not be used afterwards.

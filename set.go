@@ -13,7 +13,6 @@ import (
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
-	multierr "go.uber.org/multierr"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
@@ -622,5 +621,5 @@ func (s *set) datastoreSync(ctx context.Context, prefix ds.Key) error {
 		}
 	}
 
-	return multierr.Combine(errs...)
+	return errors.Join(errs...)
 }
