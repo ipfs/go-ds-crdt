@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ipfs/boxo/peering"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
 	badger4 "github.com/ipfs/go-ds-badger4"
@@ -213,7 +214,7 @@ func main() {
 	inf, _ := peer.AddrInfoFromP2pAddr(bstr)
 	list := append(ipfslite.DefaultBootstrapPeers(), *inf)
 	ipfs.Bootstrap(list)
-	h.ConnManager().TagPeer(inf.ID, "keep", 100)
+	h.ConnManager().Protect(inf.ID, peering.ConnmgrTag)
 
 	fmt.Printf(`
 Peer ID: %s
