@@ -1,11 +1,9 @@
 module github.com/ipfs/go-ds-crdt/examples/globaldb
 
-go 1.24
-
-toolchain go1.24.0
+go 1.25
 
 require (
-	github.com/hsanjuan/ipfs-lite v1.8.4
+	github.com/hsanjuan/ipfs-lite v1.8.6
 	github.com/ipfs/boxo v0.33.1
 	github.com/ipfs/go-datastore v0.8.2
 	github.com/ipfs/go-ds-badger4 v0.1.8
@@ -13,7 +11,7 @@ require (
 	github.com/ipfs/go-log/v2 v2.6.0
 	github.com/libp2p/go-libp2p v0.42.1
 	github.com/libp2p/go-libp2p-pubsub v0.13.0
-	github.com/multiformats/go-multiaddr v0.16.0
+	github.com/multiformats/go-multiaddr v0.16.1
 )
 
 require (
