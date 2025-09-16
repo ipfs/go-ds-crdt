@@ -13,6 +13,7 @@ import (
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
+	"go.uber.org/multierr"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
@@ -26,6 +27,16 @@ var (
 	prioritySuffix = "p"
 )
 
+// Set specifies operations that the add-wins observed-removed set must fulfil.
+type Set interface {
+	Add(ctx context.Context, key string, value []byte) (Delta, error)
+	Rmv(ctx context.Context, key string) (Delta, error)
+	Merge(ctx context.Context, d Delta, id string) error
+	Element(ctx context.Context, key string) ([]byte, error)
+	Elements(ctx context.Context, q query.Query) (query.Results, error)
+	InSet(ctx context.Context, key string) (bool, error)
+}
+
 // set implements an Add-Wins Observed-Remove Set using delta-CRDTs
 // (https://arxiv.org/abs/1410.2803) and backing all the data in a
 // go-datastore. It is fully agnostic to MerkleCRDTs or the delta distribution
@@ -33,12 +44,13 @@ var (
 // Value. When two values have the same priority, it chooses by alphabetically
 // sorting their unique IDs alphabetically.
 type set struct {
-	store      ds.Datastore
-	dagService ipld.DAGService
-	namespace  ds.Key
-	putHook    func(key string, v []byte)
-	deleteHook func(key string)
-	logger     logging.StandardLogger
+	store        ds.Datastore
+	dagService   ipld.DAGService
+	namespace    ds.Key
+	putHook      func(key string, v []byte)
+	deleteHook   func(key string)
+	deltaFactory func() Delta
+	logger       logging.StandardLogger
 
 	// Avoid merging two things at the same time since
 	// we read-write value-priorities in a non-atomic way.
@@ -53,36 +65,38 @@ func newCRDTSet(
 	logger logging.StandardLogger,
 	putHook func(key string, v []byte),
 	deleteHook func(key string),
+	deltaFactory func() Delta,
 ) (*set, error) {
 
 	set := &set{
-		namespace:  namespace,
-		store:      d,
-		dagService: dagService,
-		logger:     logger,
-		putHook:    putHook,
-		deleteHook: deleteHook,
+		namespace:    namespace,
+		store:        d,
+		dagService:   dagService,
+		logger:       logger,
+		putHook:      putHook,
+		deleteHook:   deleteHook,
+		deltaFactory: deltaFactory,
 	}
 
 	return set, nil
 }
 
 // Add returns a new delta-set adding the given key/value.
-func (s *set) Add(ctx context.Context, key string, value []byte) *pb.Delta {
-	return &pb.Delta{
-		Elements: []*pb.Element{
-			{
-				Key:   key,
-				Value: value,
-			},
+func (s *set) Add(ctx context.Context, key string, value []byte) (Delta, error) {
+	delta := s.deltaFactory()
+	delta.SetElements([]*pb.Element{
+		{
+			Key:   key,
+			Value: value,
 		},
-		Tombstones: nil,
-	}
+	})
+	return delta, nil
 }
 
 // Rmv returns a new delta-set removing the given key.
-func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
-	delta := &pb.Delta{}
+func (s *set) Rmv(ctx context.Context, key string) (Delta, error) {
+	delta := s.deltaFactory()
+	var tombs []*pb.Element
 
 	// /namespace/<key>/elements
 	prefix := s.elemsPrefix(key)
@@ -95,6 +109,7 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 	if err != nil {
 		return nil, err
 	}
+	//nolint:errcheck
 	defer results.Close()
 
 	for r := range results.Next() {
@@ -118,12 +133,17 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 			return nil, err
 		}
 		if !deleted {
-			delta.Tombstones = append(delta.Tombstones, &pb.Element{
+			tombs = append(tombs, &pb.Element{
 				Key: key,
 				Id:  id,
 			})
 		}
 	}
+
+	if len(tombs) > 0 {
+		delta.SetTombstones(tombs)
+	}
+
 	return delta, nil
 }
 
@@ -212,6 +232,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			sendResult(ctx, qctx, query.Result{Error: err}, out)
 			return
 		}
+		//nolint:errcheck
 		defer results.Close()
 
 		var entry query.Entry
@@ -379,6 +400,7 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 	if err != nil {
 		return nil, 0, err
 	}
+	//nolint:errcheck
 	defer results.Close()
 
 	var bestValue []byte
@@ -424,13 +446,20 @@ NEXT:
 			return nil, 0, err
 		}
 		deltaCid = cid.NewCidV1(cid.DagProtobuf, mhash)
-		_, delta, err := ng.GetDelta(ctx, deltaCid)
+		_, deltaBytes, err := ng.GetDelta(ctx, deltaCid)
 		if err != nil {
 			return nil, 0, err
 		}
 
+		delta := s.deltaFactory()
+		err = delta.Unmarshal(deltaBytes)
+		if err != nil {
+			return nil, 0, err
+		}
+		priority := delta.GetPriority()
+
 		// discard this delta.
-		if delta.Priority < bestPriority {
+		if priority < bestPriority {
 			continue
 		}
 
@@ -438,7 +467,11 @@ NEXT:
 		// the delta and current. When higher priority, choose the
 		// greatest only among those in the delta.
 		var greatestValueInDelta []byte
-		for _, elem := range delta.GetElements() {
+		elems, err := delta.GetElements()
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, elem := range elems {
 			if elem.GetKey() != key {
 				continue
 			}
@@ -448,9 +481,9 @@ NEXT:
 			}
 		}
 
-		if delta.Priority > bestPriority {
+		if priority > bestPriority {
 			bestValue = greatestValueInDelta
-			bestPriority = delta.Priority
+			bestPriority = priority
 			continue
 		}
 
@@ -549,17 +582,18 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		if err != nil {
 			return err
 		}
+
 		if v == nil {
-			store.Delete(ctx, valueK)
-			store.Delete(ctx, s.priorityKey(key))
+			err = multierr.Append(err, store.Delete(ctx, valueK))
+			err = multierr.Append(err, store.Delete(ctx, s.priorityKey(key)))
 		} else {
-			store.Put(ctx, valueK, v)
-			s.setPriority(ctx, store, key, p)
+			err = multierr.Append(err, store.Put(ctx, valueK, v))
+			err = multierr.Append(err, s.setPriority(ctx, store, key, p))
 		}
 
 		// Write tomb into store.
 		k := s.tombsPrefix(key).ChildString(id)
-		err = store.Put(ctx, k, nil)
+		err = multierr.Append(err, store.Put(ctx, k, nil))
 		if err != nil {
 			return err
 		}
@@ -582,13 +616,23 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	return nil
 }
 
-func (s *set) Merge(ctx context.Context, d *pb.Delta, id string) error {
-	err := s.putTombs(ctx, d.GetTombstones())
+func (s *set) Merge(ctx context.Context, d Delta, id string) error {
+	tombs, err := d.GetTombstones()
 	if err != nil {
 		return err
 	}
 
-	return s.putElems(ctx, d.GetElements(), id, d.GetPriority())
+	elems, err := d.GetElements()
+	if err != nil {
+		return err
+	}
+
+	err = s.putTombs(ctx, tombs)
+	if err != nil {
+		return err
+	}
+
+	return s.putElems(ctx, elems, id, d.GetPriority())
 }
 
 // currently unused

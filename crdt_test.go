@@ -262,6 +262,7 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 		}
 	}
 	if debug {
+		// nolint:errcheck
 		log.SetLogLevel("crdt", "debug")
 	}
 
@@ -272,6 +273,7 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 			if err != nil {
 				t.Error(err)
 			}
+			// nolint:errcheck
 			os.RemoveAll(storeFolder(i))
 		}
 	}
@@ -335,6 +337,7 @@ func TestCRDTReplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// nolint:errcheck
 	defer results.Close()
 	rest, err := results.Rest()
 	if err != nil {
@@ -373,6 +376,7 @@ func TestCRDTReplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// nolint:errcheck
 	defer results.Close()
 
 	total := 0
@@ -513,6 +517,7 @@ func TestCRDTCatchUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// nolint:errcheck
 	defer results.Close()
 	rest, err := results.Rest()
 	if err != nil {
@@ -838,6 +843,7 @@ func BenchmarkQueryElements(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	// nolint:errcheck
 	defer results.Close()
 
 	totalSize := 0
@@ -919,9 +925,11 @@ func TestCRDTPutPutDelete(t *testing.T) {
 	if string(r0Res) != string(r1Res) {
 		fmt.Printf("r0Res: %s\nr1Res: %s\n", string(r0Res), string(r1Res))
 		t.Log("r0 dag")
+		// nolint:errcheck
 		replicas[0].PrintDAG(ctx)
 
 		t.Log("r1 dag")
+		// nolint:errcheck
 		replicas[1].PrintDAG(ctx)
 
 		t.Fatal("r0 and r1 should have the same value")
