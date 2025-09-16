@@ -6,9 +6,7 @@ import (
 
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	cid "github.com/ipfs/go-cid"
-	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
-	"google.golang.org/protobuf/proto"
 )
 
 // IPLD related things
@@ -20,7 +18,7 @@ type crdtNodeGetter struct {
 	ipld.NodeGetter
 }
 
-func (ng *crdtNodeGetter) GetDelta(ctx context.Context, c cid.Cid) (ipld.Node, *pb.Delta, error) {
+func (ng *crdtNodeGetter) GetDelta(ctx context.Context, c cid.Cid) (ipld.Node, []byte, error) {
 	nd, err := ng.Get(ctx, c)
 	if err != nil {
 		return nil, nil, err
@@ -29,17 +27,8 @@ func (ng *crdtNodeGetter) GetDelta(ctx context.Context, c cid.Cid) (ipld.Node, *
 	return nd, delta, err
 }
 
-// GetHeight returns the height of a block
-func (ng *crdtNodeGetter) GetPriority(ctx context.Context, c cid.Cid) (uint64, error) {
-	_, delta, err := ng.GetDelta(ctx, c)
-	if err != nil {
-		return 0, err
-	}
-	return delta.Priority, nil
-}
-
 type deltaOption struct {
-	delta *pb.Delta
+	delta []byte
 	node  ipld.Node
 	err   error
 }
@@ -69,24 +58,18 @@ func (ng *crdtNodeGetter) GetDeltas(ctx context.Context, cids []cid.Cid) <-chan 
 	return deltaOpts
 }
 
-func extractDelta(nd ipld.Node) (*pb.Delta, error) {
+func extractDelta(nd ipld.Node) ([]byte, error) {
 	protonode, ok := nd.(*dag.ProtoNode)
 	if !ok {
 		return nil, errors.New("node is not a ProtoNode")
 	}
-	d := pb.Delta{}
-	err := proto.Unmarshal(protonode.Data(), &d)
-	return &d, err
+	return protonode.Data(), nil
 }
 
-func makeNode(delta *pb.Delta, heads []cid.Cid) (ipld.Node, error) {
-	var data []byte
-	var err error
-	if delta != nil {
-		data, err = proto.Marshal(delta)
-		if err != nil {
-			return nil, err
-		}
+func makeNode(delta Delta, heads []cid.Cid) (ipld.Node, error) {
+	data, err := delta.Marshal()
+	if err != nil {
+		return nil, err
 	}
 
 	nd := dag.NodeWithData(data)

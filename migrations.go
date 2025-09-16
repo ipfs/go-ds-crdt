@@ -15,7 +15,7 @@ import (
 var version uint64 = 1
 
 func (store *Datastore) versionKey() ds.Key {
-	return store.namespace.ChildString(versionKey)
+	return store.namespace.ChildString(store.opts.crdtOpts.Namespaces.VersionKey)
 }
 
 func (store *Datastore) getVersion(ctx context.Context) (uint64, error) {

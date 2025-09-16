@@ -26,6 +26,16 @@ var (
 	prioritySuffix = "p"
 )
 
+// Set specifies operations that the add-wins observed-removed set must fulfil.
+type Set interface {
+	Add(ctx context.Context, key string, value []byte) (Delta, error)
+	Rmv(ctx context.Context, key string) (Delta, error)
+	Merge(ctx context.Context, d Delta, id string) error
+	Element(ctx context.Context, key string) ([]byte, error)
+	Elements(ctx context.Context, q query.Query) (query.Results, error)
+	InSet(ctx context.Context, key string) (bool, error)
+}
+
 // set implements an Add-Wins Observed-Remove Set using delta-CRDTs
 // (https://arxiv.org/abs/1410.2803) and backing all the data in a
 // go-datastore. It is fully agnostic to MerkleCRDTs or the delta distribution
@@ -33,12 +43,13 @@ var (
 // Value. When two values have the same priority, it chooses by alphabetically
 // sorting their unique IDs alphabetically.
 type set struct {
-	store      ds.Datastore
-	dagService ipld.DAGService
-	namespace  ds.Key
-	putHook    func(key string, v []byte)
-	deleteHook func(key string)
-	logger     logging.StandardLogger
+	store        ds.Datastore
+	dagService   ipld.DAGService
+	namespace    ds.Key
+	putHook      func(key string, v []byte)
+	deleteHook   func(key string)
+	deltaFactory func() Delta
+	logger       logging.StandardLogger
 
 	// Avoid merging two things at the same time since
 	// we read-write value-priorities in a non-atomic way.
@@ -53,36 +64,38 @@ func newCRDTSet(
 	logger logging.StandardLogger,
 	putHook func(key string, v []byte),
 	deleteHook func(key string),
+	deltaFactory func() Delta,
 ) (*set, error) {
 
 	set := &set{
-		namespace:  namespace,
-		store:      d,
-		dagService: dagService,
-		logger:     logger,
-		putHook:    putHook,
-		deleteHook: deleteHook,
+		namespace:    namespace,
+		store:        d,
+		dagService:   dagService,
+		logger:       logger,
+		putHook:      putHook,
+		deleteHook:   deleteHook,
+		deltaFactory: deltaFactory,
 	}
 
 	return set, nil
 }
 
 // Add returns a new delta-set adding the given key/value.
-func (s *set) Add(ctx context.Context, key string, value []byte) *pb.Delta {
-	return &pb.Delta{
-		Elements: []*pb.Element{
-			{
-				Key:   key,
-				Value: value,
-			},
+func (s *set) Add(ctx context.Context, key string, value []byte) (Delta, error) {
+	delta := s.deltaFactory()
+	delta.SetElements([]*pb.Element{
+		{
+			Key:   key,
+			Value: value,
 		},
-		Tombstones: nil,
-	}
+	})
+	return delta, nil
 }
 
 // Rmv returns a new delta-set removing the given key.
-func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
-	delta := &pb.Delta{}
+func (s *set) Rmv(ctx context.Context, key string) (Delta, error) {
+	delta := s.deltaFactory()
+	var tombs []*pb.Element
 
 	// /namespace/<key>/elements
 	prefix := s.elemsPrefix(key)
@@ -118,12 +131,17 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 			return nil, err
 		}
 		if !deleted {
-			delta.Tombstones = append(delta.Tombstones, &pb.Element{
+			tombs = append(tombs, &pb.Element{
 				Key: key,
 				Id:  id,
 			})
 		}
 	}
+
+	if len(tombs) > 0 {
+		delta.SetTombstones(tombs)
+	}
+
 	return delta, nil
 }
 
@@ -426,13 +444,20 @@ NEXT:
 			return nil, 0, err
 		}
 		deltaCid = cid.NewCidV1(cid.DagProtobuf, mhash)
-		_, delta, err := ng.GetDelta(ctx, deltaCid)
+		_, deltaBytes, err := ng.GetDelta(ctx, deltaCid)
 		if err != nil {
 			return nil, 0, err
 		}
 
+		delta := s.deltaFactory()
+		err = delta.Unmarshal(deltaBytes)
+		if err != nil {
+			return nil, 0, err
+		}
+		priority := delta.GetPriority()
+
 		// discard this delta.
-		if delta.Priority < bestPriority {
+		if priority < bestPriority {
 			continue
 		}
 
@@ -450,9 +475,9 @@ NEXT:
 			}
 		}
 
-		if delta.Priority > bestPriority {
+		if priority > bestPriority {
 			bestValue = greatestValueInDelta
-			bestPriority = delta.Priority
+			bestPriority = priority
 			continue
 		}
 
@@ -584,7 +609,7 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	return nil
 }
 
-func (s *set) Merge(ctx context.Context, d *pb.Delta, id string) error {
+func (s *set) Merge(ctx context.Context, d Delta, id string) error {
 	err := s.putTombs(ctx, d.GetTombstones())
 	if err != nil {
 		return err
