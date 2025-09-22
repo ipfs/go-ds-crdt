@@ -8,7 +8,7 @@ require (
 	github.com/dgraph-io/badger v1.6.2
 	github.com/ipfs/boxo v0.33.1
 	github.com/ipfs/go-cid v0.5.0
-	github.com/ipfs/go-datastore v0.8.2
+	github.com/ipfs/go-datastore v0.9.0
 	github.com/ipfs/go-ds-badger v0.3.4
 	github.com/ipfs/go-ipld-format v0.6.2
 	github.com/ipfs/go-log/v2 v2.6.0
@@ -57,9 +57,9 @@ require (
 	github.com/polydawn/refmt v0.89.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
-	go.opentelemetry.io/otel v1.37.0 // indirect
-	go.opentelemetry.io/otel/metric v1.37.0 // indirect
-	go.opentelemetry.io/otel/trace v1.37.0 // indirect
+	go.opentelemetry.io/otel v1.38.0 // indirect
+	go.opentelemetry.io/otel/metric v1.38.0 // indirect
+	go.opentelemetry.io/otel/trace v1.38.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/crypto v0.40.0 // indirect
 	golang.org/x/exp v0.0.0-20250718183923-645b1fa84792 // indirect
