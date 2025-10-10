@@ -45,6 +45,7 @@ func NewPubSubBroadcaster(ctx context.Context, psub *pubsub.PubSub, topic string
 		for err == nil {
 			_, err = subs.Next(ctx)
 		}
+		//nolint:errcheck
 		psubTopic.Close()
 	}(ctx, subs)
 

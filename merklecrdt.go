@@ -76,7 +76,7 @@ func NewMerkleCRDT(
 
 // Publish allows to manually publish a Delta. The Priority is set automatically, upon which the delta is merged, serialized and broadcasted.
 func (mcrdt *MerkleCRDT) Publish(ctx context.Context, delta Delta) error {
-	return mcrdt.Datastore.publish(ctx, delta)
+	return mcrdt.publish(ctx, delta)
 }
 
 // Set returns the internal set.

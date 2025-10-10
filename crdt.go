@@ -1484,6 +1484,7 @@ func (store *Datastore) printDAGRec(ctx context.Context, from cid.Cid, depth uin
 
 	fmt.Println(line)
 	for _, l := range nd.Links() {
+		// nolint:errcheck
 		store.printDAGRec(ctx, l.Cid, depth+1, ng, set)
 	}
 	return nil
@@ -1498,16 +1499,20 @@ func (store *Datastore) DotDAG(ctx context.Context, w io.Writer) error {
 		return err
 	}
 
+	// nolint:errcheck
 	fmt.Fprintln(w, "digraph CRDTDAG {")
 
 	ng := &crdtNodeGetter{NodeGetter: store.dagService}
 
 	set := cid.NewSet()
 
+	// nolint:errcheck
 	fmt.Fprintln(w, "subgraph heads {")
 	for _, h := range heads {
+		// nolint:errcheck
 		fmt.Fprintln(w, h)
 	}
+	// nolint:errcheck
 	fmt.Fprintln(w, "}")
 
 	for _, h := range heads {
@@ -1516,6 +1521,7 @@ func (store *Datastore) DotDAG(ctx context.Context, w io.Writer) error {
 			return err
 		}
 	}
+	// nolint:errcheck
 	fmt.Fprintln(w, "}")
 	return nil
 }
@@ -1542,6 +1548,7 @@ func (store *Datastore) dotDAGRec(ctx context.Context, w io.Writer, from cid.Cid
 		return err
 	}
 
+	// nolint:errcheck
 	fmt.Fprintf(w, "%s [label=\"%d | %s: +%d -%d\"]\n",
 		cidLong,
 		delta.GetPriority(),
@@ -1549,20 +1556,27 @@ func (store *Datastore) dotDAGRec(ctx context.Context, w io.Writer, from cid.Cid
 		len(delta.GetElements()),
 		len(delta.GetTombstones()),
 	)
+	// nolint:errcheck
 	fmt.Fprintf(w, "%s -> {", cidLong)
 	for _, l := range nd.Links() {
+		// nolint:errcheck
 		fmt.Fprintf(w, "%s ", l.Cid)
 	}
+	// nolint:errcheck
 	fmt.Fprintln(w, "}")
-
+	// nolint:errcheck
 	fmt.Fprintf(w, "subgraph sg_%s {\n", cidLong)
 	for _, l := range nd.Links() {
+		// nolint:errcheck
 		fmt.Fprintln(w, l.Cid)
 	}
+	// nolint:errcheck
 	fmt.Fprintln(w, "}")
 
 	for _, l := range nd.Links() {
-		store.dotDAGRec(ctx, w, l.Cid, depth+1, ng, set)
+		if err = store.dotDAGRec(ctx, w, l.Cid, depth+1, ng, set); err != nil {
+			return err
+		}
 	}
 	return nil
 }

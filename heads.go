@@ -183,6 +183,7 @@ func (hh *heads) primeCache(ctx context.Context) (ret error) {
 	if err != nil {
 		return err
 	}
+	// nolint:errcheck
 	defer results.Close()
 
 	for r := range results.Next() {

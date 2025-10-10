@@ -24,15 +24,15 @@ type pbDelta struct {
 }
 
 func (d *pbDelta) SetElements(elems []*pb.Element) {
-	d.Delta.Elements = elems
+	d.Elements = elems
 }
 
 func (d *pbDelta) SetTombstones(tombs []*pb.Element) {
-	d.Delta.Tombstones = tombs
+	d.Tombstones = tombs
 }
 
 func (d *pbDelta) SetPriority(p uint64) {
-	d.Delta.Priority = p
+	d.Priority = p
 }
 
 func (d *pbDelta) Size() int {
@@ -43,7 +43,7 @@ func (d *pbDelta) Size() int {
 }
 
 func (d *pbDelta) IsEmpty() bool {
-	return d == nil || (len(d.Delta.Tombstones)+len(d.Delta.Elements) == 0)
+	return d == nil || (len(d.Tombstones)+len(d.Elements) == 0)
 }
 
 func (d *pbDelta) Unmarshal(b []byte) error {

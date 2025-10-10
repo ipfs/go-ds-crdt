@@ -13,6 +13,7 @@ import (
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
+	"go.uber.org/multierr"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
@@ -108,6 +109,7 @@ func (s *set) Rmv(ctx context.Context, key string) (Delta, error) {
 	if err != nil {
 		return nil, err
 	}
+	//nolint:errcheck
 	defer results.Close()
 
 	for r := range results.Next() {
@@ -232,6 +234,7 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 			sendResult(ctx, qctx, query.Result{Error: err}, out)
 			return
 		}
+		//nolint:errcheck
 		defer results.Close()
 
 		var entry query.Entry
@@ -399,6 +402,7 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 	if err != nil {
 		return nil, 0, err
 	}
+	//nolint:errcheck
 	defer results.Close()
 
 	var bestValue []byte
@@ -576,17 +580,18 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		if err != nil {
 			return err
 		}
+
 		if v == nil {
-			store.Delete(ctx, valueK)
-			store.Delete(ctx, s.priorityKey(key))
+			err = multierr.Append(err, store.Delete(ctx, valueK))
+			err = multierr.Append(err, store.Delete(ctx, s.priorityKey(key)))
 		} else {
-			store.Put(ctx, valueK, v)
-			s.setPriority(ctx, store, key, p)
+			err = multierr.Append(err, store.Put(ctx, valueK, v))
+			err = multierr.Append(err, s.setPriority(ctx, store, key, p))
 		}
 
 		// Write tomb into store.
 		k := s.tombsPrefix(key).ChildString(id)
-		err = store.Put(ctx, k, nil)
+		err = multierr.Append(err, store.Put(ctx, k, nil))
 		if err != nil {
 			return err
 		}
