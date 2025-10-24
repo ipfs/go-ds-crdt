@@ -1106,7 +1106,12 @@ func (store *Datastore) Delete(ctx context.Context, key ds.Key) error {
 		return err
 	}
 
-	if len(delta.GetTombstones()) == 0 {
+	tombs, err := delta.GetTombstones()
+	if err != nil {
+		return err
+	}
+
+	if len(tombs) == 0 {
 		return nil
 	}
 	return store.publish(ctx, delta)
@@ -1174,7 +1179,7 @@ func (store *Datastore) Batch(ctx context.Context) (ds.Batch, error) {
 	return &batch{ctx: ctx, store: store}, nil
 }
 
-func (store *Datastore) deltaMerge(d1, d2 Delta) Delta {
+func (store *Datastore) deltaMerge(d1, d2 Delta) (Delta, error) {
 	if d1 == nil {
 		d1 = store.newDelta()
 	}
@@ -1182,9 +1187,29 @@ func (store *Datastore) deltaMerge(d1, d2 Delta) Delta {
 		d2 = store.newDelta()
 	}
 
+	elems1, err := d1.GetElements()
+	if err != nil {
+		return nil, err
+	}
+
+	elems2, err := d2.GetElements()
+	if err != nil {
+		return nil, err
+	}
+
+	tombs1, err := d1.GetTombstones()
+	if err != nil {
+		return nil, err
+	}
+
+	tombs2, err := d2.GetTombstones()
+	if err != nil {
+		return nil, err
+	}
+
 	result := store.newDelta()
-	result.SetElements(append(d1.GetElements(), d2.GetElements()...))
-	result.SetTombstones(append(d1.GetTombstones(), d2.GetTombstones()...))
+	result.SetElements(append(elems1, elems2...))
+	result.SetTombstones(append(tombs1, tombs2...))
 	p1 := d1.GetPriority()
 	p2 := d2.GetPriority()
 	if p2 > p1 {
@@ -1192,7 +1217,7 @@ func (store *Datastore) deltaMerge(d1, d2 Delta) Delta {
 	} else {
 		result.SetPriority(p1)
 	}
-	return result
+	return result, nil
 }
 
 // returns delta size and error
@@ -1201,7 +1226,7 @@ func (store *Datastore) addToDelta(ctx context.Context, key string, value []byte
 	if err != nil {
 		return 0, err
 	}
-	return store.updateDelta(delta), nil
+	return store.updateDelta(delta)
 
 }
 
@@ -1212,48 +1237,60 @@ func (store *Datastore) rmvToDelta(ctx context.Context, key string) (int, error)
 		return 0, err
 	}
 
-	return store.updateDeltaWithRemove(key, delta), nil
+	return store.updateDeltaWithRemove(key, delta)
 }
 
 // to satisfy datastore semantics, we need to remove elements from the current
 // batch if they were added.
-func (store *Datastore) updateDeltaWithRemove(key string, newDelta Delta) int {
+func (store *Datastore) updateDeltaWithRemove(key string, newDelta Delta) (int, error) {
 	store.curDeltaMux.Lock()
 	defer store.curDeltaMux.Unlock()
 
 	if store.curDelta == nil {
 		store.curDelta = newDelta
-		return newDelta.Size()
+		return newDelta.Size(), nil
 	}
 
 	// Remove `key` from current elements in the delta.
 	elems := make([]*pb.Element, 0)
-	for _, e := range store.curDelta.GetElements() {
+	curElems, err := store.curDelta.GetElements()
+	if err != nil {
+		return 0, err
+	}
+
+	for _, e := range curElems {
 		if e.GetKey() != key {
 			elems = append(elems, e)
 		}
 	}
+
+	curTombs, err := store.curDelta.GetTombstones()
+	if err != nil {
+		return 0, err
+	}
+
 	storeDelta := store.newDelta()
 	storeDelta.SetElements(elems)
-	storeDelta.SetTombstones(store.curDelta.GetTombstones())
+	storeDelta.SetTombstones(curTombs)
 	storeDelta.SetPriority(store.curDelta.GetPriority())
 	store.curDelta = storeDelta
 
 	// we have deleted the removed element from Elements(). Now
 	// merge normally.
-	store.curDelta = store.deltaMerge(store.curDelta, newDelta)
-	return store.curDelta.Size()
+	store.curDelta, err = store.deltaMerge(store.curDelta, newDelta)
+	return store.curDelta.Size(), nil
 }
 
-func (store *Datastore) updateDelta(newDelta Delta) int {
+func (store *Datastore) updateDelta(newDelta Delta) (int, error) {
 	var size int
+	var err error
 	store.curDeltaMux.Lock()
 	{
-		store.curDelta = store.deltaMerge(store.curDelta, newDelta)
+		store.curDelta, err = store.deltaMerge(store.curDelta, newDelta)
 		size = store.curDelta.Size()
 	}
 	store.curDeltaMux.Unlock()
-	return size
+	return size, err
 }
 
 func (store *Datastore) publishDelta(ctx context.Context) error {
@@ -1456,11 +1493,20 @@ func (store *Datastore) printDAGRec(ctx context.Context, from cid.Cid, depth uin
 	cidStr = cidStr[len(cidStr)-4:]
 	line += fmt.Sprintf("- %d | %s: ", delta.GetPriority(), cidStr)
 	line += "Add: {"
-	for _, e := range delta.GetElements() {
+	elems, err := delta.GetElements()
+	if err != nil {
+		return err
+	}
+	for _, e := range elems {
 		line += fmt.Sprintf("%s:%s,", e.GetKey(), e.GetValue())
 	}
+
+	tombs, err := delta.GetTombstones()
+	if err != nil {
+		return err
+	}
 	line += "}. Rmv: {"
-	for _, e := range delta.GetTombstones() {
+	for _, e := range tombs {
 		line += fmt.Sprintf("%s,", e.GetKey())
 	}
 	line += "}. Links: {"
@@ -1548,13 +1594,16 @@ func (store *Datastore) dotDAGRec(ctx context.Context, w io.Writer, from cid.Cid
 		return err
 	}
 
+	elems, _ := delta.GetElements()
+	tombs, _ := delta.GetTombstones()
+
 	// nolint:errcheck
 	fmt.Fprintf(w, "%s [label=\"%d | %s: +%d -%d\"]\n",
 		cidLong,
 		delta.GetPriority(),
 		cidShort,
-		len(delta.GetElements()),
-		len(delta.GetTombstones()),
+		len(elems),
+		len(tombs),
 	)
 	// nolint:errcheck
 	fmt.Fprintf(w, "%s -> {", cidLong)

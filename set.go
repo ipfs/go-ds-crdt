@@ -469,7 +469,11 @@ NEXT:
 		// the delta and current. When higher priority, choose the
 		// greatest only among those in the delta.
 		var greatestValueInDelta []byte
-		for _, elem := range delta.GetElements() {
+		elems, err := delta.GetElements()
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, elem := range elems {
 			if elem.GetKey() != key {
 				continue
 			}
@@ -615,12 +619,22 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 }
 
 func (s *set) Merge(ctx context.Context, d Delta, id string) error {
-	err := s.putTombs(ctx, d.GetTombstones())
+	tombs, err := d.GetTombstones()
 	if err != nil {
 		return err
 	}
 
-	return s.putElems(ctx, d.GetElements(), id, d.GetPriority())
+	elems, err := d.GetElements()
+	if err != nil {
+		return err
+	}
+
+	err = s.putTombs(ctx, tombs)
+	if err != nil {
+		return err
+	}
+
+	return s.putElems(ctx, elems, id, d.GetPriority())
 }
 
 // currently unused

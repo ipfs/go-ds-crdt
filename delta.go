@@ -7,8 +7,8 @@ import (
 
 // Delta represent a CRDT changeset, it carries new or updated elements and new or updated tombstones. The priority value allows comparing this update with others, to determine which elements take precedence.
 type Delta interface {
-	GetElements() []*pb.Element
-	GetTombstones() []*pb.Element
+	GetElements() ([]*pb.Element, error)
+	GetTombstones() ([]*pb.Element, error)
 	GetPriority() uint64
 	SetElements(elems []*pb.Element)
 	SetTombstones(tombs []*pb.Element)
@@ -19,8 +19,18 @@ type Delta interface {
 	Marshal() ([]byte, error)
 }
 
+var _ Delta = (*pbDelta)(nil)
+
 type pbDelta struct {
 	*pb.Delta
+}
+
+func (d *pbDelta) GetElements() ([]*pb.Element, error) {
+	return d.Delta.GetElements(), nil
+}
+
+func (d *pbDelta) GetTombstones() ([]*pb.Element, error) {
+	return d.Delta.GetTombstones(), nil
 }
 
 func (d *pbDelta) SetElements(elems []*pb.Element) {
