@@ -825,6 +825,9 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 	blockKey := dshelp.MultihashToDsKey(current.Hash()).String()
 	err := store.set.Merge(ctx, delta, blockKey)
 	if err != nil {
+		// node was not processed properly, we do not need to
+		// mark datastore as dirty, as this may result from
+		// custom delta errors that prevent applying this delta.
 		return nil, fmt.Errorf("error merging delta from %s: %w", current, err)
 	}
 
@@ -832,6 +835,7 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 	// can skip it.
 	err = store.markProcessed(ctx, current)
 	if err != nil {
+		// marking as dirty here will not help, as we have not made this block a head, so we will not re-traverse it when fixing the datastore.
 		return nil, fmt.Errorf("error recording %s as processed: %w", current, err)
 	}
 
@@ -1369,7 +1373,14 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (cid.Cid, e
 		nd,
 	)
 	if err != nil {
-		store.MarkDirty(ctx) // not sure if this will fix much if this happens.
+		// store.MarkDirty(ctx) // Keep disabled: Since we are
+		// adding a new node that should become head any
+		// processing failures are unlikely to be fixed by
+		// reprocessing, unlike when processing nodes deep in
+		// the DAG.  Additionally, process node may fail due
+		// to custom delta errors on GetElement(). Those
+		// should just abort merging, and not mark the whole
+		// datastore dirty.
 		return cid.Undef, fmt.Errorf("error processing new block: %w", err)
 	}
 	if len(children) != 0 {
