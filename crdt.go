@@ -1282,6 +1282,9 @@ func (store *Datastore) updateDeltaWithRemove(key string, newDelta Delta) (int, 
 	// we have deleted the removed element from Elements(). Now
 	// merge normally.
 	store.curDelta, err = store.deltaMerge(store.curDelta, newDelta)
+	if err != nil {
+		return 0, err
+	}
 	return store.curDelta.Size(), nil
 }
 
