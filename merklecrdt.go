@@ -83,3 +83,7 @@ func (mcrdt *MerkleCRDT) Publish(ctx context.Context, delta Delta) error {
 func (mcrdt *MerkleCRDT) Set() Set {
 	return mcrdt.set
 }
+
+func (mcrdt *MerkleCRDT) Heads() Heads {
+	return mcrdt.heads
+}
