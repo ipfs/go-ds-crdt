@@ -16,6 +16,15 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
+// Heads represents a set of the current root CIDs of the Merkle-CRDT DAG.
+type Heads interface {
+	IsHead(ctx context.Context, c cid.Cid) (bool, uint64, error)
+	Len(ctx context.Context) (int, error)
+	Replace(ctx context.Context, h, c cid.Cid, height uint64) error
+	Add(ctx context.Context, c cid.Cid, height uint64) error
+	List(ctx context.Context) ([]cid.Cid, uint64, error)
+}
+
 // heads manages the current Merkle-CRDT heads.
 type heads struct {
 	store ds.Datastore
