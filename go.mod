@@ -11,6 +11,7 @@ require (
 	github.com/ipfs/go-log/v2 v2.9.1
 	github.com/libp2p/go-libp2p-pubsub v0.15.0
 	github.com/multiformats/go-multihash v0.2.3
+	go.uber.org/multierr v1.11.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -78,7 +79,6 @@ require (
 	go.opentelemetry.io/otel v1.40.0 // indirect
 	go.opentelemetry.io/otel/metric v1.40.0 // indirect
 	go.opentelemetry.io/otel/trace v1.40.0 // indirect
-	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	golang.org/x/crypto v0.47.0 // indirect

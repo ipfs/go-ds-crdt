@@ -14,6 +14,8 @@ type Delta interface {
 	SetTombstones(tombs []*pb.Element)
 	SetPriority(p uint64)
 	Size() int
+	GetDagName() string
+	SetDagName(string)
 	IsEmpty() bool
 	Unmarshal([]byte) error
 	Marshal() ([]byte, error)
@@ -50,6 +52,14 @@ func (d *pbDelta) Size() int {
 		return 0
 	}
 	return proto.Size(d.Delta)
+}
+
+func (d *pbDelta) GetDagName() string {
+	return d.Delta.GetDagName()
+}
+
+func (d *pbDelta) SetDagName(n string) {
+	d.DagName = n
 }
 
 func (d *pbDelta) IsEmpty() bool {
