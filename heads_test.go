@@ -16,6 +16,7 @@ import (
 )
 
 var headsTestNS = ds.NewKey("headstest")
+var headsTestDagsNS = ds.NewKey("headstestdags")
 
 var randg = rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -24,7 +25,7 @@ func newTestHeads(t *testing.T) *heads {
 	t.Helper()
 	ctx := context.Background()
 	store := dssync.MutexWrap(ds.NewMapDatastore())
-	heads, err := newHeads(ctx, store, headsTestNS, &testLogger{
+	heads, err := newHeads(ctx, store, headsTestNS, headsTestDagsNS, &testLogger{
 		name: t.Name(),
 		l:    DefaultOptions().Logger,
 	})
@@ -58,12 +59,15 @@ func TestHeadsBasic(t *testing.T) {
 		t.Errorf("new heads should have Len==0, got: %d", l)
 	}
 
-	cidHeights := make(map[cid.Cid]uint64)
+	cidHeights := make(map[cid.Cid]Head)
 	numHeads := 5
 	for i := 0; i < numHeads; i++ {
 		c, height := newCID(t), uint64(randg.Int())
-		cidHeights[c] = height
-		err := heads.Add(ctx, c, height)
+		head := Head{Cid: c}
+		head.Height = height
+		cidHeights[c] = head
+
+		err := heads.Add(ctx, head)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -71,14 +75,16 @@ func TestHeadsBasic(t *testing.T) {
 
 	assertHeads(t, heads, cidHeights)
 
-	for c := range cidHeights {
+	for c, old := range cidHeights {
 		newC, newHeight := newCID(t), uint64(randg.Int())
-		err := heads.Replace(ctx, c, newC, newHeight)
+		head := Head{Cid: newC}
+		head.Height = newHeight
+		err := heads.Replace(ctx, old, head)
 		if err != nil {
 			t.Fatal(err)
 		}
 		delete(cidHeights, c)
-		cidHeights[newC] = newHeight
+		cidHeights[newC] = head
 		assertHeads(t, heads, cidHeights)
 	}
 
@@ -89,7 +95,7 @@ func TestHeadsBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	heads, err = newHeads(ctx, heads.store, headsTestNS, &testLogger{
+	heads, err = newHeads(ctx, heads.store, headsTestNS, headsTestDagsNS, &testLogger{
 		name: t.Name(),
 		l:    DefaultOptions().Logger,
 	})
@@ -99,19 +105,19 @@ func TestHeadsBasic(t *testing.T) {
 	assertHeads(t, heads, cidHeights)
 }
 
-func assertHeads(t *testing.T, hh *heads, cidHeights map[cid.Cid]uint64) {
+func assertHeads(t *testing.T, hh *heads, headsMap map[cid.Cid]Head) {
 	t.Helper()
 	ctx := context.Background()
 
-	headCids, maxHeight, err := hh.List(ctx)
+	heads, maxHeight, err := hh.List(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var expectedMaxHeight uint64
-	for _, height := range cidHeights {
-		if height > expectedMaxHeight {
-			expectedMaxHeight = height
+	for _, head := range headsMap {
+		if head.Height > expectedMaxHeight {
+			expectedMaxHeight = head.Height
 		}
 	}
 	if maxHeight != expectedMaxHeight {
@@ -122,33 +128,42 @@ func assertHeads(t *testing.T, hh *heads, cidHeights map[cid.Cid]uint64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(headCids) != headsLen {
-		t.Errorf("expected len and list to agree, got listLen=%d, len=%d", len(headCids), headsLen)
+	if len(heads) != headsLen {
+		t.Errorf("expected len and list to agree, got listLen=%d, len=%d", len(heads), headsLen)
 	}
 
-	cids := make([]cid.Cid, 0, len(cidHeights))
-	for c := range cidHeights {
-		cids = append(cids, c)
+	mapcids := make([]cid.Cid, 0, len(headsMap))
+	for c := range headsMap {
+		mapcids = append(mapcids, c)
 	}
-	sort.Slice(cids, func(i, j int) bool {
-		ci := cids[i].Bytes()
-		cj := cids[j].Bytes()
+
+	headcids := make([]cid.Cid, 0, len(headsMap))
+	for _, h := range headsMap {
+		headcids = append(headcids, h.Cid)
+	}
+
+	sort.Slice(mapcids, func(i, j int) bool {
+		ci := mapcids[i].Bytes()
+		cj := mapcids[j].Bytes()
 		return bytes.Compare(ci, cj) < 0
 	})
-	if !reflect.DeepEqual(cids, headCids) {
-		t.Errorf("given cids don't match cids returned by List: %v, %v", cids, headCids)
-	}
-	for _, c := range cids {
-		present, height, err := hh.IsHead(ctx, c)
-		if err != nil {
-			t.Fatal(err)
-		}
 
-		if !present {
+	sort.Slice(headcids, func(i, j int) bool {
+		ci := headcids[i].Bytes()
+		cj := headcids[j].Bytes()
+		return bytes.Compare(ci, cj) < 0
+	})
+
+	if !reflect.DeepEqual(mapcids, headcids) {
+		t.Errorf("given cids don't match cids returned by List: %v, %v", mapcids, headcids)
+	}
+	for _, c := range mapcids {
+		head, ok := hh.Get(ctx, c)
+		if !ok {
 			t.Errorf("cid returned by List reported absent by IsHead: %v", c)
 		}
-		if height != cidHeights[c] {
-			t.Errorf("expected cid %v to have height %d, got: %d", c, cidHeights[c], height)
+		if head.Height != headsMap[head.Cid].Height {
+			t.Errorf("expected cid %v to have height %d, got: %d", c, headsMap[c].Height, head.Height)
 		}
 	}
 }

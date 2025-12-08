@@ -66,7 +66,7 @@ func extractDelta(nd ipld.Node) ([]byte, error) {
 	return protonode.Data(), nil
 }
 
-func makeNode(delta Delta, heads []cid.Cid) (ipld.Node, error) {
+func makeNode(delta Delta, heads []Head) (ipld.Node, error) {
 	data, err := delta.Marshal()
 	if err != nil {
 		return nil, err
@@ -74,7 +74,7 @@ func makeNode(delta Delta, heads []cid.Cid) (ipld.Node, error) {
 
 	nd := dag.NodeWithData(data)
 	for _, h := range heads {
-		err = nd.AddRawLink("", &ipld.Link{Cid: h})
+		err = nd.AddRawLink("", &ipld.Link{Cid: h.Cid})
 		if err != nil {
 			return nil, err
 		}

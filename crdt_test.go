@@ -803,27 +803,27 @@ func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
-	cids, err := replicas[0].decodeBroadcast(ctx, cidV0.Bytes())
+	heads, err := replicas[0].decodeBroadcast(ctx, cidV0.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(cids) != 1 || !cids[0].Equals(cidV0) {
-		t.Error("should have returned a single cidV0", cids)
+	if len(heads) != 1 || !heads[0].Cid.Equals(cidV0) {
+		t.Error("should have returned a single cidV0", heads)
 	}
 
-	data, err := replicas[0].encodeBroadcast(ctx, cids)
+	data, err := replicas[0].encodeBroadcast(ctx, heads)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cids2, err := replicas[0].decodeBroadcast(ctx, data)
+	heads2, err := replicas[0].decodeBroadcast(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(cids2) != 1 || !cids[0].Equals(cidV0) {
-		t.Error("should have reparsed cid0", cids2)
+	if len(heads2) != 1 || !heads2[0].Cid.Equals(cidV0) {
+		t.Error("should have reparsed cid0", heads2)
 	}
 }
 
@@ -1016,5 +1016,158 @@ func TestMigration0to1(t *testing.T) {
 		if string(v) != "final value" {
 			t.Fatalf("value for elem %d should be final value: %s", i, string(v))
 		}
+	}
+}
+
+func TestCRDTDagNames(t *testing.T) {
+	// make 2 replicas
+	replicas, closeReplicas := makeNReplicas(t, 2, nil)
+	defer closeReplicas()
+
+	ctx := context.Background()
+
+	nItems := 50
+
+	// create delta manually for each item with store.set.Add()
+	// delta.SetDagName() alternatively to "dag1" and "dag2"
+	for i := 0; i < nItems; i++ {
+		k := ds.RandomKey()
+		v := []byte(fmt.Sprintf("value-%d", i))
+
+		// Create delta manually
+		delta, err := replicas[0].set.Add(ctx, k.String(), v)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Set different DAG names for alternating items
+		if i%2 == 0 {
+			delta.SetDagName("dag1")
+		} else {
+			delta.SetDagName("dag2")
+		}
+
+		// Commit the delta
+		err = replicas[0].publish(ctx, delta)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait for propagation
+	time.Sleep(100 * time.Millisecond)
+
+	// verify there are 2 distinct heads (.List())
+	heads, _, err := replicas[0].heads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// replicas[0].PrintDAG(ctx)
+
+	if len(heads) != 2 {
+		t.Fatalf("Expected 2 heads, got %d", len(heads))
+	}
+
+	// verify one head has dagName set to "dag1" and the other to "dag2"
+	headDagNames := make(map[string]bool)
+	for _, head := range heads {
+		headDagNames[head.DAGName] = true
+	}
+
+	if !headDagNames["dag1"] {
+		t.Error("Expected a head with DAGName 'dag1'")
+	}
+
+	if !headDagNames["dag2"] {
+		t.Error("Expected a head with DAGName 'dag2'")
+	}
+
+	var expectedDagName string
+	visit := func(d Delta) error {
+		if d.GetDagName() != expectedDagName {
+			return fmt.Errorf("wrong dagName in subtree: got %s, expected %s", d.GetDagName(), expectedDagName)
+		}
+		return nil
+	}
+
+	mcrdt := MerkleCRDT{replicas[0]}
+	for _, h := range heads {
+		expectedDagName = h.DAGName
+		err := mcrdt.Traverse(ctx, []cid.Cid{h.Cid}, visit)
+		if err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func TestCRDTHeadsSaveLoad(t *testing.T) {
+	// make 1 replica
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+	replica := replicas[0]
+	ctx := context.Background()
+
+	// for dagname = range ["", "dag1", "dag2"]:
+	//  generate a random cid
+	//  add a head to the replica heads.
+	dagNames := []string{"", "dag1", "dag2"}
+	for _, dagName := range dagNames {
+		// Generate a random cid
+		k := ds.RandomKey()
+		pref := cid.Prefix{
+			Version: 1,
+		}
+
+		c, err := pref.Sum([]byte(k.String()))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Add a head to the replica heads
+		head := Head{
+			Cid: c,
+			HeadValue: HeadValue{
+				Height:  1,
+				DAGName: dagName,
+			},
+		}
+		err = replica.heads.Add(ctx, head)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	heads, err := newHeads(ctx, replica.store, replica.heads.namespace, replica.heads.namespaceDags, replica.heads.logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify there are 3 heads and they are the ones written before
+	newheads, _, err := heads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(newheads) != 3 {
+		t.Fatalf("Expected 3 heads, got %d", len(newheads))
+	}
+
+	// Verify the heads have the correct DAG names
+	headDagNames := make(map[string]bool)
+	for _, head := range newheads {
+		headDagNames[head.DAGName] = true
+	}
+
+	if !headDagNames[""] {
+		t.Error("Expected a head with DAGName ''")
+	}
+
+	if !headDagNames["dag1"] {
+		t.Error("Expected a head with DAGName 'dag1'")
+	}
+
+	if !headDagNames["dag2"] {
+		t.Error("Expected a head with DAGName 'dag2'")
 	}
 }

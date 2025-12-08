@@ -1,11 +1,10 @@
 package crdt
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
-	"sort"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -16,31 +15,50 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
+const DefaultDagName = "default"
+
 // Heads represents a set of the current root CIDs of the Merkle-CRDT DAG.
 type Heads interface {
-	IsHead(ctx context.Context, c cid.Cid) (bool, uint64, error)
+	Get(ctx context.Context, c cid.Cid) (Head, bool)
 	Len(ctx context.Context) (int, error)
-	Replace(ctx context.Context, h, c cid.Cid, height uint64) error
-	Add(ctx context.Context, c cid.Cid, height uint64) error
-	List(ctx context.Context) ([]cid.Cid, uint64, error)
+	Replace(ctx context.Context, old Head, new Head) error
+	Add(ctx context.Context, head Head) error
+	List(ctx context.Context) ([]Head, uint64, error)
+}
+
+type Head struct {
+	HeadValue
+	Cid cid.Cid
+}
+
+type HeadValue struct {
+	Height  uint64
+	DAGName string
+}
+
+func (h Head) String() string {
+	return fmt.Sprintf("{Cid: %s, Height: %d, DAGName: %s}", h.Cid.String(), h.Height, h.DAGName)
 }
 
 // heads manages the current Merkle-CRDT heads.
 type heads struct {
 	store ds.Datastore
 	// cache contains the current contents of the store
-	cache     map[cid.Cid]uint64
-	cacheMux  sync.RWMutex
-	namespace ds.Key
-	logger    logging.StandardLogger
+	cache         map[cid.Cid]HeadValue
+	cacheMux      sync.RWMutex
+	namespace     ds.Key
+	namespaceDags ds.Key
+
+	logger logging.StandardLogger
 }
 
-func newHeads(ctx context.Context, store ds.Datastore, namespace ds.Key, logger logging.StandardLogger) (*heads, error) {
+func newHeads(ctx context.Context, store ds.Datastore, namespace, namespaceDags ds.Key, logger logging.StandardLogger) (*heads, error) {
 	hh := &heads{
-		store:     store,
-		namespace: namespace,
-		logger:    logger,
-		cache:     make(map[cid.Cid]uint64),
+		store:         store,
+		namespace:     namespace,
+		namespaceDags: namespaceDags,
+		logger:        logger,
+		cache:         make(map[cid.Cid]HeadValue),
 	}
 	if err := hh.primeCache(ctx); err != nil {
 		return nil, err
@@ -48,22 +66,27 @@ func newHeads(ctx context.Context, store ds.Datastore, namespace ds.Key, logger 
 	return hh, nil
 }
 
-func (hh *heads) key(c cid.Cid) ds.Key {
-	// /<namespace>/<cid>
-	return hh.namespace.Child(dshelp.MultihashToDsKey(c.Hash()))
+func (hh *heads) key(h Head) ds.Key {
+	if dagName := h.DAGName; dagName == "" {
+		// /<namespace>/<cid>
+		return hh.namespace.Child(dshelp.MultihashToDsKey(h.Cid.Hash()))
+	} else {
+		// /<namespaceDags>/<dagName>/<cid>
+		return hh.namespaceDags.Child(ds.NewKey(dagName)).Child(dshelp.MultihashToDsKey(h.Cid.Hash()))
+	}
 }
 
-func (hh *heads) write(ctx context.Context, store ds.Write, c cid.Cid, height uint64) error {
+func (hh *heads) write(ctx context.Context, store ds.Write, h Head) error {
 	buf := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutUvarint(buf, height)
+	n := binary.PutUvarint(buf, h.Height)
 	if n == 0 {
 		return errors.New("error encoding height")
 	}
-	return store.Put(ctx, hh.key(c), buf[0:n])
+	return store.Put(ctx, hh.key(h), buf[0:n])
 }
 
-func (hh *heads) delete(ctx context.Context, store ds.Write, c cid.Cid) error {
-	err := store.Delete(ctx, hh.key(c))
+func (hh *heads) delete(ctx context.Context, store ds.Write, h Head) error {
+	err := store.Delete(ctx, hh.key(h))
 	// The go-datastore API currently says Delete doesn't return
 	// ErrNotFound, but it used to say otherwise.  Leave this
 	// here to be safe.
@@ -73,16 +96,16 @@ func (hh *heads) delete(ctx context.Context, store ds.Write, c cid.Cid) error {
 	return err
 }
 
-// IsHead returns if a given cid is among the current heads.
-func (hh *heads) IsHead(ctx context.Context, c cid.Cid) (bool, uint64, error) {
-	var height uint64
+// Get returns a Head if a given cid is among the current heads.
+func (hh *heads) Get(ctx context.Context, c cid.Cid) (Head, bool) {
 	var ok bool
+	var hv HeadValue
 	hh.cacheMux.RLock()
 	{
-		height, ok = hh.cache[c]
+		hv, ok = hh.cache[c]
 	}
 	hh.cacheMux.RUnlock()
-	return ok, height, nil
+	return Head{Cid: c, HeadValue: hv}, ok
 }
 
 func (hh *heads) Len(ctx context.Context) (int, error) {
@@ -96,8 +119,12 @@ func (hh *heads) Len(ctx context.Context) (int, error) {
 }
 
 // Replace replaces a head with a new cid.
-func (hh *heads) Replace(ctx context.Context, h, c cid.Cid, height uint64) error {
-	hh.logger.Debugf("replacing DAG head: %s -> %s (new height: %d)", h, c, height)
+func (hh *heads) Replace(ctx context.Context, old Head, new Head) error {
+	hh.logger.Debugf("replacing DAG head: %s -> %s", old, new)
+	if old.DAGName != new.DAGName {
+		hh.logger.Errorf("new head and old head belong to different DAGs: %s -> %s", old, new)
+	}
+
 	var store ds.Write = hh.store
 
 	batchingDs, batching := store.(ds.Batching)
@@ -109,7 +136,7 @@ func (hh *heads) Replace(ctx context.Context, h, c cid.Cid, height uint64) error
 		}
 	}
 
-	err = hh.write(ctx, store, c, height)
+	err = hh.write(ctx, store, new)
 	if err != nil {
 		return err
 	}
@@ -118,15 +145,15 @@ func (hh *heads) Replace(ctx context.Context, h, c cid.Cid, height uint64) error
 	defer hh.cacheMux.Unlock()
 
 	if !batching {
-		hh.cache[c] = height
+		hh.cache[new.Cid] = new.HeadValue
 	}
 
-	err = hh.delete(ctx, store, h)
+	err = hh.delete(ctx, store, old)
 	if err != nil {
 		return err
 	}
 	if !batching {
-		delete(hh.cache, h)
+		delete(hh.cache, old.Cid)
 	}
 
 	if batching {
@@ -134,48 +161,48 @@ func (hh *heads) Replace(ctx context.Context, h, c cid.Cid, height uint64) error
 		if err != nil {
 			return err
 		}
-		delete(hh.cache, h)
-		hh.cache[c] = height
+		delete(hh.cache, old.Cid)
+		hh.cache[new.Cid] = new.HeadValue
 	}
 	return nil
 }
 
-func (hh *heads) Add(ctx context.Context, c cid.Cid, height uint64) error {
-	hh.logger.Debugf("adding new DAG head: %s (height: %d)", c, height)
-	if err := hh.write(ctx, hh.store, c, height); err != nil {
+func (hh *heads) Add(ctx context.Context, head Head) error {
+	hh.logger.Debugf("adding new DAG head: %s", head)
+	if err := hh.write(ctx, hh.store, head); err != nil {
 		return err
 	}
 
 	hh.cacheMux.Lock()
 	{
-		hh.cache[c] = height
+		hh.cache[head.Cid] = head.HeadValue
 	}
 	hh.cacheMux.Unlock()
 	return nil
 }
 
 // List returns the list of current heads plus the max height.
-func (hh *heads) List(ctx context.Context) ([]cid.Cid, uint64, error) {
+func (hh *heads) List(ctx context.Context) ([]Head, uint64, error) {
 	var maxHeight uint64
-	var heads []cid.Cid
+	var heads []Head
 
 	hh.cacheMux.RLock()
 	{
-		heads = make([]cid.Cid, 0, len(hh.cache))
-		for head, height := range hh.cache {
-			heads = append(heads, head)
-			if height > maxHeight {
-				maxHeight = height
+		heads = make([]Head, 0, len(hh.cache))
+		for c, headValue := range hh.cache {
+			heads = append(heads, Head{Cid: c, HeadValue: headValue})
+			if headValue.Height > maxHeight {
+				maxHeight = headValue.Height
 			}
 		}
 	}
 	hh.cacheMux.RUnlock()
 
-	sort.Slice(heads, func(i, j int) bool {
-		ci := heads[i].Bytes()
-		cj := heads[j].Bytes()
-		return bytes.Compare(ci, cj) < 0
-	})
+	// sort.Slice(heads, func(i, j int) bool {
+	// 	ci := heads[i].Bytes()
+	// 	cj := heads[j].Bytes()
+	// 	return bytes.Compare(ci, cj) < 0
+	// })
 
 	return heads, maxHeight, nil
 }
@@ -183,6 +210,14 @@ func (hh *heads) List(ctx context.Context) ([]cid.Cid, uint64, error) {
 // primeCache builds the heads cache based on what's in storage; since
 // it is called from the constructor only we don't bother locking.
 func (hh *heads) primeCache(ctx context.Context) (ret error) {
+	err := hh.primeCacheNs(ctx)
+	if err != nil {
+		return err
+	}
+	return hh.primeCacheDagsNs(ctx)
+}
+
+func (hh *heads) primeCacheNs(ctx context.Context) (ret error) {
 	q := query.Query{
 		Prefix:   hh.namespace.String(),
 		KeysOnly: false,
@@ -209,7 +244,60 @@ func (hh *heads) primeCache(ctx context.Context) (ret error) {
 			return errors.New("error decoding height")
 		}
 
-		hh.cache[headCid] = height
+		hv := HeadValue{
+			Height:  height,
+			DAGName: "",
+		}
+
+		hh.cache[headCid] = hv
+	}
+	return nil
+}
+
+func (hh *heads) primeCacheDagsNs(ctx context.Context) (ret error) {
+	// same with dags namespace
+	q := query.Query{
+		Prefix:   hh.namespaceDags.String(),
+		KeysOnly: false,
+	}
+
+	results, err := hh.store.Query(ctx, q)
+	if err != nil {
+		return err
+	}
+	// nolint:errcheck
+	defer results.Close()
+
+	for r := range results.Next() {
+		if r.Error != nil {
+			return r.Error
+		}
+
+		headKey := ds.NewKey(strings.TrimPrefix(r.Key, hh.namespaceDags.String()))
+		// left with /<dagName>/<cid>
+		namespcs := headKey.Namespaces()
+		if len(namespcs) != 2 {
+			hh.logger.Error("bad head key: %s", r.Key)
+			continue
+		}
+		dagName := namespcs[0]
+		cidKey := namespcs[1]
+
+		headCid, err := dshelp.DsKeyToCidV1(ds.NewKey(cidKey), cid.DagProtobuf)
+		if err != nil {
+			return err
+		}
+		height, n := binary.Uvarint(r.Value)
+		if n <= 0 {
+			return errors.New("error decoding height")
+		}
+
+		hv := HeadValue{
+			Height:  height,
+			DAGName: dagName,
+		}
+
+		hh.cache[headCid] = hv
 	}
 
 	return nil

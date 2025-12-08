@@ -2,7 +2,10 @@ package crdt
 
 import (
 	"context"
+	"errors"
 
+	"github.com/ipfs/boxo/ipld/merkledag/traverse"
+	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	ipld "github.com/ipfs/go-ipld-format"
 )
@@ -10,6 +13,7 @@ import (
 // DatatstoreNamespaces carries configuration for how internal namespaces are named.
 type InternalNamespaces struct {
 	Heads           string
+	DAGHeads        string
 	Set             string
 	ProcessedBlocks string
 	DirtyBitKey     string
@@ -51,6 +55,9 @@ func NewMerkleCRDT(
 		if ns := in.Heads; ns != "" {
 			opts.crdtOpts.Namespaces.Heads = ns
 		}
+		if ns := in.DAGHeads; ns != "" {
+			opts.crdtOpts.Namespaces.DAGHeads = ns
+		}
 		if ns := in.Set; ns != "" {
 			opts.crdtOpts.Namespaces.Set = ns
 		}
@@ -86,4 +93,76 @@ func (mcrdt *MerkleCRDT) Set() Set {
 
 func (mcrdt *MerkleCRDT) Heads() Heads {
 	return mcrdt.heads
+}
+
+// Traverse visits nodes in the Merkle-CRDT tree. It skips duplicates
+// and calls the visit function with the Deltas extracted from every
+// node. An error results in the traversal operations being aborted.
+func (mcrdt *MerkleCRDT) Traverse(ctx context.Context,
+	from []cid.Cid,
+	visit func(delta Delta) error,
+) error {
+	if len(from) == 0 {
+		return errors.New("no roots to traverse from")
+	}
+
+	var ignoreCid cid.Cid
+	var root ipld.Node
+	var err error
+
+	tFunc := func(current traverse.State) error {
+		n := current.Node
+		if ignoreCid.Defined() && ignoreCid.Equals(n.Cid()) {
+			return nil
+		}
+
+		deltaBytes, err := extractDelta(n)
+		if err != nil {
+			return err
+		}
+
+		delta := mcrdt.newDelta()
+		err = delta.Unmarshal(deltaBytes)
+		if err != nil {
+			return err
+		}
+		return visit(delta)
+	}
+
+	// this is the default. Just to be explicit.
+	tErrFunc := func(err error) error {
+		return err
+	}
+
+	if len(from) == 1 { // root node is the given cid
+		rootCid := from[0]
+		root, err = mcrdt.dagService.Get(ctx, rootCid)
+		if err != nil {
+			return err
+		}
+	} else {
+		heads := make([]Head, len(from))
+		for i, c := range from {
+			heads[i] = Head{
+				Cid: c,
+			}
+		}
+		delta := mcrdt.newDelta()
+		// we are going to make a single root node to traverse from.
+		root, err = makeNode(delta, heads)
+		if err != nil {
+			return err
+		}
+		ignoreCid = root.Cid() // tFunc will skip this.
+	}
+
+	opts := traverse.Options{
+		DAG:            mcrdt.dagService,
+		Order:          traverse.DFSPre, // default
+		Func:           tFunc,
+		ErrFunc:        tErrFunc,
+		SkipDuplicates: true,
+	}
+
+	return traverse.Traverse(root, opts)
 }
