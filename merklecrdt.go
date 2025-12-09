@@ -100,7 +100,7 @@ func (mcrdt *MerkleCRDT) Heads() Heads {
 // node. An error results in the traversal operations being aborted.
 func (mcrdt *MerkleCRDT) Traverse(ctx context.Context,
 	from []cid.Cid,
-	visit func(delta Delta) error,
+	visit func(ipld.Node) error,
 ) error {
 	if len(from) == 0 {
 		return errors.New("no roots to traverse from")
@@ -116,17 +116,7 @@ func (mcrdt *MerkleCRDT) Traverse(ctx context.Context,
 			return nil
 		}
 
-		deltaBytes, err := extractDelta(n)
-		if err != nil {
-			return err
-		}
-
-		delta := mcrdt.newDelta()
-		err = delta.Unmarshal(deltaBytes)
-		if err != nil {
-			return err
-		}
-		return visit(delta)
+		return visit(n)
 	}
 
 	// this is the default. Just to be explicit.
