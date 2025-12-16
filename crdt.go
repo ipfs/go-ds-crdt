@@ -703,7 +703,7 @@ func (store *Datastore) sendNewJobs(ctx context.Context, session *sync.WaitGroup
 
 	// Special case for root
 	if root.Height == 0 {
-		store.logger.Debugf("getting priority for head %s [%s]", root.Cid, root.DAGName)
+		store.logger.Debugf("getting priority for head %s [%s] - timeout: %s", root.Cid, root.DAGName, store.opts.DAGSyncerTimeout)
 		prio, err := store.getPriority(cctx, ng, children[0])
 		if err != nil {
 			return fmt.Errorf("error getting root delta priority: %s %w", children[0], err)
