@@ -163,6 +163,6 @@ func (store *Datastore) migrate0to1(ctx context.Context) error {
 		}
 	}
 
-	s.logger.Infof("Migration v0 to v1 finished (%d elements affected)", total)
+	s.logger.Debugf("Migration v0 to v1 finished (%d elements affected)", total)
 	return nil
 }
