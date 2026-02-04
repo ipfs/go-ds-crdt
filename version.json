@@ -1,3 +1,7 @@
 {
+<<<<<<< HEAD
   "version": "v0.6.7"
+=======
+  "version": "v0.6.8"
+>>>>>>> 3b7db21 (Add version.json and release actions configs)
 }
