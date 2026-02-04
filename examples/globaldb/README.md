@@ -83,4 +83,4 @@ The GlobalDB CLI leverages the following components:
 - **IPFS Lite**: Provides a lightweight IPFS node for peer-to-peer networking.
 - **Libp2p PubSub**: Enables decentralized communication using the GossipSub protocol.
 - **CRDTs**: Ensure conflict-free synchronization of data across distributed peers.
-- **Badger Datastore**: A high-performance datastore for storing key-value pairs.
+- **Pebble Datastore**: A high-performance datastore for storing key-value pairs.

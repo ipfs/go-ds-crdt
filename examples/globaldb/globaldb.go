@@ -19,8 +19,8 @@ import (
 	"github.com/ipfs/boxo/peering"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
-	badger4 "github.com/ipfs/go-ds-badger4"
 	crdt "github.com/ipfs/go-ds-crdt"
+	pebbleds "github.com/ipfs/go-ds-pebble"
 	logging "github.com/ipfs/go-log/v2"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -83,7 +83,7 @@ func main() {
 		data = *dataDir + "/" + config
 	}
 
-	store, err := badger4.NewDatastore(data, &badger4.DefaultOptions)
+	store, err := pebbleds.NewDatastore(data)
 	if err != nil {
 		logger.Fatal(err)
 	}

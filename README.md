@@ -38,7 +38,7 @@ Using batching, Any `go-ds-crdt` replica can easily process and sync 400 keys/s 
   * A user-provided, thread-safe,
     [`go-datastore`](https://github.com/ipfs/go-datastore) implementation to
     be used as permanent storage. We recommend using the
-    [Badger implementation](https://pkg.go.dev/github.com/ipfs/go-ds-badger).
+    [Pebble implementation](https://pkg.go.dev/github.com/ipfs/go-ds-pebble).
   * A user-defined `Broadcaster` component to broadcast and receive updates
     from a set of replicas. If your application uses
     [libp2p](https://libp2p.io), you can use

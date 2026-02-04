@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgraph-io/badger"
 	blockstore "github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/boxo/ipld/merkledag"
 	mdutils "github.com/ipfs/boxo/ipld/merkledag/test"
@@ -20,7 +19,7 @@ import (
 	query "github.com/ipfs/go-datastore/query"
 	dssync "github.com/ipfs/go-datastore/sync"
 	dstest "github.com/ipfs/go-datastore/test"
-	badgerds "github.com/ipfs/go-ds-badger"
+	pebbleds "github.com/ipfs/go-ds-pebble"
 	ipld "github.com/ipfs/go-ipld-format"
 	log "github.com/ipfs/go-log/v2"
 	"github.com/multiformats/go-multihash"
@@ -31,7 +30,7 @@ var debug = false
 
 const (
 	mapStore = iota
-	badgerStore
+	pebbleStore
 )
 
 var store int = mapStore
@@ -188,7 +187,7 @@ func (mds *mockDAGSvc) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipld
 }
 
 func storeFolder(i int) string {
-	return fmt.Sprintf("test-badger-%d", i)
+	return fmt.Sprintf("test-pebble-%d", i)
 }
 
 func makeStore(t testing.TB, i int) ds.Datastore {
@@ -197,19 +196,14 @@ func makeStore(t testing.TB, i int) ds.Datastore {
 	switch store {
 	case mapStore:
 		return dssync.MutexWrap(ds.NewMapDatastore())
-	case badgerStore:
+	case pebbleStore:
 		folder := storeFolder(i)
 		err := os.MkdirAll(folder, 0700)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		badgerOpts := badger.DefaultOptions("")
-		badgerOpts.SyncWrites = false
-		badgerOpts.MaxTableSize = 1048576
-
-		opts := badgerds.Options{Options: badgerOpts}
-		dstore, err := badgerds.NewDatastore(folder, &opts)
+		dstore, err := pebbleds.NewDatastore(folder)
 		if err != nil {
 			t.Fatal(err)
 		}
