@@ -1084,7 +1084,14 @@ func TestCRDTDagNames(t *testing.T) {
 	}
 
 	var expectedDagName string
-	visit := func(d Delta) error {
+	visit := func(n ipld.Node) error {
+		dbytes, err := extractDelta(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := replicas[0].opts.crdtOpts.DeltaFactory()
+		d.Unmarshal(dbytes)
+
 		if d.GetDagName() != expectedDagName {
 			return fmt.Errorf("wrong dagName in subtree: got %s, expected %s", d.GetDagName(), expectedDagName)
 		}
