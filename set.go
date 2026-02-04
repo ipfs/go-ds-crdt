@@ -172,12 +172,10 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 	// * KeysOnly: false reads everything from the start. Priorities
 	//   and tombstoned values are read for nothing
 	//
-	// In-mem benchmarking shows no clear winner. Badger docs say that
-	// KeysOnly "is several order of magnitudes faster than regular
-	// iteration". Contrary to my original feeling, however, live testing
-	// with a 50GB badger with millions of keys shows more speed when
-	// querying with value. It may be that speed is fully affected by the
-	// current state of table compaction as well.
+	// KeysOnly retrieval can be faster with Pebble, at least for larger
+	// values, due to pebble's ability to bypass value retrieval. This results
+	// in reduced I/O, and reduced memory allocation and garbage collection.
+	// Performance gains may be less significant with small values.
 	setQuery := query.Query{
 		Prefix:   setQueryPrefix,
 		KeysOnly: false,
