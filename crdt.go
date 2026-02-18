@@ -788,6 +788,17 @@ func (store *Datastore) processedBlockKey(c cid.Cid) ds.Key {
 	return store.namespace.ChildString(store.opts.crdtOpts.Namespaces.ProcessedBlocks).ChildString(dshelp.MultihashToDsKey(c.Hash()).String())
 }
 
+// IsProcessed returns whether the given CID has been processed. A CID is
+// considered processed if it has been merged into the set and all its children
+// have been processed as well.
+//
+// Note that a CID is not considered processed until the whole branch below it
+// has been processed, so even if a CID is a head, it may not be considered
+// processed until the whole branch below it has been merged into the set.
+func (store *Datastore) IsProcessed(ctx context.Context, c cid.Cid) (bool, error) {
+	return store.isProcessed(ctx, c)
+}
+
 func (store *Datastore) isProcessed(ctx context.Context, c cid.Cid) (bool, error) {
 	return store.store.Has(ctx, store.processedBlockKey(c))
 }

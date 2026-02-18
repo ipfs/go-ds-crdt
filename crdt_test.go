@@ -1172,3 +1172,48 @@ func TestCRDTHeadsSaveLoad(t *testing.T) {
 		t.Error("Expected a head with DAGName 'dag2'")
 	}
 }
+
+func TestCRDTIsProcessed(t *testing.T) {
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+	replica := replicas[0]
+	ctx := context.Background()
+
+	// A CID that was never added should not be processed.
+	mh, err := multihash.Sum([]byte("never-added"), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownCID := cid.NewCidV1(cid.DagProtobuf, mh)
+	processed, err := replica.IsProcessed(ctx, unknownCID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed {
+		t.Error("unknown CID should not be processed")
+	}
+
+	// Put a value — this synchronously creates and processes a DAG block.
+	err = replica.Put(ctx, ds.NewKey("/testkey"), []byte("testval"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// All head CIDs should be marked as processed now.
+	heads, _, err := replica.heads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heads) == 0 {
+		t.Fatal("expected at least one head after Put")
+	}
+	for _, head := range heads {
+		processed, err := replica.IsProcessed(ctx, head.Cid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !processed {
+			t.Errorf("head %s should be processed after Put", head.Cid)
+		}
+	}
+}
