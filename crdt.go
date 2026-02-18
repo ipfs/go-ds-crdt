@@ -1110,7 +1110,8 @@ func (store *Datastore) Put(ctx context.Context, key ds.Key, value []byte) error
 	if err != nil {
 		return err
 	}
-	return store.publish(ctx, delta)
+	_, err = store.publish(ctx, delta)
+	return err
 }
 
 // Delete removes the value for given `key`.
@@ -1128,7 +1129,8 @@ func (store *Datastore) Delete(ctx context.Context, key ds.Key) error {
 	if len(tombs) == 0 {
 		return nil
 	}
-	return store.publish(ctx, delta)
+	_, err = store.publish(ctx, delta)
+	return err
 }
 
 // Sync ensures that all the data under the given prefix is flushed to disk in
@@ -1313,7 +1315,7 @@ func (store *Datastore) updateDelta(newDelta Delta) (int, error) {
 func (store *Datastore) publishDelta(ctx context.Context) error {
 	store.curDeltaMux.Lock()
 	defer store.curDeltaMux.Unlock()
-	err := store.publish(ctx, store.curDelta)
+	_, err := store.publish(ctx, store.curDelta)
 	if err != nil {
 		return err
 	}
@@ -1337,25 +1339,24 @@ func (store *Datastore) putBlock(ctx context.Context, heads []Head, height uint6
 	return node, nil
 }
 
-func (store *Datastore) publish(ctx context.Context, delta Delta) error {
+func (store *Datastore) publish(ctx context.Context, delta Delta) (cid.Cid, error) {
 	// curDelta might be nil if nothing has been added to it
-	if delta == nil {
-		return nil
-	}
-
-	if delta.Size() == 0 {
-		return nil
+	if delta == nil || delta.Size() == 0 {
+		return cid.Undef, nil
 	}
 
 	c, err := store.addDAGNode(ctx, delta)
 	if err != nil {
-		return err
+		return cid.Undef, err
 	}
 
 	head := Head{Cid: c}
 	head.DAGName = delta.GetDagName()
 
-	return store.broadcast(ctx, []Head{head})
+	if err := store.broadcast(ctx, []Head{head}); err != nil {
+		return cid.Undef, err
+	}
+	return c, nil
 }
 
 func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (cid.Cid, error) {

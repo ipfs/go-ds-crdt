@@ -1042,7 +1042,7 @@ func TestCRDTDagNames(t *testing.T) {
 		}
 
 		// Commit the delta
-		err = replicas[0].publish(ctx, delta)
+		_, err = replicas[0].publish(ctx, delta)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1170,5 +1170,50 @@ func TestCRDTHeadsSaveLoad(t *testing.T) {
 
 	if !headDagNames["dag2"] {
 		t.Error("Expected a head with DAGName 'dag2'")
+	}
+}
+
+func TestCRDTIsProcessed(t *testing.T) {
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+	mcrdt := MerkleCRDT{replicas[0]}
+	ctx := context.Background()
+
+	// A CID that was never added should not be processed.
+	mh, err := multihash.Sum([]byte("never-added"), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownCID := cid.NewCidV1(cid.DagProtobuf, mh)
+	processed, err := mcrdt.IsProcessed(ctx, unknownCID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed {
+		t.Error("unknown CID should not be processed")
+	}
+
+	// Put a value — this synchronously creates and processes a DAG block.
+	err = mcrdt.Put(ctx, ds.NewKey("/testkey"), []byte("testval"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// All head CIDs should be marked as processed now.
+	heads, _, err := mcrdt.Heads().List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heads) == 0 {
+		t.Fatal("expected at least one head after Put")
+	}
+	for _, head := range heads {
+		processed, err := mcrdt.IsProcessed(ctx, head.Cid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !processed {
+			t.Errorf("head %s should be processed after Put", head.Cid)
+		}
 	}
 }
