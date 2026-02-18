@@ -1042,7 +1042,7 @@ func TestCRDTDagNames(t *testing.T) {
 		}
 
 		// Commit the delta
-		err = replicas[0].publish(ctx, delta)
+		_, err = replicas[0].publish(ctx, delta)
 		if err != nil {
 			t.Fatal(err)
 		}
