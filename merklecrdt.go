@@ -97,6 +97,13 @@ func (mcrdt *MerkleCRDT) Heads() Heads {
 	return mcrdt.heads
 }
 
+// IsProcessed returns whether the given CID has been processed. Nodes are
+// marked as processed as they are traversed during the DAG walk, so a CID
+// being processed means it has been visited and merged into the set.
+func (mcrdt *MerkleCRDT) IsProcessed(ctx context.Context, c cid.Cid) (bool, error) {
+	return mcrdt.isProcessed(ctx, c)
+}
+
 // Traverse visits nodes in the Merkle-CRDT tree. It skips duplicates
 // and calls the visit function with the Deltas extracted from every
 // node. An error results in the traversal operations being aborted.

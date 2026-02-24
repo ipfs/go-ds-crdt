@@ -1176,7 +1176,7 @@ func TestCRDTHeadsSaveLoad(t *testing.T) {
 func TestCRDTIsProcessed(t *testing.T) {
 	replicas, closeReplicas := makeNReplicas(t, 1, nil)
 	defer closeReplicas()
-	replica := replicas[0]
+	mcrdt := MerkleCRDT{replicas[0]}
 	ctx := context.Background()
 
 	// A CID that was never added should not be processed.
@@ -1185,7 +1185,7 @@ func TestCRDTIsProcessed(t *testing.T) {
 		t.Fatal(err)
 	}
 	unknownCID := cid.NewCidV1(cid.DagProtobuf, mh)
-	processed, err := replica.IsProcessed(ctx, unknownCID)
+	processed, err := mcrdt.IsProcessed(ctx, unknownCID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1194,13 +1194,13 @@ func TestCRDTIsProcessed(t *testing.T) {
 	}
 
 	// Put a value — this synchronously creates and processes a DAG block.
-	err = replica.Put(ctx, ds.NewKey("/testkey"), []byte("testval"))
+	err = mcrdt.Put(ctx, ds.NewKey("/testkey"), []byte("testval"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// All head CIDs should be marked as processed now.
-	heads, _, err := replica.heads.List(ctx)
+	heads, _, err := mcrdt.Heads().List(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1208,7 +1208,7 @@ func TestCRDTIsProcessed(t *testing.T) {
 		t.Fatal("expected at least one head after Put")
 	}
 	for _, head := range heads {
-		processed, err := replica.IsProcessed(ctx, head.Cid)
+		processed, err := mcrdt.IsProcessed(ctx, head.Cid)
 		if err != nil {
 			t.Fatal(err)
 		}
