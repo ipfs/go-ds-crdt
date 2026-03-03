@@ -1084,7 +1084,7 @@ func TestCRDTDagNames(t *testing.T) {
 			t.Fatal(err)
 		}
 		d := replicas[0].opts.crdtOpts.DeltaFactory()
-		d.Unmarshal(dbytes)
+		d.Unmarshal(dbytes) // nolint:errcheck
 
 		if d.GetDagName() != expectedDagName {
 			return fmt.Errorf("wrong dagName in subtree: got %s, expected %s", d.GetDagName(), expectedDagName)

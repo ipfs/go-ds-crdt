@@ -13,7 +13,6 @@ import (
 	pb "github.com/ipfs/go-ds-crdt/pb"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
-	"go.uber.org/multierr"
 
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
@@ -569,7 +568,7 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	// key -> tombstonedBlockID. Carries the tombstoned blocks for each
 	// element in this delta.
 	deletedElems := make(map[string][]string)
-
+	var errs []error
 	for _, e := range tombs {
 		// /namespace/tombs/<key>/<id>
 		key := e.GetKey()
@@ -584,17 +583,27 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 
 		if v == nil {
-			err = multierr.Append(err, store.Delete(ctx, valueK))
-			err = multierr.Append(err, store.Delete(ctx, s.priorityKey(key)))
+			if err = store.Delete(ctx, valueK); err != nil {
+				errs = append(errs, err)
+			}
+			if err = store.Delete(ctx, s.priorityKey(key)); err != nil {
+				errs = append(errs, err)
+			}
 		} else {
-			err = multierr.Append(err, store.Put(ctx, valueK, v))
-			err = multierr.Append(err, s.setPriority(ctx, store, key, p))
+			if err = store.Put(ctx, valueK, v); err != nil {
+				errs = append(errs, err)
+			}
+			if err = s.setPriority(ctx, store, key, p); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
 		// Write tomb into store.
 		k := s.tombsPrefix(key).ChildString(id)
-		err = multierr.Append(err, store.Put(ctx, k, nil))
-		if err != nil {
+		if err = store.Put(ctx, k, nil); err != nil {
+			errs = append(errs, err)
+		}
+		if err := errors.Join(errs...); err != nil {
 			return err
 		}
 	}

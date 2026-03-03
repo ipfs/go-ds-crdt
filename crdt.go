@@ -476,7 +476,7 @@ func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) ([]Hea
 			return nil, err
 		}
 		store.logger.Debugf("a legacy CID broadcast was received for: %s", c)
-		return []Head{Head{Cid: c}}, nil
+		return []Head{{Cid: c}}, nil
 	}
 
 	bCastHeads := make([]Head, len(bcastData.Heads))

@@ -15,8 +15,6 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-const DefaultDagName = "default"
-
 // Heads represents a set of the current root CIDs of the Merkle-CRDT DAG.
 type Heads interface {
 	Get(ctx context.Context, c cid.Cid) (Head, bool)
