@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -192,7 +193,7 @@ func (hh *heads) primeCache(ctx context.Context) (ret error) {
 		headKey := ds.NewKey(strings.TrimPrefix(r.Key, hh.namespace.String()))
 		headCid, err := dshelp.DsKeyToCidV1(headKey, cid.DagProtobuf)
 		if err != nil {
-			return err
+			return fmt.Errorf("unable to convert given key %s to a Cid V1: %w", r.Key, err)
 		}
 		height, n := binary.Uvarint(r.Value)
 		if n <= 0 {
