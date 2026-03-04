@@ -84,7 +84,7 @@ func NewMerkleCRDT(
 // Publish allows to manually publish a Delta. The Priority is set
 // automatically, upon which the delta is merged, serialized and broadcasted.
 // Returns the CID of the new root node resulting from applying the delta.
-func (mcrdt *MerkleCRDT) Publish(ctx context.Context, delta Delta) (cid.Cid, error) {
+func (mcrdt *MerkleCRDT) Publish(ctx context.Context, delta Delta) (Head, error) {
 	return mcrdt.publish(ctx, delta)
 }
 

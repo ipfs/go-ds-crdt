@@ -1303,10 +1303,14 @@ func (store *Datastore) updateDeltaWithRemove(key string, newDelta Delta) (int, 
 func (store *Datastore) updateDelta(newDelta Delta) (int, error) {
 	var size int
 	var err error
+	var merged Delta
 	store.curDeltaMux.Lock()
 	{
-		store.curDelta, err = store.deltaMerge(store.curDelta, newDelta)
-		size = store.curDelta.Size()
+		merged, err = store.deltaMerge(store.curDelta, newDelta)
+		if err == nil {
+			store.curDelta = merged
+			size = merged.Size()
+		}
 	}
 	store.curDeltaMux.Unlock()
 	return size, err
@@ -1323,7 +1327,7 @@ func (store *Datastore) publishDelta(ctx context.Context) error {
 	return nil
 }
 
-func (store *Datastore) putBlock(ctx context.Context, heads []Head, height uint64, delta Delta) (ipld.Node, error) {
+func (store *Datastore) putBlock(ctx context.Context, heads []Head, delta Delta) (ipld.Node, error) {
 	node, err := makeNode(delta, heads)
 	if err != nil {
 		return nil, fmt.Errorf("error creating new block: %w", err)
@@ -1339,31 +1343,28 @@ func (store *Datastore) putBlock(ctx context.Context, heads []Head, height uint6
 	return node, nil
 }
 
-func (store *Datastore) publish(ctx context.Context, delta Delta) (cid.Cid, error) {
+func (store *Datastore) publish(ctx context.Context, delta Delta) (Head, error) {
 	// curDelta might be nil if nothing has been added to it
 	if delta == nil || delta.Size() == 0 {
-		return cid.Undef, nil
+		return Head{}, nil
 	}
 
-	c, err := store.addDAGNode(ctx, delta)
+	head, err := store.addDAGNode(ctx, delta)
 	if err != nil {
-		return cid.Undef, err
+		return Head{}, err
 	}
-
-	head := Head{Cid: c}
-	head.DAGName = delta.GetDagName()
 
 	if err := store.broadcast(ctx, []Head{head}); err != nil {
-		return cid.Undef, err
+		return Head{}, err
 	}
-	return c, nil
+	return head, nil
 }
 
-func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (cid.Cid, error) {
+func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, error) {
 	dagName := delta.GetDagName()
 	heads, height, err := store.heads.ListDAG(ctx, dagName)
 	if err != nil {
-		return cid.Undef, fmt.Errorf("error listing heads: %w", err)
+		return Head{}, fmt.Errorf("error listing heads: %w", err)
 	}
 	height = height + 1 // This implies our minimum height is 1
 	delta.SetPriority(height)
@@ -1372,9 +1373,9 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (cid.Cid, e
 	// 	e.Value = append(e.GetValue(), []byte(fmt.Sprintf(" height: %d", height))...)
 	// }
 
-	nd, err := store.putBlock(ctx, heads, height, delta)
+	nd, err := store.putBlock(ctx, heads, delta)
 	if err != nil {
-		return cid.Undef, err
+		return Head{}, err
 	}
 
 	newHead := Head{Cid: nd.Cid()}
@@ -1402,13 +1403,13 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (cid.Cid, e
 		// to custom delta errors on GetElement(). Those
 		// should just abort merging, and not mark the whole
 		// datastore dirty.
-		return cid.Undef, fmt.Errorf("error processing new block: %w", err)
+		return newHead, fmt.Errorf("error processing new block: %w", err)
 	}
 	if len(children) != 0 {
 		store.logger.Warnf("bug: created a block to unknown children")
 	}
 
-	return nd.Cid(), nil
+	return newHead, nil
 }
 
 func (store *Datastore) broadcast(ctx context.Context, heads []Head) error {

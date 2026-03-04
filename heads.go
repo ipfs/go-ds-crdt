@@ -121,7 +121,7 @@ func (hh *heads) Len(ctx context.Context) (int, error) {
 func (hh *heads) Replace(ctx context.Context, old Head, new Head) error {
 	hh.logger.Debugf("replacing DAG head: %s -> %s", old, new)
 	if old.DAGName != new.DAGName {
-		hh.logger.Errorf("new head and old head belong to different DAGs: %s -> %s", old, new)
+		hh.logger.Warnf("new head and old head belong to different DAGs: %s -> %s", old, new)
 	}
 
 	var store ds.Write = hh.store
@@ -188,8 +188,7 @@ func (hh *heads) list(ctx context.Context, dagName string, useDagName bool) ([]H
 	{
 		heads = make([]Head, 0, len(hh.cache))
 		for c, headValue := range hh.cache {
-			if !useDagName ||
-				(useDagName && headValue.DAGName == dagName) {
+			if !useDagName || headValue.DAGName == dagName {
 				heads = append(heads, Head{Cid: c, HeadValue: headValue})
 				if headValue.Height > maxHeight {
 					maxHeight = headValue.Height
