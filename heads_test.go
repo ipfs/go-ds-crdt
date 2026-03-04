@@ -105,6 +105,117 @@ func TestHeadsBasic(t *testing.T) {
 	assertHeads(t, heads, cidHeights)
 }
 
+func TestHeadsListDAG(t *testing.T) {
+	ctx := context.Background()
+
+	heads := newTestHeads(t)
+
+	// Add heads with different DAG names
+	dag1Heads := make(map[cid.Cid]Head)
+	dag2Heads := make(map[cid.Cid]Head)
+
+	// Add 3 heads for DAG 1
+	for i := 0; i < 3; i++ {
+		c, height := newCID(t), uint64(randg.Intn(100))
+		head := Head{Cid: c, HeadValue: HeadValue{Height: height, DAGName: "dag1"}}
+		dag1Heads[c] = head
+		err := heads.Add(ctx, head)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Add 2 heads for DAG 2
+	for i := 0; i < 2; i++ {
+		c, height := newCID(t), uint64(randg.Intn(100))
+		head := Head{Cid: c, HeadValue: HeadValue{Height: height, DAGName: "dag2"}}
+		dag2Heads[c] = head
+		err := heads.Add(ctx, head)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Test that ListDAG("dag1") returns only DAG 1 heads
+	dag1HeadsList, maxHeight1, err := heads.ListDAG(ctx, "dag1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(dag1HeadsList) != 3 {
+		t.Errorf("expected 3 heads for DAG 1, got %d", len(dag1HeadsList))
+	}
+
+	if maxHeight1 == 0 {
+		t.Error("expected max height > 0 for DAG 1")
+	}
+
+	// Verify all returned heads belong to DAG 1
+	for _, head := range dag1HeadsList {
+		if head.DAGName != "dag1" {
+			t.Errorf("head %s belongs to DAG %s, expected DAG 1", head.Cid, head.DAGName)
+		}
+	}
+
+	// Test that ListDAG("dag2") returns only DAG 2 heads
+	dag2HeadsList, maxHeight2, err := heads.ListDAG(ctx, "dag2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(dag2HeadsList) != 2 {
+		t.Errorf("expected 2 heads for DAG 2, got %d", len(dag2HeadsList))
+	}
+
+	if maxHeight2 == 0 {
+		t.Error("expected max height > 0 for DAG 2")
+	}
+
+	// Verify all returned heads belong to DAG 2
+	for _, head := range dag2HeadsList {
+		if head.DAGName != "dag2" {
+			t.Errorf("head %s belongs to DAG %s, expected DAG 2", head.Cid, head.DAGName)
+		}
+	}
+
+	// Verify max heights are correct
+	expectedMaxHeight1 := uint64(0)
+	for _, head := range dag1Heads {
+		if head.Height > expectedMaxHeight1 {
+			expectedMaxHeight1 = head.Height
+		}
+	}
+
+	expectedMaxHeight2 := uint64(0)
+	for _, head := range dag2Heads {
+		if head.Height > expectedMaxHeight2 {
+			expectedMaxHeight2 = head.Height
+		}
+	}
+
+	if maxHeight1 != expectedMaxHeight1 {
+		t.Errorf("expected max height for DAG 1 %d, got %d", expectedMaxHeight1, maxHeight1)
+	}
+
+	if maxHeight2 != expectedMaxHeight2 {
+		t.Errorf("expected max height for DAG 2 %d, got %d", expectedMaxHeight2, maxHeight2)
+	}
+
+	// Test that ListDAG with non-existent DAG returns empty list
+	emptyHeads, maxHeightEmpty, err := heads.ListDAG(ctx, "nonexistent")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(emptyHeads) != 0 {
+		t.Errorf("expected 0 heads for non-existent DAG, got %d", len(emptyHeads))
+	}
+
+	if maxHeightEmpty != 0 {
+		t.Errorf("expected max height 0 for non-existent DAG, got %d", maxHeightEmpty)
+	}
+}
+
 func assertHeads(t *testing.T, hh *heads, headsMap map[cid.Cid]Head) {
 	t.Helper()
 	ctx := context.Background()

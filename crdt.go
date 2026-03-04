@@ -1361,28 +1361,18 @@ func (store *Datastore) publish(ctx context.Context, delta Delta) (cid.Cid, erro
 
 func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (cid.Cid, error) {
 	dagName := delta.GetDagName()
-	heads, height, err := store.heads.List(ctx)
+	heads, height, err := store.heads.ListDAG(ctx, dagName)
 	if err != nil {
 		return cid.Undef, fmt.Errorf("error listing heads: %w", err)
 	}
 	height = height + 1 // This implies our minimum height is 1
-
-	// Only set heads with the same DAG name as children.
-	// This will partition the CRDT dag based on DAGName.
-	headsForDag := make([]Head, 0, len(heads))
-	for _, h := range heads {
-		if h.DAGName == dagName {
-			headsForDag = append(headsForDag, h)
-		}
-	}
-
 	delta.SetPriority(height)
 
 	// for _, e := range delta.GetElements() {
 	// 	e.Value = append(e.GetValue(), []byte(fmt.Sprintf(" height: %d", height))...)
 	// }
 
-	nd, err := store.putBlock(ctx, headsForDag, height, delta)
+	nd, err := store.putBlock(ctx, heads, height, delta)
 	if err != nil {
 		return cid.Undef, err
 	}

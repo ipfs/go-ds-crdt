@@ -22,6 +22,7 @@ type Heads interface {
 	Replace(ctx context.Context, old Head, new Head) error
 	Add(ctx context.Context, head Head) error
 	List(ctx context.Context) ([]Head, uint64, error)
+	ListDAG(ctx context.Context, dagName string) ([]Head, uint64, error)
 }
 
 type Head struct {
@@ -179,8 +180,7 @@ func (hh *heads) Add(ctx context.Context, head Head) error {
 	return nil
 }
 
-// List returns the list of current heads plus the max height.
-func (hh *heads) List(ctx context.Context) ([]Head, uint64, error) {
+func (hh *heads) list(ctx context.Context, dagName string, useDagName bool) ([]Head, uint64, error) {
 	var maxHeight uint64
 	var heads []Head
 
@@ -188,9 +188,12 @@ func (hh *heads) List(ctx context.Context) ([]Head, uint64, error) {
 	{
 		heads = make([]Head, 0, len(hh.cache))
 		for c, headValue := range hh.cache {
-			heads = append(heads, Head{Cid: c, HeadValue: headValue})
-			if headValue.Height > maxHeight {
-				maxHeight = headValue.Height
+			if !useDagName ||
+				(useDagName && headValue.DAGName == dagName) {
+				heads = append(heads, Head{Cid: c, HeadValue: headValue})
+				if headValue.Height > maxHeight {
+					maxHeight = headValue.Height
+				}
 			}
 		}
 	}
@@ -203,6 +206,15 @@ func (hh *heads) List(ctx context.Context) ([]Head, uint64, error) {
 	// })
 
 	return heads, maxHeight, nil
+}
+
+// List returns the list of current heads plus the max height.
+func (hh *heads) List(ctx context.Context) ([]Head, uint64, error) {
+	return hh.list(ctx, "", false)
+}
+
+func (hh *heads) ListDAG(ctx context.Context, dagName string) ([]Head, uint64, error) {
+	return hh.list(ctx, dagName, true)
 }
 
 // primeCache builds the heads cache based on what's in storage; since
