@@ -9,4 +9,5 @@ message CRDTBroadcast {
 
 message Head {
   bytes Cid = 1;
+  string DagName = 2;
 }
