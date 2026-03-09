@@ -19,6 +19,7 @@ import (
 type Heads interface {
 	Get(ctx context.Context, c cid.Cid) (Head, bool)
 	Len(ctx context.Context) (int, error)
+	LenDAG(ctx context.Context, dagName string) (int, error)
 	Replace(ctx context.Context, old Head, new Head) error
 	Add(ctx context.Context, head Head) error
 	List(ctx context.Context) ([]Head, uint64, error)
@@ -112,6 +113,20 @@ func (hh *heads) Len(ctx context.Context) (int, error) {
 	hh.cacheMux.RLock()
 	{
 		ret = len(hh.cache)
+	}
+	hh.cacheMux.RUnlock()
+	return ret, nil
+}
+
+func (hh *heads) LenDAG(ctx context.Context, dagName string) (int, error) {
+	var ret int
+	hh.cacheMux.RLock()
+	{
+		for _, v := range hh.cache {
+			if v.DAGName == dagName {
+				ret++
+			}
+		}
 	}
 	hh.cacheMux.RUnlock()
 	return ret, nil

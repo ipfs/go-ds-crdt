@@ -797,27 +797,27 @@ func TestCRDTBroadcastBackwardsCompat(t *testing.T) {
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
-	heads, err := replicas[0].decodeBroadcast(ctx, cidV0.Bytes())
+	headsMap, err := replicas[0].decodeBroadcast(ctx, cidV0.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(heads) != 1 || !heads[0].Cid.Equals(cidV0) {
-		t.Error("should have returned a single cidV0", heads)
+	if len(headsMap[""]) != 1 || !headsMap[""][0].Cid.Equals(cidV0) {
+		t.Error("should have returned a single cidV0", headsMap[""])
 	}
 
-	data, err := replicas[0].encodeBroadcast(ctx, heads)
+	data, err := replicas[0].encodeBroadcast(ctx, headsMap[""])
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	heads2, err := replicas[0].decodeBroadcast(ctx, data)
+	headsMap2, err := replicas[0].decodeBroadcast(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(heads2) != 1 || !heads2[0].Cid.Equals(cidV0) {
-		t.Error("should have reparsed cid0", heads2)
+	if len(headsMap2[""]) != 1 || !headsMap2[""][0].Cid.Equals(cidV0) {
+		t.Error("should have reparsed cid0", headsMap2[""])
 	}
 }
 
@@ -1215,5 +1215,143 @@ func TestCRDTIsProcessed(t *testing.T) {
 		if !processed {
 			t.Errorf("head %s should be processed after Put", head.Cid)
 		}
+	}
+}
+
+func TestCRDTLenDag(t *testing.T) {
+	// make a replica
+	replicas, closeReplicas := makeNReplicas(t, 1, nil)
+	defer closeReplicas()
+	replica := replicas[0]
+	ctx := context.Background()
+
+	// publish one delta for dag1
+	k1 := ds.RandomKey()
+	v1 := []byte("value1")
+	delta1, err := replica.set.Add(ctx, k1.String(), v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta1.SetDagName("dag1")
+	_, err = replica.publish(ctx, delta1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// publish 2 deltas for dag2
+	k2 := ds.RandomKey()
+	v2 := []byte("value2")
+	delta2, err := replica.set.Add(ctx, k2.String(), v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta2.SetDagName("dag2")
+	_, err = replica.publish(ctx, delta2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	k3 := ds.RandomKey()
+	v3 := []byte("value3")
+	delta3, err := replica.set.Add(ctx, k3.String(), v3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta3.SetDagName("dag2")
+	_, err = replica.publish(ctx, delta3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lenDag1, err := replica.heads.LenDAG(ctx, "dag1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lenDag1 != 1 {
+		t.Errorf("Expected 1 head for dag1, got %d", lenDag1)
+	}
+
+	lenDag2, err := replica.heads.LenDAG(ctx, "dag2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lenDag2 != 1 {
+		t.Errorf("Expected 1 heads for dag2, got %d", lenDag2)
+	}
+
+	_, max, _ := replica.heads.ListDAG(ctx, "dag2")
+	if max != 2 {
+		t.Errorf("Expected height = 2 for dag2")
+	}
+}
+
+type memoryBroadcaster struct {
+	Broadcaster
+	last []byte
+}
+
+func (mb *memoryBroadcaster) Next(ctx context.Context) ([]byte, error) {
+	b, err := mb.Broadcaster.Next(ctx)
+	mb.last = b
+	return b, err
+}
+
+func TestCRDTBatchBroadcast(t *testing.T) {
+	// makes DefaultOptions
+	opts := DefaultOptions()
+	// sets the BroadcastBatchDelay to 1 second
+	opts.BroadcastBatchDelay = 500 * time.Millisecond
+
+	// makes 1 replica
+	replicas, closeReplicas := makeNReplicas(t, 1, opts)
+	defer closeReplicas()
+	replica := replicas[0]
+	ctx := context.Background()
+
+	mb := &memoryBroadcaster{
+		Broadcaster: replica.broadcaster,
+	}
+	replica.broadcaster = mb
+
+	// Performs 3 updates
+	k1 := ds.RandomKey()
+	v1 := []byte("value1")
+	err := replica.Put(ctx, k1, v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	k2 := ds.RandomKey()
+	v2 := []byte("value2")
+	err = replica.Put(ctx, k2, v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	k3 := ds.RandomKey()
+	v3 := []byte("value3")
+	err = replica.Put(ctx, k3, v3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(time.Second)
+	// obtain the last broadcast
+	data := mb.last
+
+	// calls decodeBroadcast on the response and verifies that there are 3 heads in the response
+	heads, err := replica.decodeBroadcast(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have one DAG with 3 heads (all from the same DAG)
+	var totalHeads int
+	for _, headList := range heads {
+		totalHeads += len(headList)
+	}
+
+	if totalHeads != 3 {
+		t.Errorf("Expected 3 heads in broadcast, got %d", totalHeads)
 	}
 }

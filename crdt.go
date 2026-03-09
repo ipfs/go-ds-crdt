@@ -76,12 +76,17 @@ type SessionDAGService interface {
 
 // Options holds configurable values for Datastore.
 type Options struct {
-	Logger              logging.StandardLogger
+	Logger logging.StandardLogger
+	// RebroadcastInterval specifies how often the system
+	// re-publishes its latest heads so that new replicas can
+	// learn about them. It only broadcasts heads that have not
+	// been already broadcasted by other replicas in the
+	// interval. Default: 1m.
 	RebroadcastInterval time.Duration
 	// The PutHook function is triggered whenever an element
 	// is successfully added to the datastore (either by a local
 	// or remote update), and only when that addition is considered the
-	// prevalent value.
+	// prevalent value. Default: nil.
 	PutHook func(k ds.Key, v []byte)
 	// The DeleteHook function is triggered whenever a version of an
 	// element is successfully removed from the datastore (either by a
@@ -89,26 +94,37 @@ type Options struct {
 	// result in the DeleteHook being triggered even though the element is
 	// still present in the datastore because it was re-added or not fully
 	// tombstoned. If that is relevant, use Has() to check if the removed
-	// element is still part of the datastore.
+	// element is still part of the datastore. Default: nil.
 	DeleteHook func(k ds.Key)
-	// NumWorkers specifies the number of workers ready to walk DAGs
+	// NumWorkers specifies the number of workers ready to
+	// retrieve and merge deltas while walking the DAGs. Default:
+	// 5.
 	NumWorkers int
-	// DAGSyncerTimeout specifies how long to wait for a DAGSyncer.
-	// Set to 0 to disable.
+	// DAGSyncerTimeout specifies how long to wait for a DAGSyncer
+	// to, for example, receive a delta from a different replica.
+	// Set to 0 to disable. Default: 5m.
 	DAGSyncerTimeout time.Duration
 	// MaxBatchDeltaSize will automatically commit any batches whose
 	// delta size gets too big. This helps keep DAG nodes small
-	// enough that they will be transferred by the network.
+	// enough that they will be transferred by the network. Default: 1MiB.
 	MaxBatchDeltaSize int
 	// RepairInterval specifies how often to walk the full DAG until
-	// the root(s) if it has been marked dirty. 0 to disable.
+	// the root(s) if it has been marked dirty. 0 to disable. Default: 1h.
 	RepairInterval time.Duration
-	// MultiHeadProcessing lets several new heads to be processed in
-	// parallel.  This results in more branching in general. More
-	// branching is not necessarily a bad thing and may improve
-	// throughput, but everything depends on usage.
+	// MultiHeadProcessing lets several new heads to be processed
+	// in parallel. This results in more branching in
+	// general. More branching is not necessarily a bad thing and
+	// may improve throughput, but everything depends on
+	// usage. Default: false.
 	MultiHeadProcessing bool
-
+	// BroadcastBatchDelay batches the new Head broadcasts when
+	// publishing new deltas into a single message. As a result,
+	// broadcast traffic is reduced on systems with high
+	// utilization. On the other side, the delay introduces
+	// latency as a change will not be published until it is
+	// included in the batch when the delay expires. 0 to
+	// disable. Default: 0.
+	BroadcastBatchDelay time.Duration
 	// advanced options
 	crdtOpts MerkleCRDTOptions
 }
@@ -142,6 +158,10 @@ func (opts *Options) verify() error {
 		return errors.New("invalid RepairInterval")
 	}
 
+	if opts.BroadcastBatchDelay < 0 {
+		return errors.New("invalid BroadcastBatchDelay")
+	}
+
 	if opts.crdtOpts.DeltaFactory == nil {
 		panic("deltaFactory is unset, and this should never happen")
 	}
@@ -173,6 +193,7 @@ func DefaultOptions() *Options {
 		MaxBatchDeltaSize:   1 * 1024 * 1024, // 1MB,
 		RepairInterval:      time.Hour,
 		MultiHeadProcessing: false,
+		BroadcastBatchDelay: 0,
 
 		crdtOpts: MerkleCRDTOptions{
 			DeltaFactory: func() Delta { return &pbDelta{Delta: &pb.Delta{}} },
@@ -203,8 +224,9 @@ type Datastore struct {
 	set       *set
 	heads     *heads
 
-	dagService  ipld.DAGService
-	broadcaster Broadcaster
+	dagService       ipld.DAGService
+	broadcaster      Broadcaster
+	broadcastBatchCh chan []Head
 
 	seenHeadsMux sync.RWMutex
 	seenHeads    map[cid.Cid]struct{}
@@ -301,20 +323,21 @@ func New(
 	}
 
 	dstore := &Datastore{
-		ctx:            ctx,
-		cancel:         cancel,
-		opts:           opts,
-		logger:         opts.Logger,
-		store:          store,
-		namespace:      namespace,
-		set:            set,
-		heads:          heads,
-		dagService:     dagSyncer,
-		broadcaster:    bcast,
-		seenHeads:      make(map[cid.Cid]struct{}),
-		jobQueue:       make(chan *dagJob, opts.NumWorkers),
-		sendJobs:       make(chan *dagJob),
-		queuedChildren: newCidSafeSet(),
+		ctx:              ctx,
+		cancel:           cancel,
+		opts:             opts,
+		logger:           opts.Logger,
+		store:            store,
+		namespace:        namespace,
+		set:              set,
+		heads:            heads,
+		dagService:       dagSyncer,
+		broadcaster:      bcast,
+		broadcastBatchCh: make(chan []Head, 1),
+		seenHeads:        make(map[cid.Cid]struct{}),
+		jobQueue:         make(chan *dagJob, opts.NumWorkers),
+		sendJobs:         make(chan *dagJob),
+		queuedChildren:   newCidSafeSet(),
 	}
 
 	err = dstore.applyMigrations(ctx)
@@ -347,7 +370,7 @@ func New(
 			dstore.dagWorker()
 		}()
 	}
-	dstore.wg.Add(4)
+	dstore.wg.Add(5)
 	go func() {
 		defer dstore.wg.Done()
 		dstore.handleNext(ctx)
@@ -355,6 +378,10 @@ func New(
 	go func() {
 		defer dstore.wg.Done()
 		dstore.rebroadcast(ctx)
+	}()
+	go func() {
+		defer dstore.wg.Done()
+		dstore.broadcastHeadsBatch(ctx)
 	}()
 
 	go func() {
@@ -370,6 +397,21 @@ func New(
 	return dstore, nil
 }
 
+// handleNext will loop on broadcaster.Next().  In the general case
+// (MultiheadProcessing = false), for each received head it will wait
+// until the branch it points to has been processed before returning.
+// Different DAGNames are however processed in parallel. Multiple
+// heads from the same DAGName are processed sequentially. We wait for
+// all DAGname-branches to be finished before continuing to process
+// the next broadcast.
+//
+// When MultiheadProcessing = true, we do not wait for a branch to
+// have been processed to return and launch goroutines instead so that
+// the processing happens in the background, while we read the next
+// updates.
+//
+// MultiheadProcessing may cause goroutines to queue as the jobQueue
+// has as much space as numWorkers.
 func (store *Datastore) handleNext(ctx context.Context) {
 	if store.broadcaster == nil { // offline
 		return
@@ -390,7 +432,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			continue
 		}
 
-		bCastHeads, err := store.decodeBroadcast(ctx, data)
+		receivedHeads, err := store.decodeBroadcast(ctx, data)
 		if err != nil {
 			store.logger.Error(err)
 			continue
@@ -411,45 +453,68 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			}
 		}
 
-		// if we have no heads, make seen-heads heads immediately.  On
-		// a fresh start, this allows us to start building on top of
-		// recent heads, even if we have not fully synced rather than
-		// creating new orphan branches.
-		curHeadCount, err := store.heads.Len(ctx)
-		if err != nil {
-			store.logger.Error(err)
-			continue
-		}
-		if curHeadCount == 0 {
-			dg := &crdtNodeGetter{NodeGetter: store.dagService}
-			for _, head := range bCastHeads {
-				prio, err := store.getPriority(ctx, dg, head.Cid)
-				if err != nil {
-					store.logger.Error(err)
-					continue
-				}
-				head.Height = prio
-				err = store.heads.Add(ctx, head)
-				if err != nil {
-					store.logger.Error(err)
+		for dagName, heads := range receivedHeads {
+			// if we have no heads for the DAG name, make
+			// seen-heads heads immediately.  On a fresh
+			// start, this allows us to start building on
+			// top of recent heads, even if we have not
+			// fully synced rather than creating new
+			// orphan branches.
+			curHeadCount, err := store.heads.LenDAG(ctx, dagName)
+			if err != nil {
+				store.logger.Error(err)
+				continue
+			}
+			if curHeadCount == 0 {
+				dg := &crdtNodeGetter{NodeGetter: store.dagService}
+				for _, head := range heads {
+					// getPriority fetches the delta.
+					prio, err := store.getPriority(ctx, dg, head.Cid)
+					if err != nil {
+						store.logger.Error(err)
+						continue
+					}
+					head.Height = prio
+					err = store.heads.Add(ctx, head)
+					if err != nil {
+						store.logger.Error(err)
+					}
 				}
 			}
 		}
 
-		// For each head, we process it.
-		for _, head := range bCastHeads {
-			// A thing to try here would be to process heads in
-			// the same broadcast in parallel, but do not process
-			// heads from multiple broadcasts in parallel.
-			if store.opts.MultiHeadProcessing {
-				go processHead(ctx, head)
-			} else {
-				processHead(ctx, head)
-			}
-			store.seenHeadsMux.Lock()
-			store.seenHeads[head.Cid] = struct{}{}
-			store.seenHeadsMux.Unlock()
+		// Send heads for processing. Each dagName is
+		// processed in parallel, and follows
+		// the MultiHeadProcessing configuration.
+		// If MultiHeadProcessing is false, this will wait until all
+		// dagNames heads have been processed.
+		var wg sync.WaitGroup
+		for _, heads := range receivedHeads {
+			wg.Add(1)
+			go func(heads []Head) {
+				defer wg.Done()
+				for _, head := range heads {
+					// A thing to try here would be to process heads in
+					// the same broadcast in parallel, but do not process
+					// heads from multiple broadcasts in parallel.
+					if store.opts.MultiHeadProcessing {
+						go processHead(ctx, head)
+					} else {
+						processHead(ctx, head)
+					}
+					store.seenHeadsMux.Lock()
+					store.seenHeads[head.Cid] = struct{}{}
+					store.seenHeadsMux.Unlock()
+				}
+			}(heads)
 		}
+
+		// wait for all heads in all dagNames to be processed.
+		// If MultiHeadProcessing is enabled this will not wait long as goroutines above
+		// will return quickly.
+		wg.Wait()
+
+		// --> continue loop for next heads broadcast
 
 		// TODO: We should store trusted-peer signatures associated to
 		// each head in a timecache. When we broadcast, attach the
@@ -459,7 +524,9 @@ func (store *Datastore) handleNext(ctx context.Context) {
 	}
 }
 
-func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) ([]Head, error) {
+// decodeBroadcast parses a CRDTBroadcast received via pubsub and
+// returns the heads classified by DAGName.
+func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) (map[string][]Head, error) {
 	// Make a list of heads we received
 	bcastData := pb.CRDTBroadcast{}
 	err := proto.Unmarshal(data, &bcastData)
@@ -476,18 +543,22 @@ func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) ([]Hea
 			return nil, err
 		}
 		store.logger.Debugf("a legacy CID broadcast was received for: %s", c)
-		return []Head{{Cid: c}}, nil
+		return map[string][]Head{
+			"": []Head{{Cid: c}},
+		}, nil
 	}
 
-	bCastHeads := make([]Head, len(bcastData.Heads))
-	for i, protoHead := range bcastData.Heads {
+	bCastHeads := make(map[string][]Head, len(bcastData.Heads))
+	for _, protoHead := range bcastData.Heads {
 		c, err := cid.Cast(protoHead.Cid)
 		if err != nil {
 			return bCastHeads, err
 		}
+		// The broadcast does not include the height of the
+		// head as this is obtained from the delta, once it is fetched.
 		h := Head{Cid: c}
 		h.DAGName = protoHead.GetDagName()
-		bCastHeads[i] = h
+		bCastHeads[h.DAGName] = append(bCastHeads[h.DAGName], h)
 	}
 	return bCastHeads, nil
 }
@@ -507,14 +578,15 @@ func (store *Datastore) encodeBroadcast(ctx context.Context, heads []Head) ([]by
 func randomizeInterval(d time.Duration) time.Duration {
 	// 30% of the configured interval
 	leeway := (d * 30 / 100)
-	// A random number between -leeway|+leeway
+	// A random number between -leeway|+leeway.
 	randGen := rand.New(rand.NewSource(time.Now().UnixNano()))
 	randomInterval := time.Duration(randGen.Int63n(int64(leeway*2))) - leeway
 	return d + randomInterval
 }
 
 func (store *Datastore) rebroadcast(ctx context.Context) {
-	timer := time.NewTimer(randomizeInterval(store.opts.RebroadcastInterval))
+	delay := randomizeInterval(store.opts.RebroadcastInterval)
+	timer := time.NewTimer(delay)
 
 	for {
 		select {
@@ -525,7 +597,41 @@ func (store *Datastore) rebroadcast(ctx context.Context) {
 			return
 		case <-timer.C:
 			store.rebroadcastHeads(ctx)
-			timer.Reset(randomizeInterval(store.opts.RebroadcastInterval))
+			delay := randomizeInterval(store.opts.RebroadcastInterval)
+			timer.Reset(delay)
+		}
+	}
+}
+
+func (store *Datastore) broadcastHeadsBatch(ctx context.Context) {
+	if store.opts.BroadcastBatchDelay == 0 {
+		return
+	}
+
+	t := time.NewTimer(store.opts.BroadcastBatchDelay)
+	var heads []Head
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case newHeads := <-store.broadcastBatchCh:
+			heads = append(heads, newHeads...)
+		case <-t.C:
+			store.logger.Debugf("broadcasting heads batch %s", heads)
+
+			bcastBytes, err := store.encodeBroadcast(ctx, heads)
+			if err != nil {
+				store.logger.Errorf("error encoding heads batch%s: %w", heads, err)
+			} else {
+
+				err = store.broadcaster.Broadcast(ctx, bcastBytes)
+				if err != nil {
+					store.logger.Errorf("error broadcasting heads batch%s: %w", heads, err)
+				}
+			}
+
+			heads = nil
+			t.Reset(store.opts.BroadcastBatchDelay)
 		}
 	}
 }
@@ -557,7 +663,10 @@ func (store *Datastore) repair(ctx context.Context) {
 	}
 }
 
-// regularly send out a list of heads that we have not recently seen
+// regularly send out a list of heads that we have not recently seen.
+// If we have seen heads during our randomized rebroadcastInterval, it
+// means someone else has broadcasted them. Otherwise, the others
+// might not have these heads we we need to broadcast them.
 func (store *Datastore) rebroadcastHeads(ctx context.Context) {
 	// Get our current list of heads
 	heads, _, err := store.heads.List(ctx)
@@ -586,7 +695,7 @@ func (store *Datastore) rebroadcastHeads(ctx context.Context) {
 
 	// Reset the map
 	store.seenHeadsMux.Lock()
-	store.seenHeads = make(map[cid.Cid]struct{})
+	clear(store.seenHeads)
 	store.seenHeadsMux.Unlock()
 }
 
@@ -1427,6 +1536,14 @@ func (store *Datastore) broadcast(ctx context.Context, heads []Head) error {
 	default:
 	}
 
+	if store.opts.BroadcastBatchDelay > 0 {
+		select {
+		case store.broadcastBatchCh <- heads:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	store.logger.Debugf("broadcasting %s", heads)
 
 	bcastBytes, err := store.encodeBroadcast(ctx, heads)
@@ -1680,7 +1797,7 @@ func (store *Datastore) InternalStats(ctx context.Context) Stats {
 	return Stats{
 		Heads:      heads,
 		MaxHeight:  height,
-		QueuedJobs: len(store.jobQueue),
+		QueuedJobs: len(store.jobQueue), // capacity: numWorkers
 	}
 }
 
