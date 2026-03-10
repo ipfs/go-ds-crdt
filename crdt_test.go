@@ -1313,24 +1313,40 @@ func TestCRDTBatchBroadcast(t *testing.T) {
 	}
 	replica.broadcaster = mb
 
-	// Performs 3 updates
+	// publish one delta for dag1
 	k1 := ds.RandomKey()
 	v1 := []byte("value1")
-	err := replica.Put(ctx, k1, v1)
+	delta1, err := replica.set.Add(ctx, k1.String(), v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta1.SetDagName("dag1")
+	_, err = replica.publish(ctx, delta1)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	// publish 2 deltas for dag2
 	k2 := ds.RandomKey()
 	v2 := []byte("value2")
-	err = replica.Put(ctx, k2, v2)
+	delta2, err := replica.set.Add(ctx, k2.String(), v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta2.SetDagName("dag2")
+	_, err = replica.publish(ctx, delta2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	k3 := ds.RandomKey()
 	v3 := []byte("value3")
-	err = replica.Put(ctx, k3, v3)
+	delta3, err := replica.set.Add(ctx, k3.String(), v3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta3.SetDagName("dag2")
+	_, err = replica.publish(ctx, delta3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1345,13 +1361,14 @@ func TestCRDTBatchBroadcast(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Should have one DAG with 3 heads (all from the same DAG)
+	// Should have one DAG with 2 heads since the last update in
+	// "dag2" replaced the previous head as it became a child.
 	var totalHeads int
 	for _, headList := range heads {
 		totalHeads += len(headList)
 	}
 
-	if totalHeads != 3 {
-		t.Errorf("Expected 3 heads in broadcast, got %d", totalHeads)
+	if totalHeads != 2 {
+		t.Errorf("Expected 2 heads in broadcast, got %d", totalHeads)
 	}
 }

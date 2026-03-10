@@ -226,7 +226,7 @@ type Datastore struct {
 
 	dagService       ipld.DAGService
 	broadcaster      Broadcaster
-	broadcastBatchCh chan []Head
+	broadcastBatchCh chan broadcastBatchHead
 
 	seenHeadsMux sync.RWMutex
 	seenHeads    map[cid.Cid]struct{}
@@ -251,6 +251,11 @@ type dagJob struct {
 	delta      Delta           // the current delta
 	node       ipld.Node       // the current ipld Node
 
+}
+
+type broadcastBatchHead struct {
+	head     Head
+	children []Head
 }
 
 // New returns a Merkle-CRDT-based Datastore using the given one to persist
@@ -333,7 +338,7 @@ func New(
 		heads:            heads,
 		dagService:       dagSyncer,
 		broadcaster:      bcast,
-		broadcastBatchCh: make(chan []Head, 1),
+		broadcastBatchCh: make(chan broadcastBatchHead, 1),
 		seenHeads:        make(map[cid.Cid]struct{}),
 		jobQueue:         make(chan *dagJob, opts.NumWorkers),
 		sendJobs:         make(chan *dagJob),
@@ -381,7 +386,7 @@ func New(
 	}()
 	go func() {
 		defer dstore.wg.Done()
-		dstore.broadcastHeadsBatch(ctx)
+		dstore.broadcastBatchWorker(ctx)
 	}()
 
 	go func() {
@@ -566,6 +571,9 @@ func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) (map[s
 func (store *Datastore) encodeBroadcast(ctx context.Context, heads []Head) ([]byte, error) {
 	bcastData := pb.CRDTBroadcast{}
 	for _, h := range heads {
+		if h.Cid == cid.Undef {
+			continue
+		}
 		bcastData.Heads = append(bcastData.Heads, &pb.Head{
 			Cid:     h.Cid.Bytes(),
 			DagName: h.DAGName,
@@ -603,7 +611,7 @@ func (store *Datastore) rebroadcast(ctx context.Context) {
 	}
 }
 
-func (store *Datastore) broadcastHeadsBatch(ctx context.Context) {
+func (store *Datastore) broadcastBatchWorker(ctx context.Context) {
 	if store.opts.BroadcastBatchDelay == 0 {
 		return
 	}
@@ -614,22 +622,41 @@ func (store *Datastore) broadcastHeadsBatch(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case newHeads := <-store.broadcastBatchCh:
-			heads = append(heads, newHeads...)
-		case <-t.C:
-			store.logger.Debugf("broadcasting heads batch %s", heads)
+		case batchHead := <-store.broadcastBatchCh:
+			children := batchHead.children
+			head := batchHead.head
 
-			bcastBytes, err := store.encodeBroadcast(ctx, heads)
-			if err != nil {
-				store.logger.Errorf("error encoding heads batch%s: %w", heads, err)
-			} else {
-
-				err = store.broadcaster.Broadcast(ctx, bcastBytes)
-				if err != nil {
-					store.logger.Errorf("error broadcasting heads batch%s: %w", heads, err)
+			// Remove children from heads
+			for _, child := range children {
+				for i, curHead := range heads {
+					if curHead.Cid.Equals(child.Cid) {
+						heads[i].Cid = cid.Undef
+					}
 				}
 			}
 
+			// Sweep to remove Cid.Undef-heads in-place.
+			// They would also be ignored by broadcastHeads
+			// so this is mostly cosmetic.
+			toI := 0
+			for fromI := 0; fromI < len(heads); fromI++ {
+				if heads[fromI].Cid != cid.Undef {
+					if toI != fromI {
+						heads[toI] = heads[fromI]
+					}
+					toI++
+				}
+			}
+			heads = heads[:toI]
+
+			// append the new head
+			heads = append(heads, head)
+		case <-t.C:
+			// fixme ctx heads delta
+			err := store.broadcastHeads(ctx, heads)
+			if err != nil {
+				store.logger.Errorf("error broadcasting heads batch%s: %w", heads, err)
+			}
 			heads = nil
 			t.Reset(store.opts.BroadcastBatchDelay)
 		}
@@ -688,7 +715,7 @@ func (store *Datastore) rebroadcastHeads(ctx context.Context) {
 	store.seenHeadsMux.RUnlock()
 
 	// Send them out
-	err = store.broadcast(ctx, headsToBroadcast)
+	err = store.broadcastHeads(ctx, headsToBroadcast)
 	if err != nil {
 		store.logger.Warn("broadcast failed: %v", err)
 	}
@@ -1458,22 +1485,24 @@ func (store *Datastore) publish(ctx context.Context, delta Delta) (Head, error) 
 		return Head{}, nil
 	}
 
-	head, err := store.addDAGNode(ctx, delta)
+	head, children, err := store.addDAGNode(ctx, delta)
 	if err != nil {
 		return Head{}, err
 	}
 
-	if err := store.broadcast(ctx, []Head{head}); err != nil {
+	if err := store.broadcast(ctx, head, children); err != nil {
 		return Head{}, err
 	}
 	return head, nil
 }
 
-func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, error) {
+// addDAGNode creates a block with the given delta and returns the new
+// head and the heads it replaced.
+func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, []Head, error) {
 	dagName := delta.GetDagName()
 	heads, height, err := store.heads.ListDAG(ctx, dagName)
 	if err != nil {
-		return Head{}, fmt.Errorf("error listing heads: %w", err)
+		return Head{}, nil, fmt.Errorf("error listing heads: %w", err)
 	}
 	height = height + 1 // This implies our minimum height is 1
 	delta.SetPriority(height)
@@ -1484,7 +1513,7 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, erro
 
 	nd, err := store.putBlock(ctx, heads, delta)
 	if err != nil {
-		return Head{}, err
+		return Head{}, nil, err
 	}
 
 	newHead := Head{Cid: nd.Cid()}
@@ -1512,39 +1541,21 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, erro
 		// to custom delta errors on GetElement(). Those
 		// should just abort merging, and not mark the whole
 		// datastore dirty.
-		return newHead, fmt.Errorf("error processing new block: %w", err)
+		return newHead, nil, fmt.Errorf("error processing new block: %w", err)
 	}
 	if len(children) != 0 {
 		store.logger.Warnf("bug: created a block to unknown children")
 	}
 
-	return newHead, nil
+	return newHead, heads, nil
 }
 
-func (store *Datastore) broadcast(ctx context.Context, heads []Head) error {
-	if store.broadcaster == nil { // offline
-		return nil
-	}
+func (store *Datastore) broadcastHeads(ctx context.Context, heads []Head) error {
+	store.logger.Debugf("broadcasting %s", heads)
 
 	if len(heads) == 0 { // nothing to rebroadcast
 		return nil
 	}
-
-	select {
-	case <-ctx.Done():
-		store.logger.Debugf("skipping broadcast: %s", ctx.Err())
-	default:
-	}
-
-	if store.opts.BroadcastBatchDelay > 0 {
-		select {
-		case store.broadcastBatchCh <- heads:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	store.logger.Debugf("broadcasting %s", heads)
 
 	bcastBytes, err := store.encodeBroadcast(ctx, heads)
 	if err != nil {
@@ -1556,6 +1567,33 @@ func (store *Datastore) broadcast(ctx context.Context, heads []Head) error {
 		return fmt.Errorf("error broadcasting %s: %w", heads, err)
 	}
 	return nil
+}
+
+func (store *Datastore) broadcast(ctx context.Context, head Head, children []Head) error {
+	if store.broadcaster == nil { // offline
+		return nil
+	}
+
+	if head.Cid == cid.Undef { // nothing to rebroadcast
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		store.logger.Debugf("skipping broadcast: %s", ctx.Err())
+	default:
+	}
+
+	if store.opts.BroadcastBatchDelay > 0 {
+		select {
+		case store.broadcastBatchCh <- broadcastBatchHead{head: head, children: children}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return store.broadcastHeads(ctx, []Head{head})
 }
 
 type batch struct {
