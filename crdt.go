@@ -549,7 +549,7 @@ func (store *Datastore) decodeBroadcast(ctx context.Context, data []byte) (map[s
 		}
 		store.logger.Debugf("a legacy CID broadcast was received for: %s", c)
 		return map[string][]Head{
-			"": []Head{{Cid: c}},
+			"": {{Cid: c}},
 		}, nil
 	}
 
