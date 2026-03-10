@@ -444,7 +444,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 		}
 
 		processHead := func(ctx context.Context, h Head) {
-			err = store.handleBlock(ctx, h) //handleBlock blocks
+			err := store.handleBlock(ctx, h) //handleBlock blocks
 			if err != nil {
 				store.logger.Errorf("error processing new head: %s", err)
 				// For posterity: do not mark the store as

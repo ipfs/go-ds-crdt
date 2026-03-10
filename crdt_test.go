@@ -101,9 +101,9 @@ type mockBroadcaster struct {
 	t        testing.TB
 }
 
-func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFunc) {
+func newBroadcasters(t testing.TB, n int) ([]Broadcaster, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	broadcasters := make([]*mockBroadcaster, n)
+	broadcasters := make([]Broadcaster, n)
 	chans := make([]chan []byte, n)
 	for i := range chans {
 		dropP := &atomic.Int64{}
@@ -216,7 +216,11 @@ func makeStore(t testing.TB, i int) ds.Datastore {
 }
 
 func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
-	bcasts, bcastCancel := newBroadcasters(t, n)
+	bcasts, cancel := newBroadcasters(t, n)
+	return makeNReplicasWithBroadcasters(t, n, opts, bcasts, cancel)
+}
+
+func makeNReplicasWithBroadcasters(t testing.TB, n int, opts *Options, bcasts []Broadcaster, cancelBcasts context.CancelFunc) ([]*Datastore, func()) {
 	bs := mdutils.Bserv()
 	dagserv := merkledag.NewDAGService(bs)
 
@@ -267,7 +271,7 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 	}
 
 	closeReplicas := func() {
-		bcastCancel()
+		cancelBcasts()
 		for i, r := range replicas {
 			err := r.Close()
 			if err != nil {
@@ -1287,12 +1291,15 @@ func TestCRDTLenDag(t *testing.T) {
 
 type memoryBroadcaster struct {
 	Broadcaster
-	last []byte
+	last  []byte
+	ready chan struct{}
 }
 
 func (mb *memoryBroadcaster) Next(ctx context.Context) ([]byte, error) {
 	b, err := mb.Broadcaster.Next(ctx)
-	mb.last = b
+	mb.last = make([]byte, len(b))
+	copy(mb.last, b)
+	close(mb.ready)
 	return b, err
 }
 
@@ -1302,16 +1309,17 @@ func TestCRDTBatchBroadcast(t *testing.T) {
 	// sets the BroadcastBatchDelay to 1 second
 	opts.BroadcastBatchDelay = 500 * time.Millisecond
 
+	bcaster, cancel := newBroadcasters(t, 1)
+	mb := &memoryBroadcaster{
+		Broadcaster: bcaster[0],
+		ready:       make(chan struct{}),
+	}
+
 	// makes 1 replica
-	replicas, closeReplicas := makeNReplicas(t, 1, opts)
+	replicas, closeReplicas := makeNReplicasWithBroadcasters(t, 1, opts, []Broadcaster{mb}, cancel)
 	defer closeReplicas()
 	replica := replicas[0]
 	ctx := context.Background()
-
-	mb := &memoryBroadcaster{
-		Broadcaster: replica.broadcaster,
-	}
-	replica.broadcaster = mb
 
 	// publish one delta for dag1
 	k1 := ds.RandomKey()
@@ -1351,8 +1359,8 @@ func TestCRDTBatchBroadcast(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(time.Second)
-	// obtain the last broadcast
+	// wait for Next() to be called
+	<-mb.ready
 	data := mb.last
 
 	// calls decodeBroadcast on the response and verifies that there are 3 heads in the response
