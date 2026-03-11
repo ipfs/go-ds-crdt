@@ -442,13 +442,18 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			// the same broadcast in parallel, but do not process
 			// heads from multiple broadcasts in parallel.
 			if store.opts.MultiHeadProcessing {
-				go processHead(ctx, head)
+				go func(h Head) {
+					processHead(ctx, h)
+					store.seenHeadsMux.Lock()
+					store.seenHeads[h.Cid] = struct{}{}
+					store.seenHeadsMux.Unlock()
+				}(head)
 			} else {
 				processHead(ctx, head)
+				store.seenHeadsMux.Lock()
+				store.seenHeads[head.Cid] = struct{}{}
+				store.seenHeadsMux.Unlock()
 			}
-			store.seenHeadsMux.Lock()
-			store.seenHeads[head.Cid] = struct{}{}
-			store.seenHeadsMux.Unlock()
 		}
 
 		// TODO: We should store trusted-peer signatures associated to
