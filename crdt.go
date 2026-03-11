@@ -397,7 +397,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 		}
 
 		processHead := func(ctx context.Context, h Head) {
-			err = store.handleBlock(ctx, h) //handleBlock blocks
+			err = store.handleBlock(ctx, h) // handleBlock blocks
 			if err != nil {
 				store.logger.Errorf("error processing new head: %s", err)
 				// For posterity: do not mark the store as
@@ -438,21 +438,19 @@ func (store *Datastore) handleNext(ctx context.Context) {
 
 		// For each head, we process it.
 		for _, head := range bCastHeads {
+			// Mark the head as seen before processing it. This
+			// prevents re-broadcasting a head we have already
+			// received, regardless of whether processing succeeds.
+			store.seenHeadsMux.Lock()
+			store.seenHeads[head.Cid] = struct{}{}
+			store.seenHeadsMux.Unlock()
 			// A thing to try here would be to process heads in
 			// the same broadcast in parallel, but do not process
 			// heads from multiple broadcasts in parallel.
 			if store.opts.MultiHeadProcessing {
-				go func(h Head) {
-					processHead(ctx, h)
-					store.seenHeadsMux.Lock()
-					store.seenHeads[h.Cid] = struct{}{}
-					store.seenHeadsMux.Unlock()
-				}(head)
+				go processHead(ctx, head)
 			} else {
 				processHead(ctx, head)
-				store.seenHeadsMux.Lock()
-				store.seenHeads[head.Cid] = struct{}{}
-				store.seenHeadsMux.Unlock()
 			}
 		}
 
