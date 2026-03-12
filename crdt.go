@@ -338,7 +338,7 @@ func New(
 		heads:            heads,
 		dagService:       dagSyncer,
 		broadcaster:      bcast,
-		broadcastBatchCh: make(chan broadcastBatchHead, 1),
+		broadcastBatchCh: make(chan broadcastBatchHead, 32000),
 		seenHeads:        make(map[cid.Cid]struct{}),
 		jobQueue:         make(chan *dagJob, opts.NumWorkers),
 		sendJobs:         make(chan *dagJob),
@@ -458,46 +458,55 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			}
 		}
 
-		for dagName, heads := range receivedHeads {
-			// if we have no heads for the DAG name, make
-			// seen-heads heads immediately.  On a fresh
-			// start, this allows us to start building on
-			// top of recent heads, even if we have not
-			// fully synced rather than creating new
-			// orphan branches.
-			curHeadCount, err := store.heads.LenDAG(ctx, dagName)
-			if err != nil {
-				store.logger.Error(err)
-				continue
-			}
-			if curHeadCount == 0 {
-				dg := &crdtNodeGetter{NodeGetter: store.dagService}
-				for _, head := range heads {
-					// getPriority fetches the delta.
-					prio, err := store.getPriority(ctx, dg, head.Cid)
-					if err != nil {
-						store.logger.Error(err)
-						continue
-					}
-					head.Height = prio
-					err = store.heads.Add(ctx, head)
-					if err != nil {
-						store.logger.Error(err)
-					}
-				}
+		// markHeadsAsSeen asap so that we don't rebroadcast them.
+		for _, heads := range receivedHeads {
+			for _, head := range heads {
+				store.seenHeadsMux.Lock()
+				store.seenHeads[head.Cid] = struct{}{}
+				store.seenHeadsMux.Unlock()
 			}
 		}
 
-		// Send heads for processing. Each dagName is
-		// processed in parallel, and follows
-		// the MultiHeadProcessing configuration.
-		// If MultiHeadProcessing is false, this will wait until all
-		// dagNames heads have been processed.
 		var wg sync.WaitGroup
-		for _, heads := range receivedHeads {
-			wg.Add(1)
-			go func(heads []Head) {
+		wg.Add(len(receivedHeads))
+		for dagName, heads := range receivedHeads {
+			// Send heads for processing. Each dagName is
+			// processed in parallel, and follows the
+			// MultiHeadProcessing configuration.  If
+			// MultiHeadProcessing is false, this will
+			// wait until all dagNames heads have been
+			// processed.
+			go func(dagName string, heads []Head) {
 				defer wg.Done()
+
+				// if we have no heads for the DAG name, make
+				// seen-heads heads immediately.  On a fresh
+				// start, this allows us to start building on
+				// top of recent heads, even if we have not
+				// fully synced rather than creating new
+				// orphan branches.
+				curHeadCount, err := store.heads.LenDAG(ctx, dagName)
+				if err != nil {
+					store.logger.Error(err)
+					return
+				}
+				if curHeadCount == 0 {
+					dg := &crdtNodeGetter{NodeGetter: store.dagService}
+					for _, head := range heads {
+						// getPriority fetches the delta.
+						prio, err := store.getPriority(ctx, dg, head.Cid)
+						if err != nil {
+							store.logger.Error(err)
+							continue
+						}
+						head.Height = prio
+						err = store.heads.Add(ctx, head)
+						if err != nil {
+							store.logger.Error(err)
+						}
+					}
+				}
+
 				for _, head := range heads {
 					// A thing to try here would be to process heads in
 					// the same broadcast in parallel, but do not process
@@ -511,7 +520,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 					store.seenHeads[head.Cid] = struct{}{}
 					store.seenHeadsMux.Unlock()
 				}
-			}(heads)
+			}(dagName, heads)
 		}
 
 		// wait for all heads in all dagNames to be processed.
@@ -626,11 +635,13 @@ func (store *Datastore) broadcastBatchWorker(ctx context.Context) {
 			children := batchHead.children
 			head := batchHead.head
 
+			removed := false
 			// Remove children from heads
 			for _, child := range children {
 				for i, curHead := range heads {
 					if curHead.Cid.Equals(child.Cid) {
 						heads[i].Cid = cid.Undef
+						removed = true
 					}
 				}
 			}
@@ -638,24 +649,25 @@ func (store *Datastore) broadcastBatchWorker(ctx context.Context) {
 			// Sweep to remove Cid.Undef-heads in-place.
 			// They would also be ignored by broadcastHeads
 			// so this is mostly cosmetic.
-			toI := 0
-			for fromI := 0; fromI < len(heads); fromI++ {
-				if heads[fromI].Cid != cid.Undef {
-					if toI != fromI {
-						heads[toI] = heads[fromI]
+			if removed { // skip unless necessary.
+				toI := 0
+				for fromI := 0; fromI < len(heads); fromI++ {
+					if heads[fromI].Cid != cid.Undef {
+						if toI != fromI {
+							heads[toI] = heads[fromI]
+						}
+						toI++
 					}
-					toI++
 				}
+				heads = heads[:toI]
 			}
-			heads = heads[:toI]
 
 			// append the new head
 			heads = append(heads, head)
 		case <-t.C:
-			// fixme ctx heads delta
 			err := store.broadcastHeads(ctx, heads)
 			if err != nil {
-				store.logger.Errorf("error broadcasting heads batch%s: %w", heads, err)
+				store.logger.Errorf("error broadcasting heads batch %s: %w", heads, err)
 			}
 			heads = nil
 			t.Reset(store.opts.BroadcastBatchDelay)
@@ -1569,6 +1581,8 @@ func (store *Datastore) broadcastHeads(ctx context.Context, heads []Head) error 
 	return nil
 }
 
+// broadcast calls broadcastHeads directly or batches the the Head when
+// BroadcastBatchDelay is enabled.
 func (store *Datastore) broadcast(ctx context.Context, head Head, children []Head) error {
 	if store.broadcaster == nil { // offline
 		return nil
@@ -1581,16 +1595,24 @@ func (store *Datastore) broadcast(ctx context.Context, head Head, children []Hea
 	select {
 	case <-ctx.Done():
 		store.logger.Debugf("skipping broadcast: %s", ctx.Err())
+		return ctx.Err()
 	default:
 	}
 
 	if store.opts.BroadcastBatchDelay > 0 {
-		select {
-		case store.broadcastBatchCh <- broadcastBatchHead{head: head, children: children}:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		go func() {
+			for {
+				select {
+				case store.broadcastBatchCh <- broadcastBatchHead{head: head, children: children}:
+					return
+				case <-ctx.Done():
+					return
+				default:
+					store.logger.Error("broadcastBatch channel is full! Batch broadcasting is too slow for number of heads received. Retrying...")
+				}
+			}
+		}()
+		return nil
 	}
 
 	return store.broadcastHeads(ctx, []Head{head})
