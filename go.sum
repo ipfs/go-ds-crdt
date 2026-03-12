@@ -260,8 +260,8 @@ github.com/ipfs/go-detect-race v0.0.1 h1:qX/xay2W3E4Q1U7d9lNs1sU9nvguX0a7319XbyQ
 github.com/ipfs/go-detect-race v0.0.1/go.mod h1:8BNT7shDZPo99Q74BpGMK+4D8Mn4j46UU0LZ723meps=
 github.com/ipfs/go-ds-leveldb v0.5.2 h1:6nmxlQ2zbp4LCNdJVsmHfs9GP0eylfBNxpmY1csp0x0=
 github.com/ipfs/go-ds-leveldb v0.5.2/go.mod h1:2fAwmcvD3WoRT72PzEekHBkQmBDhc39DJGoREiuGmYo=
-github.com/ipfs/go-ds-pebble v0.5.9 h1:D1FEuMxjbEmDADNqsyT74n9QHVAn12nv9i9Qa15AFYc=
-github.com/ipfs/go-ds-pebble v0.5.9/go.mod h1:XmUBN05l6B+tMg7mpMS75ZcKW/CX01uZMhhWw85imQA=
+github.com/ipfs/go-ds-pebble v0.5.10 h1:MsSPrq4ubtaWGaIvdE5+L227wEaoxs7nWEb6+lKojNE=
+github.com/ipfs/go-ds-pebble v0.5.10/go.mod h1:ShbyLsills0WD9TJavOHu7uEDj/LwDW1WW91G4+W4X8=
 github.com/ipfs/go-dsqueue v0.2.0 h1:MBi9w3oSiX98Xc+Y7NuJ9G8MI6mAT4IGdO9dHEMCZzU=
 github.com/ipfs/go-dsqueue v0.2.0/go.mod h1:8FfNQC4DMF/KkzBXRNB9Rb3MKDW0Sh98HMtXYl1mLQE=
 github.com/ipfs/go-ipfs-delay v0.0.1 h1:r/UXYyRcddO6thwOnhiznIAiSvxMECGgtv35Xs1IeRQ=
