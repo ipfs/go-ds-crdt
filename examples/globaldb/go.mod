@@ -7,7 +7,7 @@ require (
 	github.com/ipfs/boxo v0.37.0
 	github.com/ipfs/go-datastore v0.9.1
 	github.com/ipfs/go-ds-crdt v0.6.5
-	github.com/ipfs/go-ds-pebble v0.5.9
+	github.com/ipfs/go-ds-pebble v0.5.10
 	github.com/ipfs/go-log/v2 v2.9.1
 	github.com/libp2p/go-libp2p v0.47.0
 	github.com/libp2p/go-libp2p-pubsub v0.15.0
