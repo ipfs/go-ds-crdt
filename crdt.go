@@ -1600,18 +1600,13 @@ func (store *Datastore) broadcast(ctx context.Context, head Head, children []Hea
 	}
 
 	if store.opts.BroadcastBatchDelay > 0 {
-		go func() {
-			for {
-				select {
-				case store.broadcastBatchCh <- broadcastBatchHead{head: head, children: children}:
-					return
-				case <-ctx.Done():
-					return
-				default:
-					store.logger.Error("broadcastBatch channel is full! Batch broadcasting is too slow for number of heads received. Retrying...")
-				}
-			}
-		}()
+		select {
+		case store.broadcastBatchCh <- broadcastBatchHead{head: head, children: children}:
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			store.logger.Error("broadcastBatch channel is full! Batch broadcasting is too slow for number of heads received.")
+		}
 		return nil
 	}
 

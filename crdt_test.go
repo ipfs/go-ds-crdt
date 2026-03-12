@@ -1291,28 +1291,37 @@ func TestCRDTLenDag(t *testing.T) {
 
 type memoryBroadcaster struct {
 	Broadcaster
-	last  []byte
-	ready chan struct{}
+	last chan []byte
 }
 
 func (mb *memoryBroadcaster) Next(ctx context.Context) ([]byte, error) {
 	b, err := mb.Broadcaster.Next(ctx)
-	mb.last = make([]byte, len(b))
-	copy(mb.last, b)
-	close(mb.ready)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case mb.last <- b:
+	}
 	return b, err
+}
+
+func (mb *memoryBroadcaster) Last() []byte {
+	last := <-mb.last
+	return last
 }
 
 func TestCRDTBatchBroadcast(t *testing.T) {
 	// makes DefaultOptions
 	opts := DefaultOptions()
 	// sets the BroadcastBatchDelay to 1 second
-	opts.BroadcastBatchDelay = 500 * time.Millisecond
+	opts.BroadcastBatchDelay = 250 * time.Millisecond
 
 	bcaster, cancel := newBroadcasters(t, 1)
 	mb := &memoryBroadcaster{
 		Broadcaster: bcaster[0],
-		ready:       make(chan struct{}),
+		last:        make(chan []byte),
 	}
 
 	// makes 1 replica
@@ -1360,8 +1369,7 @@ func TestCRDTBatchBroadcast(t *testing.T) {
 	}
 
 	// wait for Next() to be called
-	<-mb.ready
-	data := mb.last
+	data := mb.Last()
 
 	// calls decodeBroadcast on the response and verifies that there are 3 heads in the response
 	heads, err := replica.decodeBroadcast(ctx, data)
@@ -1377,6 +1385,6 @@ func TestCRDTBatchBroadcast(t *testing.T) {
 	}
 
 	if totalHeads != 2 {
-		t.Errorf("Expected 2 heads in broadcast, got %d", totalHeads)
+		t.Errorf("Expected 2 heads in broadcast, got %d: %s", totalHeads, heads)
 	}
 }
