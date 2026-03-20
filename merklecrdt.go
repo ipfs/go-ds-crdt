@@ -10,6 +10,104 @@ import (
 	ipld "github.com/ipfs/go-ipld-format"
 )
 
+// PurgeDAG removes all state associated with a named DAG: its heads, all DAG
+// blocks reachable from those heads, the set entries created by those blocks,
+// and processed block markers. Returns the number of DAG nodes removed.
+//
+// The caller must ensure no concurrent writes to this dagName during purge.
+// The Datastore's background workers (rebroadcast, repair, DAG walking) also
+// access heads and set state — callers should either Close() the Datastore
+// first or ensure the dagName is not being actively synced.
+func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, error) {
+	deletedHeads, err := mcrdt.heads.DeleteDAG(ctx, dagName)
+	if err != nil {
+		return 0, err
+	}
+	if len(deletedHeads) == 0 {
+		return 0, nil
+	}
+
+	headCIDs := make([]cid.Cid, len(deletedHeads))
+	for i, h := range deletedHeads {
+		headCIDs[i] = h.Cid
+	}
+
+	dagCIDSet := make(map[cid.Cid]struct{})
+	setKeys := make(map[string]struct{})
+
+	if err := mcrdt.TraverseWithOptions(ctx, headCIDs, func(nd ipld.Node) error {
+		c := nd.Cid()
+		if _, seen := dagCIDSet[c]; seen {
+			return nil
+		}
+		dagCIDSet[c] = struct{}{}
+
+		deltaBytes, err := extractDelta(nd)
+		if err != nil {
+			return err
+		}
+		delta := mcrdt.newDelta()
+		if err := delta.Unmarshal(deltaBytes); err != nil {
+			return err
+		}
+
+		elems, err := delta.GetElements()
+		if err != nil {
+			return err
+		}
+		for _, e := range elems {
+			setKeys[e.GetKey()] = struct{}{}
+		}
+
+		tombs, err := delta.GetTombstones()
+		if err != nil {
+			return err
+		}
+		for _, t := range tombs {
+			setKeys[t.GetKey()] = struct{}{}
+		}
+		return nil
+	}, TraverseOptions{DisableSkipDuplicates: true}); err != nil {
+		return 0, err
+	}
+
+	for key := range setKeys {
+		if err := mcrdt.set.PurgeKeyBlocks(ctx, key, dagCIDSet); err != nil {
+			return 0, err
+		}
+	}
+
+	dagCIDs := make([]cid.Cid, 0, len(dagCIDSet))
+	for c := range dagCIDSet {
+		dagCIDs = append(dagCIDs, c)
+	}
+
+	var store ds.Write = mcrdt.store
+	batchingDs, batching := store.(ds.Batching)
+	if batching {
+		store, err = batchingDs.Batch(ctx)
+		if err != nil {
+			return 0, err
+		}
+	}
+	for _, c := range dagCIDs {
+		if err := store.Delete(ctx, mcrdt.processedBlockKey(c)); err != nil {
+			return 0, err
+		}
+	}
+	if batching {
+		if err := store.(ds.Batch).Commit(ctx); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := mcrdt.dagService.RemoveMany(ctx, dagCIDs); err != nil {
+		return 0, err
+	}
+
+	return len(dagCIDs), nil
+}
+
 // DatatstoreNamespaces carries configuration for how internal namespaces are named.
 type InternalNamespaces struct {
 	Heads           string
@@ -43,7 +141,6 @@ func NewMerkleCRDT(
 	opts *Options,
 	internalOptions *MerkleCRDTOptions,
 ) (*MerkleCRDT, error) {
-
 	if opts == nil {
 		opts = DefaultOptions()
 	}
@@ -104,12 +201,30 @@ func (mcrdt *MerkleCRDT) IsProcessed(ctx context.Context, c cid.Cid) (bool, erro
 	return mcrdt.isProcessed(ctx, c)
 }
 
+// TraverseOptions configures the behavior of Traverse and TraverseWithOptions.
+type TraverseOptions struct {
+	// DisableSkipDuplicates disables the built-in duplicate tracking in the
+	// traversal library. Callers that maintain their own visited set can
+	// use this to avoid keeping two copies of every CID in memory.
+	DisableSkipDuplicates bool
+}
+
 // Traverse visits nodes in the Merkle-CRDT tree. It skips duplicates
 // and calls the visit function with the Deltas extracted from every
 // node. An error results in the traversal operations being aborted.
 func (mcrdt *MerkleCRDT) Traverse(ctx context.Context,
 	from []cid.Cid,
 	visit func(ipld.Node) error,
+) error {
+	return mcrdt.TraverseWithOptions(ctx, from, visit, TraverseOptions{})
+}
+
+// TraverseWithOptions is like Traverse but accepts a TraverseOptions to
+// configure traversal behavior.
+func (mcrdt *MerkleCRDT) TraverseWithOptions(ctx context.Context,
+	from []cid.Cid,
+	visit func(ipld.Node) error,
+	opts TraverseOptions,
 ) error {
 	if len(from) == 0 {
 		return errors.New("no roots to traverse from")
@@ -155,13 +270,13 @@ func (mcrdt *MerkleCRDT) Traverse(ctx context.Context,
 		ignoreCid = root.Cid() // tFunc will skip this.
 	}
 
-	opts := traverse.Options{
+	travOpts := traverse.Options{
 		DAG:            mcrdt.dagService,
 		Order:          traverse.DFSPre, // default
 		Func:           tFunc,
 		ErrFunc:        tErrFunc,
-		SkipDuplicates: true,
+		SkipDuplicates: !opts.DisableSkipDuplicates,
 	}
 
-	return traverse.Traverse(root, opts)
+	return traverse.Traverse(root, travOpts)
 }
