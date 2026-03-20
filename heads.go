@@ -24,6 +24,7 @@ type Heads interface {
 	Add(ctx context.Context, head Head) error
 	List(ctx context.Context) ([]Head, uint64, error)
 	ListDAG(ctx context.Context, dagName string) ([]Head, uint64, error)
+	DeleteDAG(ctx context.Context, dagName string) ([]Head, error)
 }
 
 type Head struct {
@@ -229,6 +230,48 @@ func (hh *heads) List(ctx context.Context) ([]Head, uint64, error) {
 
 func (hh *heads) ListDAG(ctx context.Context, dagName string) ([]Head, uint64, error) {
 	return hh.list(ctx, dagName, true)
+}
+
+// DeleteDAG removes all heads for the given dagName and returns them. The
+// returned heads can be used as traversal roots to remove associated DAG
+// blocks and set entries.
+func (hh *heads) DeleteDAG(ctx context.Context, dagName string) ([]Head, error) {
+	hh.cacheMux.Lock()
+	defer hh.cacheMux.Unlock()
+
+	var store ds.Write = hh.store
+	batchingDs, batching := store.(ds.Batching)
+	var err error
+	if batching {
+		store, err = batchingDs.Batch(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var deleted []Head
+	for c, hv := range hh.cache {
+		if hv.DAGName != dagName {
+			continue
+		}
+		h := Head{Cid: c, HeadValue: hv}
+		if err := hh.delete(ctx, store, h); err != nil {
+			return nil, err
+		}
+		deleted = append(deleted, h)
+	}
+
+	if batching {
+		if err := store.(ds.Batch).Commit(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, h := range deleted {
+		delete(hh.cache, h.Cid)
+	}
+
+	return deleted, nil
 }
 
 // primeCache builds the heads cache based on what's in storage; since
