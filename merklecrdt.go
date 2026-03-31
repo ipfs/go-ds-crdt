@@ -237,30 +237,12 @@ func (mcrdt *MerkleCRDT) IsProcessed(ctx context.Context, c cid.Cid) (bool, erro
 	return mcrdt.isProcessed(ctx, c)
 }
 
-// TraverseOptions configures the behavior of Traverse and TraverseWithOptions.
-type TraverseOptions struct {
-	// DisableSkipDuplicates disables the built-in duplicate tracking in the
-	// traversal library. Callers that maintain their own visited set can
-	// use this to avoid keeping two copies of every CID in memory.
-	DisableSkipDuplicates bool
-}
-
 // Traverse visits nodes in the Merkle-CRDT tree. It skips duplicates
 // and calls the visit function with the Deltas extracted from every
 // node. An error results in the traversal operations being aborted.
 func (mcrdt *MerkleCRDT) Traverse(ctx context.Context,
 	from []cid.Cid,
 	visit func(ipld.Node) error,
-) error {
-	return mcrdt.TraverseWithOptions(ctx, from, visit, TraverseOptions{})
-}
-
-// TraverseWithOptions is like Traverse but accepts a TraverseOptions to
-// configure traversal behavior.
-func (mcrdt *MerkleCRDT) TraverseWithOptions(ctx context.Context,
-	from []cid.Cid,
-	visit func(ipld.Node) error,
-	opts TraverseOptions,
 ) error {
 	if len(from) == 0 {
 		return errors.New("no roots to traverse from")
@@ -306,13 +288,13 @@ func (mcrdt *MerkleCRDT) TraverseWithOptions(ctx context.Context,
 		ignoreCid = root.Cid() // tFunc will skip this.
 	}
 
-	travOpts := traverse.Options{
+	opts := traverse.Options{
 		DAG:            mcrdt.dagService,
 		Order:          traverse.DFSPre, // default
 		Func:           tFunc,
 		ErrFunc:        tErrFunc,
-		SkipDuplicates: !opts.DisableSkipDuplicates,
+		SkipDuplicates: true,
 	}
 
-	return traverse.Traverse(root, travOpts)
+	return traverse.Traverse(root, opts)
 }
