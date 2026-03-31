@@ -47,25 +47,44 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 	)
 	setKeys := make(map[string]purgeKeyKind)
 
-	if err := mcrdt.TraverseWithOptions(ctx, headCIDs, func(nd ipld.Node) error {
-		c := nd.Cid()
+	// Walk the DAG with a local-only DFS: check isProcessed before fetching each
+	// block so we never trigger network requests. Unprocessed blocks have no set
+	// state to clean up, so skipping them is correct.
+	stack := make([]cid.Cid, len(headCIDs))
+	copy(stack, headCIDs)
+	for len(stack) > 0 {
+		c := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
 		if _, seen := dagCIDSet[c]; seen {
-			return nil
+			continue
+		}
+		processed, err := mcrdt.isProcessed(ctx, c)
+		if err != nil {
+			return 0, err
+		}
+		if !processed {
+			continue
 		}
 		dagCIDSet[c] = struct{}{}
 
+		nd, err := mcrdt.dagService.Get(ctx, c)
+		if err != nil {
+			return 0, err
+		}
+
 		deltaBytes, err := extractDelta(nd)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		delta := mcrdt.newDelta()
 		if err := delta.Unmarshal(deltaBytes); err != nil {
-			return err
+			return 0, err
 		}
 
 		elems, err := delta.GetElements()
 		if err != nil {
-			return err
+			return 0, err
 		}
 		for _, e := range elems {
 			setKeys[e.GetKey()] |= purgeKeyElem
@@ -73,14 +92,15 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 
 		tombs, err := delta.GetTombstones()
 		if err != nil {
-			return err
+			return 0, err
 		}
 		for _, t := range tombs {
 			setKeys[t.GetKey()] |= purgeKeyTomb
 		}
-		return nil
-	}, TraverseOptions{DisableSkipDuplicates: true}); err != nil {
-		return 0, err
+
+		for _, link := range nd.Links() {
+			stack = append(stack, link.Cid)
+		}
 	}
 
 	for key, kind := range setKeys {
