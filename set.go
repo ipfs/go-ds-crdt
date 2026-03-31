@@ -702,11 +702,21 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 			if r.Error != nil {
 				return r.Error
 			}
-			id := strings.TrimPrefix(r.Key, prefix.String())
-			if !ds.RawKey(id).IsTopLevel() {
+			// Strip the query prefix to get the relative remainder, which for a
+			// direct child is just the block ID (a CID encoded as a datastore key
+			// string): "/namespace/s/foo/<blockID>" → "/<blockID>".
+			blockID := strings.TrimPrefix(r.Key, prefix.String())
+			// The prefix query also returns entries for child keys: prefix "foo"
+			// matches both "foo/<block>" and "foo/bar/<block>". After trimming, a
+			// direct child yields a top-level key "/<blockID>", while a grandchild
+			// yields "/bar/<blockID>". Reject the latter since it belongs to a
+			// different key.
+			if !ds.RawKey(blockID).IsTopLevel() {
 				continue
 			}
-			mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+			// Decode the datastore key back into a CID so we can look it up in the
+			// caller-supplied set.
+			mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(blockID))
 			if err != nil {
 				return err
 			}
@@ -714,7 +724,7 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 			if _, ok := blockCIDs[c]; !ok {
 				continue
 			}
-			if err := store.Delete(ctx, prefix.ChildString(id)); err != nil {
+			if err := store.Delete(ctx, prefix.ChildString(blockID)); err != nil {
 				return err
 			}
 		}
