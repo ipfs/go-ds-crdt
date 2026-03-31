@@ -14,21 +14,24 @@ import (
 // blocks reachable from those heads, the set entries created by those blocks,
 // and processed block markers. Returns the number of DAG nodes removed.
 //
+// Heads are deleted last so that a partial failure leaves them intact and a
+// subsequent call can resume the cleanup.
+//
 // The caller must ensure no concurrent writes to this dagName during purge.
 // The Datastore's background workers (rebroadcast, repair, DAG walking) also
 // access heads and set state — callers should either Close() the Datastore
 // first or ensure the dagName is not being actively synced.
 func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, error) {
-	deletedHeads, err := mcrdt.heads.DeleteDAG(ctx, dagName)
+	currentHeads, _, err := mcrdt.heads.ListDAG(ctx, dagName)
 	if err != nil {
 		return 0, err
 	}
-	if len(deletedHeads) == 0 {
+	if len(currentHeads) == 0 {
 		return 0, nil
 	}
 
-	headCIDs := make([]cid.Cid, len(deletedHeads))
-	for i, h := range deletedHeads {
+	headCIDs := make([]cid.Cid, len(currentHeads))
+	for i, h := range currentHeads {
 		headCIDs[i] = h.Cid
 	}
 
@@ -111,6 +114,10 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 	}
 
 	if err := mcrdt.dagService.RemoveMany(ctx, dagCIDs); err != nil {
+		return 0, err
+	}
+
+	if _, err := mcrdt.heads.DeleteDAG(ctx, dagName); err != nil {
 		return 0, err
 	}
 
