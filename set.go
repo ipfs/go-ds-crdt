@@ -410,7 +410,7 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 NEXT:
 	for r := range results.Next() {
 		if r.Error != nil {
-			return nil, 0, err
+			return nil, 0, r.Error
 		}
 
 		id := strings.TrimPrefix(r.Key, prefix.String())
@@ -746,6 +746,10 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		}
 	}
 
+	// The delete batch and the value/priority rewrite below are not atomic.
+	// A crash between them leaves a stale value key, but PurgeDAG is
+	// idempotent: a retry will skip the already-deleted entries and rewrite
+	// the value correctly.
 	if batching {
 		if err := store.(ds.Batch).Commit(ctx); err != nil {
 			return err
@@ -762,10 +766,10 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 	valueK := s.valueKey(key)
 	if bestVal == nil {
 		var errs []error
-		if err := s.store.Delete(ctx, valueK); err != nil && err != ds.ErrNotFound {
+		if err := s.store.Delete(ctx, valueK); err != nil && errors.Is(err, ds.ErrNotFound) {
 			errs = append(errs, err)
 		}
-		if err := s.store.Delete(ctx, s.priorityKey(key)); err != nil && err != ds.ErrNotFound {
+		if err := s.store.Delete(ctx, s.priorityKey(key)); err != nil && errors.Is(err, ds.ErrNotFound) {
 			errs = append(errs, err)
 		}
 		if err := errors.Join(errs...); err != nil {

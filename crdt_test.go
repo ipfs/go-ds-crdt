@@ -1417,8 +1417,7 @@ func makeNReplicasNoBcast(t testing.TB, n int, opts *Options) ([]*Datastore, fun
 	for i := range bcasts {
 		bcasts[i] = &nullBroadcaster{}
 	}
-	_, cancel := context.WithCancel(t.Context())
-	return makeNReplicasWithBroadcasters(t, n, opts, bcasts, cancel)
+	return makeNReplicasWithBroadcasters(t, n, opts, bcasts, func() {})
 }
 
 func TestPurgeDAG(t *testing.T) {
@@ -1494,7 +1493,7 @@ func TestPurgeDAG(t *testing.T) {
 
 	// Set entry for k1 (dag1 key) is gone.
 	_, err = replica.set.Element(ctx, k1.String())
-	if err != ds.ErrNotFound {
+	if !errors.Is(err, ds.ErrNotFound) {
 		t.Errorf("expected ErrNotFound for key1 after purge, got %v", err)
 	}
 
@@ -1566,7 +1565,7 @@ func TestPurgeDAGMixedKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The key should still exist with dag2's value.
+	// The key should still exist with dag1's value.
 	val, err := replica.set.Element(ctx, key)
 	if err != nil {
 		t.Fatalf("key should survive after purging dag2: %v", err)
@@ -1596,6 +1595,7 @@ func TestPurgeDAGCleanStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { replica.Close() })
 
 	mcrdt := MerkleCRDT{replica}
 

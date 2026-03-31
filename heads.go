@@ -24,7 +24,6 @@ type Heads interface {
 	Add(ctx context.Context, head Head) error
 	List(ctx context.Context) ([]Head, uint64, error)
 	ListDAG(ctx context.Context, dagName string) ([]Head, uint64, error)
-	DeleteDAG(ctx context.Context, dagName string) ([]Head, error)
 }
 
 type Head struct {
