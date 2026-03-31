@@ -673,7 +673,11 @@ func (s *set) inTombsKeyID(ctx context.Context, key, id string) (bool, error) {
 // were created by any of the given block CIDs. After removal, it recomputes
 // the best value from surviving elements. If no elements survive, the key's
 // value and priority are deleted.
-func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.Cid]struct{}) error {
+//
+// hasElems and hasTombs indicate which namespaces the DAG being purged
+// actually wrote entries for this key; passing false for either skips the
+// corresponding datastore query.
+func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.Cid]struct{}, hasElems, hasTombs bool) error {
 	s.putElemsMux.Lock()
 	defer s.putElemsMux.Unlock()
 
@@ -731,11 +735,15 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		return nil
 	}
 
-	if err := deleteMatchingIDs(s.elemsPrefix(key)); err != nil {
-		return err
+	if hasElems {
+		if err := deleteMatchingIDs(s.elemsPrefix(key)); err != nil {
+			return err
+		}
 	}
-	if err := deleteMatchingIDs(s.tombsPrefix(key)); err != nil {
-		return err
+	if hasTombs {
+		if err := deleteMatchingIDs(s.tombsPrefix(key)); err != nil {
+			return err
+		}
 	}
 
 	if batching {

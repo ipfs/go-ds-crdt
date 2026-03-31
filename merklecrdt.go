@@ -33,7 +33,16 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 	}
 
 	dagCIDSet := make(map[cid.Cid]struct{})
-	setKeys := make(map[string]struct{})
+
+	// purgeKeyKind tracks which namespaces a key appeared in across the DAG's
+	// deltas, so purgeKeyBlocks can skip querying namespaces that the DAG never
+	// wrote to for a given key.
+	type purgeKeyKind uint8
+	const (
+		purgeKeyElem purgeKeyKind = 1 << iota
+		purgeKeyTomb
+	)
+	setKeys := make(map[string]purgeKeyKind)
 
 	if err := mcrdt.TraverseWithOptions(ctx, headCIDs, func(nd ipld.Node) error {
 		c := nd.Cid()
@@ -56,7 +65,7 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 			return err
 		}
 		for _, e := range elems {
-			setKeys[e.GetKey()] = struct{}{}
+			setKeys[e.GetKey()] |= purgeKeyElem
 		}
 
 		tombs, err := delta.GetTombstones()
@@ -64,15 +73,15 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 			return err
 		}
 		for _, t := range tombs {
-			setKeys[t.GetKey()] = struct{}{}
+			setKeys[t.GetKey()] |= purgeKeyTomb
 		}
 		return nil
 	}, TraverseOptions{DisableSkipDuplicates: true}); err != nil {
 		return 0, err
 	}
 
-	for key := range setKeys {
-		if err := mcrdt.set.purgeKeyBlocks(ctx, key, dagCIDSet); err != nil {
+	for key, kind := range setKeys {
+		if err := mcrdt.set.purgeKeyBlocks(ctx, key, dagCIDSet, kind&purgeKeyElem != 0, kind&purgeKeyTomb != 0); err != nil {
 			return 0, err
 		}
 	}
