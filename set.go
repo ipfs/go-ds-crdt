@@ -669,11 +669,11 @@ func (s *set) inTombsKeyID(ctx context.Context, key, id string) (bool, error) {
 // 	return s.inElemsKeyID(key, id)
 // }
 
-// PurgeKeyBlocks removes element and tombstone entries for the given key that
+// purgeKeyBlocks removes element and tombstone entries for the given key that
 // were created by any of the given block CIDs. After removal, it recomputes
 // the best value from surviving elements. If no elements survive, the key's
 // value and priority are deleted.
-func (s *set) PurgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.Cid]struct{}) error {
+func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.Cid]struct{}) error {
 	s.putElemsMux.Lock()
 	defer s.putElemsMux.Unlock()
 

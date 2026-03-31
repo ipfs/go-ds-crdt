@@ -72,7 +72,7 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 	}
 
 	for key := range setKeys {
-		if err := mcrdt.set.PurgeKeyBlocks(ctx, key, dagCIDSet); err != nil {
+		if err := mcrdt.set.purgeKeyBlocks(ctx, key, dagCIDSet); err != nil {
 			return 0, err
 		}
 	}
