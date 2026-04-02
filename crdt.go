@@ -494,7 +494,9 @@ func (store *Datastore) handleNext(ctx context.Context) {
 					dg := &crdtNodeGetter{NodeGetter: store.dagService}
 					for _, head := range heads {
 						// getPriority fetches the delta.
-						prio, err := store.getPriority(ctx, dg, head.Cid)
+						cctx, cancel := context.WithTimeout(ctx, store.opts.DAGSyncerTimeout)
+						prio, err := store.getPriority(cctx, dg, head.Cid)
+						cancel()
 						if err != nil {
 							store.logger.Error(err)
 							continue
