@@ -38,8 +38,10 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-var _ ds.Datastore = (*Datastore)(nil)
-var _ ds.Batching = (*Datastore)(nil)
+var (
+	_ ds.Datastore = (*Datastore)(nil)
+	_ ds.Batching  = (*Datastore)(nil)
+)
 
 // datastore namespace keys. Short keys save space and memory.
 const (
@@ -250,7 +252,6 @@ type dagJob struct {
 	root       Head            // the root of the branch we are walking down
 	delta      Delta           // the current delta
 	node       ipld.Node       // the current ipld Node
-
 }
 
 type broadcastBatchHead struct {
@@ -444,7 +445,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 		}
 
 		processHead := func(ctx context.Context, h Head) {
-			err := store.handleBlock(ctx, h) //handleBlock blocks
+			err := store.handleBlock(ctx, h) // handleBlock blocks
 			if err != nil {
 				store.logger.Errorf("error processing new head: %s", err)
 				// For posterity: do not mark the store as
@@ -822,7 +823,6 @@ func (store *Datastore) dagWorker() {
 			job.delta,
 			job.node,
 		)
-
 		if err != nil {
 			store.logger.Error(err)
 			store.MarkDirty(ctx)
@@ -1393,7 +1393,6 @@ func (store *Datastore) addToDelta(ctx context.Context, key string, value []byte
 		return 0, err
 	}
 	return store.updateDelta(delta)
-
 }
 
 // returns delta size and error
@@ -1673,7 +1672,7 @@ func (store *Datastore) PrintDAG(ctx context.Context) error {
 
 func (store *Datastore) printDAGRec(ctx context.Context, from cid.Cid, depth uint64, ng *crdtNodeGetter, set *cid.Set) error {
 	line := ""
-	for i := uint64(0); i < depth; i++ {
+	for range depth {
 		line += " "
 	}
 

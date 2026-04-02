@@ -43,7 +43,6 @@ func NewMerkleCRDT(
 	opts *Options,
 	internalOptions *MerkleCRDTOptions,
 ) (*MerkleCRDT, error) {
-
 	if opts == nil {
 		opts = DefaultOptions()
 	}
