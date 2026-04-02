@@ -66,7 +66,6 @@ func newCRDTSet(
 	deleteHook func(key string),
 	deltaFactory func() Delta,
 ) (*set, error) {
-
 	set := &set{
 		namespace:    namespace,
 		store:        d,
