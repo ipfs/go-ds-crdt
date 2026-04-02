@@ -25,8 +25,10 @@ import (
 	"github.com/multiformats/go-multihash"
 )
 
-var numReplicas = 15
-var debug = false
+var (
+	numReplicas = 15
+	debug       = false
+)
 
 const (
 	mapStore = iota
@@ -48,46 +50,57 @@ func (tl *testLogger) Debug(args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Debug(args...)
 }
+
 func (tl *testLogger) Debugf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Debugf("%s "+format, args...)
 }
+
 func (tl *testLogger) Error(args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Error(args...)
 }
+
 func (tl *testLogger) Errorf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Errorf("%s "+format, args...)
 }
+
 func (tl *testLogger) Fatal(args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Fatal(args...)
 }
+
 func (tl *testLogger) Fatalf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Fatalf("%s "+format, args...)
 }
+
 func (tl *testLogger) Info(args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Info(args...)
 }
+
 func (tl *testLogger) Infof(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Infof("%s "+format, args...)
 }
+
 func (tl *testLogger) Panic(args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Panic(args...)
 }
+
 func (tl *testLogger) Panicf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Panicf("%s "+format, args...)
 }
+
 func (tl *testLogger) Warn(args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Warn(args...)
 }
+
 func (tl *testLogger) Warnf(format string, args ...interface{}) {
 	args = append([]interface{}{tl.name}, args...)
 	tl.l.Warnf("%s "+format, args...)
@@ -138,7 +151,6 @@ func (mb *mockBroadcaster) Broadcast(ctx context.Context, data []byte) error {
 				// Sleep for a very small time that will
 				// effectively be pretty random
 				time.Sleep(time.Nanosecond)
-
 			}
 			timer := time.NewTimer(5 * time.Second)
 			defer timer.Stop()
@@ -198,7 +210,7 @@ func makeStore(t testing.TB, i int) ds.Datastore {
 		return dssync.MutexWrap(ds.NewMapDatastore())
 	case pebbleStore:
 		folder := storeFolder(i)
-		err := os.MkdirAll(folder, 0700)
+		err := os.MkdirAll(folder, 0o700)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -411,9 +423,9 @@ func TestCRDTReplication(t *testing.T) {
 		}
 		t.Log(list)
 	}
-	//replicas[0].PrintDAG()
-	//fmt.Println("==========================================================")
-	//replicas[1].PrintDAG()
+	// replicas[0].PrintDAG()
+	// fmt.Println("==========================================================")
+	// replicas[1].PrintDAG()
 }
 
 // TestCRDTPriority tests that given multiple concurrent updates from several
@@ -482,9 +494,9 @@ func TestCRDTPriority(t *testing.T) {
 		}
 	}
 
-	//replicas[14].PrintDAG()
-	//fmt.Println("=======================================================")
-	//replicas[1].PrintDAG()
+	// replicas[14].PrintDAG()
+	// fmt.Println("=======================================================")
+	// replicas[1].PrintDAG()
 }
 
 func TestCRDTCatchUp(t *testing.T) {
@@ -1386,5 +1398,258 @@ func TestCRDTBatchBroadcast(t *testing.T) {
 
 	if totalHeads != 2 {
 		t.Errorf("Expected 2 heads in broadcast, got %d: %s", totalHeads, heads)
+	}
+}
+
+// nullBroadcaster is a no-op broadcaster for tests that don't need replication.
+// Its Next() blocks until ctx is cancelled, preventing background goroutines
+// from interfering with operations that require exclusive access (e.g. PurgeDAG).
+type nullBroadcaster struct{}
+
+func (nb *nullBroadcaster) Broadcast(_ context.Context, _ []byte) error { return nil }
+func (nb *nullBroadcaster) Next(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func makeNReplicasNoBcast(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
+	bcasts := make([]Broadcaster, n)
+	for i := range bcasts {
+		bcasts[i] = &nullBroadcaster{}
+	}
+	return makeNReplicasWithBroadcasters(t, n, opts, bcasts, func() {})
+}
+
+func TestPurgeDAG(t *testing.T) {
+	replicas, closeReplicas := makeNReplicasNoBcast(t, 1, nil)
+	t.Cleanup(closeReplicas)
+	replica := replicas[0]
+	mcrdt := MerkleCRDT{replica}
+	ctx := t.Context()
+
+	// Publish one delta under dag1 and two under dag2.
+	k1 := ds.NewKey("key1")
+	delta1, err := replica.set.Add(ctx, k1.String(), []byte("val1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta1.SetDagName("dag1")
+	if _, err := replica.publish(ctx, delta1); err != nil {
+		t.Fatal(err)
+	}
+
+	k2 := ds.NewKey("key2")
+	delta2, err := replica.set.Add(ctx, k2.String(), []byte("val2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta2.SetDagName("dag2")
+	if _, err := replica.publish(ctx, delta2); err != nil {
+		t.Fatal(err)
+	}
+
+	k3 := ds.NewKey("key3")
+	delta3, err := replica.set.Add(ctx, k3.String(), []byte("val3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta3.SetDagName("dag2")
+	if _, err := replica.publish(ctx, delta3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Collect dag1 head CIDs before purge so we can check IsProcessed later.
+	dag1Heads, _, err := replica.heads.ListDAG(ctx, "dag1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Purge dag1.
+	n, err := mcrdt.PurgeDAG(ctx, "dag1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Error("expected non-zero blocks removed for dag1")
+	}
+
+	// dag1 heads are gone.
+	dag1HeadsAfter, _, err := replica.heads.ListDAG(ctx, "dag1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dag1HeadsAfter) != 0 {
+		t.Errorf("expected 0 dag1 heads after purge, got %d", len(dag1HeadsAfter))
+	}
+
+	// dag2 heads remain.
+	dag2Heads, _, err := replica.heads.ListDAG(ctx, "dag2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dag2Heads) != 1 {
+		t.Error("dag2 heads should survive purge of dag1")
+	}
+
+	// Set entry for k1 (dag1 key) is gone.
+	_, err = replica.set.Element(ctx, k1.String())
+	if !errors.Is(err, ds.ErrNotFound) {
+		t.Errorf("expected ErrNotFound for key1 after purge, got %v", err)
+	}
+
+	// Set entries for dag2 keys remain.
+	if _, err := replica.set.Element(ctx, k2.String()); err != nil {
+		t.Errorf("key2 should survive purge of dag1: %v", err)
+	}
+	if _, err := replica.set.Element(ctx, k3.String()); err != nil {
+		t.Errorf("key3 should survive purge of dag1: %v", err)
+	}
+
+	// Processed block markers for dag1 blocks are gone.
+	for _, h := range dag1Heads {
+		processed, err := mcrdt.IsProcessed(ctx, h.Cid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if processed {
+			t.Errorf("dag1 CID %s should not be processed after purge", h.Cid)
+		}
+	}
+}
+
+func TestPurgeDAGIdempotent(t *testing.T) {
+	replicas, closeReplicas := makeNReplicasNoBcast(t, 1, nil)
+	t.Cleanup(closeReplicas)
+	mcrdt := MerkleCRDT{replicas[0]}
+	ctx := t.Context()
+
+	n, err := mcrdt.PurgeDAG(ctx, "nonexistent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 blocks removed for unknown dagName, got %d", n)
+	}
+}
+
+func TestPurgeDAGMixedKey(t *testing.T) {
+	replicas, closeReplicas := makeNReplicasNoBcast(t, 1, nil)
+	t.Cleanup(closeReplicas)
+	replica := replicas[0]
+	mcrdt := MerkleCRDT{replica}
+	ctx := t.Context()
+
+	// Both dag1 and dag2 write to the same key with different values.
+	key := ds.NewKey("shared").String()
+
+	delta1, err := replica.set.Add(ctx, key, []byte("from-dag1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta1.SetDagName("dag1")
+	if _, err := replica.publish(ctx, delta1); err != nil {
+		t.Fatal(err)
+	}
+
+	delta2, err := replica.set.Add(ctx, key, []byte("from-dag2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta2.SetDagName("dag2")
+	if _, err := replica.publish(ctx, delta2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Purge dag2.
+	if _, err := mcrdt.PurgeDAG(ctx, "dag2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The key should still exist with dag1's value.
+	val, err := replica.set.Element(ctx, key)
+	if err != nil {
+		t.Fatalf("key should survive after purging dag2: %v", err)
+	}
+	if string(val) != "from-dag1" {
+		t.Errorf("expected 'from-dag1', got %q", string(val))
+	}
+}
+
+func TestPurgeDAGCleanStore(t *testing.T) {
+	ctx := t.Context()
+	mapDs := dssync.MutexWrap(ds.NewMapDatastore())
+	dagserv := merkledag.NewDAGService(mdutils.Bserv())
+	dagsync := &mockDAGSvc{
+		DAGService: dagserv,
+		bs:         mdutils.Bserv().Blockstore(),
+	}
+
+	opts := DefaultOptions()
+	opts.Logger = &testLogger{
+		name: "purge-clean: ",
+		l:    DefaultOptions().Logger,
+	}
+
+	namespace := ds.NewKey("crdttest")
+	replica, err := New(mapDs, namespace, dagsync, &nullBroadcaster{}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { replica.Close() })
+
+	mcrdt := MerkleCRDT{replica}
+
+	// Publish two keys under dag1.
+	delta1, err := replica.set.Add(ctx, "key1", []byte("val1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta1.SetDagName("dag1")
+	if _, err := replica.publish(ctx, delta1); err != nil {
+		t.Fatal(err)
+	}
+	delta2, err := replica.set.Add(ctx, "key2", []byte("val2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta2.SetDagName("dag1")
+	if _, err := replica.publish(ctx, delta2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Purge dag1.
+	n, err := mcrdt.PurgeDAG(ctx, "dag1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatal("expected non-zero blocks removed")
+	}
+
+	// Query all keys remaining in the store.
+	results, err := mapDs.Query(ctx, query.Query{KeysOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { results.Close() })
+
+	var remaining []string
+	for r := range results.Next() {
+		if r.Error != nil {
+			t.Fatal(r.Error)
+		}
+		remaining = append(remaining, r.Key)
+	}
+
+	// The only key that should survive is the version metadata key,
+	// which is Datastore-level state not associated with any dagName.
+	versionKey := namespace.ChildString("crdt_version").String()
+	for _, key := range remaining {
+		if key != versionKey {
+			t.Errorf("unexpected key remaining after purge: %s", key)
+		}
+	}
+	if len(remaining) != 1 {
+		t.Errorf("expected exactly 1 key (version) remaining, got %d: %v", len(remaining), remaining)
 	}
 }

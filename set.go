@@ -66,7 +66,6 @@ func newCRDTSet(
 	deleteHook func(key string),
 	deltaFactory func() Delta,
 ) (*set, error) {
-
 	set := &set{
 		namespace:    namespace,
 		store:        d,
@@ -411,7 +410,7 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 NEXT:
 	for r := range results.Next() {
 		if r.Error != nil {
-			return nil, 0, err
+			return nil, 0, r.Error
 		}
 
 		id := strings.TrimPrefix(r.Key, prefix.String())
@@ -669,6 +668,126 @@ func (s *set) inTombsKeyID(ctx context.Context, key, id string) (bool, error) {
 
 // 	return s.inElemsKeyID(key, id)
 // }
+
+// purgeKeyBlocks removes element and tombstone entries for the given key that
+// were created by any of the given block CIDs. After removal, it recomputes
+// the best value from surviving elements. If no elements survive, the key's
+// value and priority are deleted.
+//
+// hasElems and hasTombs indicate which namespaces the DAG being purged
+// actually wrote entries for this key; passing false for either skips the
+// corresponding datastore query.
+func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.Cid]struct{}, hasElems, hasTombs bool) error {
+	s.putElemsMux.Lock()
+	defer s.putElemsMux.Unlock()
+
+	var store ds.Write = s.store
+	batchingDs, batching := store.(ds.Batching)
+	var err error
+	if batching {
+		store, err = batchingDs.Batch(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	deleteMatchingIDs := func(prefix ds.Key) error {
+		q := query.Query{
+			Prefix:   prefix.String(),
+			KeysOnly: true,
+		}
+		results, err := s.store.Query(ctx, q)
+		if err != nil {
+			return err
+		}
+		defer results.Close() //nolint:errcheck
+
+		for r := range results.Next() {
+			if r.Error != nil {
+				return r.Error
+			}
+			// Strip the query prefix to get the relative remainder, which for a
+			// direct child is just the block ID (a CID encoded as a datastore key
+			// string): "/namespace/s/foo/<blockID>" → "/<blockID>".
+			blockID := strings.TrimPrefix(r.Key, prefix.String())
+			// The prefix query also returns entries for child keys: prefix "foo"
+			// matches both "foo/<block>" and "foo/bar/<block>". After trimming, a
+			// direct child yields a top-level key "/<blockID>", while a grandchild
+			// yields "/bar/<blockID>". Reject the latter since it belongs to a
+			// different key.
+			if !ds.RawKey(blockID).IsTopLevel() {
+				continue
+			}
+			// Decode the datastore key back into a CID so we can look it up in the
+			// caller-supplied set.
+			mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(blockID))
+			if err != nil {
+				return err
+			}
+			c := cid.NewCidV1(cid.DagProtobuf, mhash)
+			if _, ok := blockCIDs[c]; !ok {
+				continue
+			}
+			if err := store.Delete(ctx, prefix.ChildString(blockID)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if hasElems {
+		if err := deleteMatchingIDs(s.elemsPrefix(key)); err != nil {
+			return err
+		}
+	}
+	if hasTombs {
+		if err := deleteMatchingIDs(s.tombsPrefix(key)); err != nil {
+			return err
+		}
+	}
+
+	// The delete batch and the value/priority rewrite below are not atomic.
+	// A crash between them leaves a stale value key, but PurgeDAG is
+	// idempotent: a retry will skip the already-deleted entries and rewrite
+	// the value correctly.
+	if batching {
+		if err := store.(ds.Batch).Commit(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Recompute best value from surviving elements. Entries are already
+	// deleted from the store, so nil pendingTombIDs is correct.
+	bestVal, bestPrio, err := s.findBestValue(ctx, key, nil)
+	if err != nil {
+		return err
+	}
+
+	valueK := s.valueKey(key)
+	if bestVal == nil {
+		var errs []error
+		if err := s.store.Delete(ctx, valueK); err != nil && errors.Is(err, ds.ErrNotFound) {
+			errs = append(errs, err)
+		}
+		if err := s.store.Delete(ctx, s.priorityKey(key)); err != nil && errors.Is(err, ds.ErrNotFound) {
+			errs = append(errs, err)
+		}
+		if err := errors.Join(errs...); err != nil {
+			return err
+		}
+		s.deleteHook(key)
+	} else {
+		if err := s.store.Put(ctx, valueK, bestVal); err != nil {
+			return err
+		}
+		if err := s.setPriority(ctx, s.store, key, bestPrio); err != nil {
+			return err
+		}
+		s.putHook(key, bestVal)
+	}
+
+	return nil
+}
 
 // perform a sync against all the paths associated with a key prefix
 func (s *set) datastoreSync(ctx context.Context, prefix ds.Key) error {

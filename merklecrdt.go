@@ -10,6 +10,140 @@ import (
 	ipld "github.com/ipfs/go-ipld-format"
 )
 
+// PurgeDAG removes all state associated with a named DAG: its heads, all DAG
+// blocks reachable from those heads, the set entries created by those blocks,
+// and processed block markers. Returns the number of DAG nodes removed.
+//
+// Heads are deleted last so that a partial failure leaves them intact and a
+// subsequent call can resume the cleanup.
+//
+// The caller must ensure no concurrent writes to this dagName during purge.
+// The Datastore's background workers (rebroadcast, repair, DAG walking) also
+// access heads and set state — callers should either Close() the Datastore
+// first or ensure the dagName is not being actively synced.
+func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, error) {
+	currentHeads, _, err := mcrdt.heads.ListDAG(ctx, dagName)
+	if err != nil {
+		return 0, err
+	}
+	if len(currentHeads) == 0 {
+		return 0, nil
+	}
+
+	headCIDs := make([]cid.Cid, len(currentHeads))
+	for i, h := range currentHeads {
+		headCIDs[i] = h.Cid
+	}
+
+	dagCIDSet := make(map[cid.Cid]struct{})
+
+	// purgeKeyKind tracks which namespaces a key appeared in across the DAG's
+	// deltas, so purgeKeyBlocks can skip querying namespaces that the DAG never
+	// wrote to for a given key.
+	type purgeKeyKind uint8
+	const (
+		purgeKeyElem purgeKeyKind = 1 << iota
+		purgeKeyTomb
+	)
+	setKeys := make(map[string]purgeKeyKind)
+
+	// Walk the DAG with a local-only DFS: check isProcessed before fetching each
+	// block so we never trigger network requests. Unprocessed blocks have no set
+	// state to clean up, so skipping them is correct.
+	stack := make([]cid.Cid, len(headCIDs))
+	copy(stack, headCIDs)
+	for len(stack) > 0 {
+		c := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if _, seen := dagCIDSet[c]; seen {
+			continue
+		}
+		processed, err := mcrdt.isProcessed(ctx, c)
+		if err != nil {
+			return 0, err
+		}
+		if !processed {
+			continue
+		}
+		dagCIDSet[c] = struct{}{}
+
+		nd, err := mcrdt.dagService.Get(ctx, c)
+		if err != nil {
+			return 0, err
+		}
+
+		deltaBytes, err := extractDelta(nd)
+		if err != nil {
+			return 0, err
+		}
+		delta := mcrdt.newDelta()
+		if err := delta.Unmarshal(deltaBytes); err != nil {
+			return 0, err
+		}
+
+		elems, err := delta.GetElements()
+		if err != nil {
+			return 0, err
+		}
+		for _, e := range elems {
+			setKeys[e.GetKey()] |= purgeKeyElem
+		}
+
+		tombs, err := delta.GetTombstones()
+		if err != nil {
+			return 0, err
+		}
+		for _, t := range tombs {
+			setKeys[t.GetKey()] |= purgeKeyTomb
+		}
+
+		for _, link := range nd.Links() {
+			stack = append(stack, link.Cid)
+		}
+	}
+
+	for key, kind := range setKeys {
+		if err := mcrdt.set.purgeKeyBlocks(ctx, key, dagCIDSet, kind&purgeKeyElem != 0, kind&purgeKeyTomb != 0); err != nil {
+			return 0, err
+		}
+	}
+
+	dagCIDs := make([]cid.Cid, 0, len(dagCIDSet))
+	for c := range dagCIDSet {
+		dagCIDs = append(dagCIDs, c)
+	}
+
+	var store ds.Write = mcrdt.store
+	batchingDs, batching := store.(ds.Batching)
+	if batching {
+		store, err = batchingDs.Batch(ctx)
+		if err != nil {
+			return 0, err
+		}
+	}
+	for _, c := range dagCIDs {
+		if err := store.Delete(ctx, mcrdt.processedBlockKey(c)); err != nil {
+			return 0, err
+		}
+	}
+	if batching {
+		if err := store.(ds.Batch).Commit(ctx); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := mcrdt.dagService.RemoveMany(ctx, dagCIDs); err != nil {
+		return 0, err
+	}
+
+	if _, err := mcrdt.heads.DeleteDAG(ctx, dagName); err != nil {
+		return 0, err
+	}
+
+	return len(dagCIDs), nil
+}
+
 // DatatstoreNamespaces carries configuration for how internal namespaces are named.
 type InternalNamespaces struct {
 	Heads           string
@@ -43,7 +177,6 @@ func NewMerkleCRDT(
 	opts *Options,
 	internalOptions *MerkleCRDTOptions,
 ) (*MerkleCRDT, error) {
-
 	if opts == nil {
 		opts = DefaultOptions()
 	}
