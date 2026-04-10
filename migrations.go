@@ -89,7 +89,7 @@ func (store *Datastore) migrate0to1(ctx context.Context) error {
 		KeysOnly: true,
 	}
 
-	var rStore = store.store
+	rStore := store.store
 	var wStore ds.Write = store.store
 	var err error
 	batchingDs, batching := wStore.(ds.Batching)

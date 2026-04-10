@@ -46,63 +46,63 @@ type testLogger struct {
 	l    log.StandardLogger
 }
 
-func (tl *testLogger) Debug(args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Debug(args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Debug(args...)
 }
 
-func (tl *testLogger) Debugf(format string, args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Debugf(format string, args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Debugf("%s "+format, args...)
 }
 
-func (tl *testLogger) Error(args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Error(args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Error(args...)
 }
 
-func (tl *testLogger) Errorf(format string, args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Errorf(format string, args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Errorf("%s "+format, args...)
 }
 
-func (tl *testLogger) Fatal(args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Fatal(args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Fatal(args...)
 }
 
-func (tl *testLogger) Fatalf(format string, args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Fatalf(format string, args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Fatalf("%s "+format, args...)
 }
 
-func (tl *testLogger) Info(args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Info(args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Info(args...)
 }
 
-func (tl *testLogger) Infof(format string, args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Infof(format string, args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Infof("%s "+format, args...)
 }
 
-func (tl *testLogger) Panic(args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Panic(args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Panic(args...)
 }
 
-func (tl *testLogger) Panicf(format string, args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Panicf(format string, args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Panicf("%s "+format, args...)
 }
 
-func (tl *testLogger) Warn(args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Warn(args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Warn(args...)
 }
 
-func (tl *testLogger) Warnf(format string, args ...interface{}) {
-	args = append([]interface{}{tl.name}, args...)
+func (tl *testLogger) Warnf(format string, args ...any) {
+	args = append([]any{tl.name}, args...)
 	tl.l.Warnf("%s "+format, args...)
 }
 
@@ -333,9 +333,9 @@ func TestCRDTReplication(t *testing.T) {
 	defer closeReplicas()
 
 	// Add nItems choosing the replica randomly
-	for i := 0; i < nItems; i++ {
+	for i := range nItems {
 		k := ds.RandomKey()
-		v := []byte(fmt.Sprintf("%d", i))
+		v := fmt.Appendf(nil, "%d", i)
 		n := randGen.Intn(len(replicas))
 		err := replicas[n].Put(ctx, k, v)
 		if err != nil {
@@ -453,8 +453,8 @@ func TestCRDTPriority(t *testing.T) {
 	for i, r := range replicas {
 		go func(r *Datastore, i int) {
 			defer wg.Done()
-			for j := 0; j < nItems; j++ {
-				err := r.Put(ctx, k, []byte(fmt.Sprintf("r#%d", i)))
+			for range nItems {
+				err := r.Put(ctx, k, fmt.Appendf(nil, "r#%d", i))
 				if err != nil {
 					t.Error(err)
 				}
@@ -510,7 +510,7 @@ func TestCRDTCatchUp(t *testing.T) {
 	br.dropProb.Store(101)
 
 	// this items will not get to anyone
-	for i := 0; i < nItems; i++ {
+	for range nItems {
 		k := ds.RandomKey()
 		err := r.Put(ctx, k, nil)
 		if err != nil {
@@ -552,7 +552,7 @@ func TestCRDTPrintDAG(t *testing.T) {
 	defer closeReplicas()
 
 	// this items will not get to anyone
-	for i := 0; i < nItems; i++ {
+	for range nItems {
 		k := ds.RandomKey()
 		err := replicas[0].Put(ctx, k, nil)
 		if err != nil {
@@ -874,7 +874,7 @@ func BenchmarkQueryElements(b *testing.B) {
 
 func TestRandomizeInterval(t *testing.T) {
 	prevR := 100 * time.Second
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		r := randomizeInterval(100 * time.Second)
 		if r < 70*time.Second || r > 130*time.Second {
 			t.Error("r was ", r)
@@ -961,10 +961,10 @@ func TestMigration0to1(t *testing.T) {
 	nItems := 200
 	var keys []ds.Key
 	// Add nItems
-	for i := 0; i < nItems; i++ {
+	for i := range nItems {
 		k := ds.RandomKey()
 		keys = append(keys, k)
-		v := []byte(fmt.Sprintf("%d", i))
+		v := fmt.Appendf(nil, "%d", i)
 		err := replica.Put(ctx, k, v)
 		if err != nil {
 			t.Fatal(err)
@@ -974,9 +974,9 @@ func TestMigration0to1(t *testing.T) {
 
 	// Overwrite n/2 items 5 times to have multiple tombstones per key
 	// later...
-	for j := 0; j < 5; j++ {
+	for range 5 {
 		for i := 0; i < nItems/2; i++ {
-			v := []byte(fmt.Sprintf("%d", i))
+			v := fmt.Appendf(nil, "%d", i)
 			err := replica.Put(ctx, keys[i], v)
 			if err != nil {
 				t.Fatal(err)
@@ -1040,9 +1040,9 @@ func TestCRDTDagNames(t *testing.T) {
 
 	// create delta manually for each item with store.set.Add()
 	// delta.SetDagName() alternatively to "dag1" and "dag2"
-	for i := 0; i < nItems; i++ {
+	for i := range nItems {
 		k := ds.RandomKey()
-		v := []byte(fmt.Sprintf("value-%d", i))
+		v := fmt.Appendf(nil, "value-%d", i)
 
 		// Create delta manually
 		delta, err := replicas[0].set.Add(ctx, k.String(), v)

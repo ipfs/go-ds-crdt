@@ -75,7 +75,7 @@ func main() {
 		// check if the directory exists or create it
 		_, err := os.Stat(*dataDir)
 		if os.IsNotExist(err) {
-			err = os.Mkdir(*dataDir, 0755)
+			err = os.Mkdir(*dataDir, 0o755)
 			if err != nil {
 				logger.Fatal(err)
 			}
@@ -101,7 +101,7 @@ func main() {
 		if err != nil {
 			logger.Fatal(err)
 		}
-		err = os.WriteFile(keyPath, data, 0400)
+		err = os.WriteFile(keyPath, data, 0o400)
 		if err != nil {
 			logger.Fatal(err)
 		}
@@ -195,7 +195,6 @@ func main() {
 	opts.RebroadcastInterval = 5 * time.Second
 	opts.PutHook = func(k ds.Key, v []byte) {
 		fmt.Printf("Added: [%s] -> %s\n", k, string(v))
-
 	}
 	opts.DeleteHook = func(k ds.Key) {
 		fmt.Printf("Removed: [%s]\n", k)

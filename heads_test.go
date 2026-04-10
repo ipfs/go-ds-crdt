@@ -15,8 +15,10 @@ import (
 	"github.com/multiformats/go-multihash"
 )
 
-var headsTestNS = ds.NewKey("headstest")
-var headsTestDagsNS = ds.NewKey("headstestdags")
+var (
+	headsTestNS     = ds.NewKey("headstest")
+	headsTestDagsNS = ds.NewKey("headstestdags")
+)
 
 var randg = rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -61,7 +63,7 @@ func TestHeadsBasic(t *testing.T) {
 
 	cidHeights := make(map[cid.Cid]Head)
 	numHeads := 5
-	for i := 0; i < numHeads; i++ {
+	for range numHeads {
 		c, height := newCID(t), uint64(randg.Int())
 		head := Head{Cid: c}
 		head.Height = height
@@ -115,7 +117,7 @@ func TestHeadsListDAG(t *testing.T) {
 	dag2Heads := make(map[cid.Cid]Head)
 
 	// Add 3 heads for DAG 1
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		c, height := newCID(t), uint64(randg.Intn(100))
 		head := Head{Cid: c, HeadValue: HeadValue{Height: height, DAGName: "dag1"}}
 		dag1Heads[c] = head
@@ -126,7 +128,7 @@ func TestHeadsListDAG(t *testing.T) {
 	}
 
 	// Add 2 heads for DAG 2
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		c, height := newCID(t), uint64(randg.Intn(100))
 		head := Head{Cid: c, HeadValue: HeadValue{Height: height, DAGName: "dag2"}}
 		dag2Heads[c] = head
