@@ -766,10 +766,10 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 	valueK := s.valueKey(key)
 	if bestVal == nil {
 		var errs []error
-		if err := s.store.Delete(ctx, valueK); err != nil && errors.Is(err, ds.ErrNotFound) {
+		if err := s.store.Delete(ctx, valueK); err != nil && !errors.Is(err, ds.ErrNotFound) {
 			errs = append(errs, err)
 		}
-		if err := s.store.Delete(ctx, s.priorityKey(key)); err != nil && errors.Is(err, ds.ErrNotFound) {
+		if err := s.store.Delete(ctx, s.priorityKey(key)); err != nil && !errors.Is(err, ds.ErrNotFound) {
 			errs = append(errs, err)
 		}
 		if err := errors.Join(errs...); err != nil {
