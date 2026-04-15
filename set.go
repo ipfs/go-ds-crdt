@@ -36,6 +36,15 @@ type Set interface {
 	InSet(ctx context.Context, key string) (bool, error)
 }
 
+// setHooks holds the hook functions for put and delete events. Only one of
+// putHook or onPut may be set; likewise for deleteHook and onDelete.
+type setHooks struct {
+	putHook    func(key ds.Key, v []byte)
+	onPut      func(key ds.Key, newVal, oldVal []byte)
+	deleteHook func(key ds.Key)
+	onDelete   func(key ds.Key, lastVal []byte)
+}
+
 // set implements an Add-Wins Observed-Remove Set using delta-CRDTs
 // (https://arxiv.org/abs/1410.2803) and backing all the data in a
 // go-datastore. It is fully agnostic to MerkleCRDTs or the delta distribution
@@ -46,8 +55,7 @@ type set struct {
 	store        ds.Datastore
 	dagService   ipld.DAGService
 	namespace    ds.Key
-	putHook      func(key string, v []byte)
-	deleteHook   func(key string)
+	hooks        setHooks
 	deltaFactory func() Delta
 	logger       logging.StandardLogger
 
@@ -62,8 +70,7 @@ func newCRDTSet(
 	namespace ds.Key,
 	dagService ipld.DAGService,
 	logger logging.StandardLogger,
-	putHook func(key string, v []byte),
-	deleteHook func(key string),
+	hooks setHooks,
 	deltaFactory func() Delta,
 ) (*set, error) {
 	set := &set{
@@ -71,12 +78,35 @@ func newCRDTSet(
 		store:        d,
 		dagService:   dagService,
 		logger:       logger,
-		putHook:      putHook,
-		deleteHook:   deleteHook,
+		hooks:        hooks,
 		deltaFactory: deltaFactory,
 	}
 
 	return set, nil
+}
+
+// triggerPutHook calls the appropriate put hook with newVal and oldVal.
+// oldVal must have been fetched from the store before the write.
+func (s *set) triggerPutHook(key string, newVal, oldVal []byte) {
+	if s.hooks.onPut != nil {
+		s.hooks.onPut(ds.NewKey(key), newVal, oldVal)
+		return
+	}
+	if s.hooks.putHook != nil {
+		s.hooks.putHook(ds.NewKey(key), newVal)
+	}
+}
+
+// triggerDeleteHook calls the appropriate delete hook with lastVal,
+// the value that was stored before the deletion.
+func (s *set) triggerDeleteHook(key string, lastVal []byte) {
+	if s.hooks.onDelete != nil {
+		s.hooks.onDelete(ds.NewKey(key), lastVal)
+		return
+	}
+	if s.hooks.deleteHook != nil {
+		s.hooks.deleteHook(ds.NewKey(key))
+	}
 }
 
 // Add returns a new delta-set adding the given key/value.
@@ -357,11 +387,21 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 	}
 	valueK := s.valueKey(key)
 
+	var oldVal []byte
 	if prio == curPrio {
-		curValue, _ := s.store.Get(ctx, valueK)
+		oldVal, err = s.store.Get(ctx, valueK)
+		if err != nil && !errors.Is(err, ds.ErrNotFound) {
+			s.logger.Errorf("error reading current value for key %s: %s", key, err)
+		}
 		// new value greater than old
-		if bytes.Compare(curValue, value) >= 0 {
+		if bytes.Compare(oldVal, value) >= 0 {
 			return nil
+		}
+	} else if s.hooks.onPut != nil {
+		// Fetch old value before any write for the onPut hook.
+		oldVal, err = s.store.Get(ctx, valueK)
+		if err != nil && !errors.Is(err, ds.ErrNotFound) {
+			s.logger.Errorf("error reading current value for onPut hook: key %s: %s", key, err)
 		}
 	}
 
@@ -378,7 +418,7 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 	}
 
 	// trigger add hook
-	s.putHook(key, value)
+	s.triggerPutHook(key, value, oldVal)
 	return nil
 }
 
@@ -567,12 +607,43 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	// key -> tombstonedBlockID. Carries the tombstoned blocks for each
 	// element in this delta.
 	deletedElems := make(map[string][]string)
+	// newVals holds the winning value for keys that were partially tombstoned
+	// (tombstone removed a previous winner but a surviving element took over).
+	// A key absent from this map was fully deleted. Doubles as the
+	// fully-deleted oracle, so it is allocated whenever any hook is registered;
+	// nil means no hooks are configured and the firing loop is skipped entirely.
+	var newVals map[string][]byte
+	if s.hooks.putHook != nil || s.hooks.onPut != nil || s.hooks.deleteHook != nil || s.hooks.onDelete != nil {
+		newVals = make(map[string][]byte)
+	}
+	// prevVals caches the value at the time each key is first seen in this
+	// delta, before any write. Only keys that existed in the store are added;
+	// absent keys are omitted so the two-value map lookup (v, ok) cleanly
+	// distinguishes "had a value" from "was not in the store".
+	var prevVals map[string][]byte
+	if newVals != nil {
+		prevVals = make(map[string][]byte)
+	}
 	var errs []error
 	for _, e := range tombs {
 		// /namespace/tombs/<key>/<id>
 		key := e.GetKey()
 		id := e.GetId()
 		valueK := s.valueKey(key)
+
+		// Capture the current value on first encounter, before any write for
+		// this key, so hooks receive the pre-tombstone value.
+		if prevVals != nil {
+			if _, seen := prevVals[key]; !seen {
+				curVal, err := s.store.Get(ctx, valueK)
+				if err == nil {
+					prevVals[key] = curVal
+				} else if !errors.Is(err, ds.ErrNotFound) {
+					s.logger.Errorf("error reading value before tombstone for key %s: %s", key, err)
+				}
+				// ErrNotFound: omit from map; hook firing uses (v, ok) to detect absence.
+			}
+		}
 		deletedElems[key] = append(deletedElems[key], id)
 
 		// Find best value for element that we are going to delete
@@ -582,6 +653,7 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 
 		if v == nil {
+			delete(newVals, key)
 			if err = store.Delete(ctx, valueK); err != nil {
 				errs = append(errs, err)
 			}
@@ -589,6 +661,9 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 				errs = append(errs, err)
 			}
 		} else {
+			if newVals != nil {
+				newVals[key] = v
+			}
 			if err = store.Put(ctx, valueK, v); err != nil {
 				errs = append(errs, err)
 			}
@@ -614,11 +689,26 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 	}
 
-	// run delete hook only once for all versions of the same element
-	// tombstoned in this delta. Note it may be that the element was not
-	// fully deleted and only a different value took its place.
-	for del := range deletedElems {
-		s.deleteHook(del)
+	// Fire hooks once per key after all writes are committed.
+	// Skipped entirely when no hooks are registered (newVals == nil).
+	// Fully deleted keys (absent from newVals) trigger the delete hook;
+	// partially tombstoned keys (present in newVals) trigger the put hook.
+	if newVals != nil {
+		for del := range deletedElems {
+			if newVal, partial := newVals[del]; partial {
+				oldVal := prevVals[del] // nil if key was absent
+				if bytes.Equal(newVal, oldVal) {
+					continue // value unchanged, skip hook
+				}
+				s.triggerPutHook(del, newVal, oldVal)
+			} else {
+				lastVal, ok := prevVals[del]
+				if !ok {
+					continue // key had no value before tombstone, nothing to notify
+				}
+				s.triggerDeleteHook(del, lastVal)
+			}
+		}
 	}
 
 	return nil
@@ -764,6 +854,17 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 	}
 
 	valueK := s.valueKey(key)
+
+	// Fetch old value before modifying the value key, so hooks receive the
+	// pre-purge value. Only read when a hook that needs it is configured.
+	var oldVal []byte
+	if s.hooks.onPut != nil || s.hooks.onDelete != nil {
+		oldVal, err = s.store.Get(ctx, valueK)
+		if err != nil && !errors.Is(err, ds.ErrNotFound) {
+			s.logger.Errorf("error reading value before purge for hook: key %s: %s", key, err)
+		}
+	}
+
 	if bestVal == nil {
 		var errs []error
 		if err := s.store.Delete(ctx, valueK); err != nil && !errors.Is(err, ds.ErrNotFound) {
@@ -775,7 +876,7 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := errors.Join(errs...); err != nil {
 			return err
 		}
-		s.deleteHook(key)
+		s.triggerDeleteHook(key, oldVal)
 	} else {
 		if err := s.store.Put(ctx, valueK, bestVal); err != nil {
 			return err
@@ -783,7 +884,7 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := s.setPriority(ctx, s.store, key, bestPrio); err != nil {
 			return err
 		}
-		s.putHook(key, bestVal)
+		s.triggerPutHook(key, bestVal, oldVal)
 	}
 
 	return nil

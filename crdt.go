@@ -85,19 +85,31 @@ type Options struct {
 	// been already broadcasted by other replicas in the
 	// interval. Default: 1m.
 	RebroadcastInterval time.Duration
-	// The PutHook function is triggered whenever an element
-	// is successfully added to the datastore (either by a local
-	// or remote update), and only when that addition is considered the
-	// prevalent value. Default: nil.
+	// PutHook is triggered whenever an element is successfully added to the
+	// datastore (either by a local or remote update), and only when that
+	// addition is considered the prevalent value. Default: nil.
+	// Mutually exclusive with OnPut.
 	PutHook func(k ds.Key, v []byte)
-	// The DeleteHook function is triggered whenever a version of an
-	// element is successfully removed from the datastore (either by a
-	// local or remote update). Unordered and concurrent updates may
-	// result in the DeleteHook being triggered even though the element is
-	// still present in the datastore because it was re-added or not fully
-	// tombstoned. If that is relevant, use Has() to check if the removed
-	// element is still part of the datastore. Default: nil.
+	// OnPut is like PutHook but also receives the previous value for the key
+	// (nil if the key did not exist before). This incurs an extra datastore
+	// read per put. Mutually exclusive with PutHook. Default: nil.
+	// The callback is invoked while internal locks are held; it must not
+	// call back into the Datastore or it will deadlock.
+	OnPut func(k ds.Key, newVal, oldVal []byte)
+	// DeleteHook is triggered whenever a version of an element is
+	// successfully removed from the datastore (either by a local or remote
+	// update). Unordered and concurrent updates may result in the DeleteHook
+	// being triggered even though the element is still present in the
+	// datastore because it was re-added or not fully tombstoned. If that is
+	// relevant, use Has() to check if the removed element is still part of
+	// the datastore. Default: nil. Mutually exclusive with OnDelete.
 	DeleteHook func(k ds.Key)
+	// OnDelete is like DeleteHook but also receives the last known value for
+	// the key before it was removed. This incurs an extra datastore read per
+	// delete. Mutually exclusive with DeleteHook. Default: nil.
+	// The callback is invoked while internal locks are held; it must not
+	// call back into the Datastore or it will deadlock.
+	OnDelete func(k ds.Key, lastVal []byte)
 	// NumWorkers specifies the number of workers ready to
 	// retrieve and merge deltas while walking the DAGs. Default:
 	// 5.
@@ -186,7 +198,9 @@ func DefaultOptions() *Options {
 		Logger:              logging.Logger("crdt"),
 		RebroadcastInterval: time.Minute,
 		PutHook:             nil,
+		OnPut:               nil,
 		DeleteHook:          nil,
+		OnDelete:            nil,
 		NumWorkers:          5,
 		DAGSyncerTimeout:    5 * time.Minute,
 		// always keeping
@@ -292,6 +306,19 @@ func New(
 		return nil, err
 	}
 
+	if opts.PutHook != nil && opts.OnPut != nil {
+		return nil, errors.New("PutHook and OnPut are mutually exclusive")
+	}
+	if opts.DeleteHook != nil && opts.OnDelete != nil {
+		return nil, errors.New("DeleteHook and OnDelete are mutually exclusive")
+	}
+	hooks := setHooks{
+		putHook:    opts.PutHook,
+		onPut:      opts.OnPut,
+		deleteHook: opts.DeleteHook,
+		onDelete:   opts.OnDelete,
+	}
+
 	// <namespace>/set
 	fullSetNs := namespace.ChildString(opts.crdtOpts.Namespaces.Set)
 	// <namespace>/heads
@@ -300,24 +327,8 @@ func New(
 	// <namespace>/heads
 	fullDagHeadsNs := namespace.ChildString(opts.crdtOpts.Namespaces.DAGHeads)
 
-	setPutHook := func(k string, v []byte) {
-		if opts.PutHook == nil {
-			return
-		}
-		dsk := ds.NewKey(k)
-		opts.PutHook(dsk, v)
-	}
-
-	setDeleteHook := func(k string) {
-		if opts.DeleteHook == nil {
-			return
-		}
-		dsk := ds.NewKey(k)
-		opts.DeleteHook(dsk)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-	set, err := newCRDTSet(ctx, store, fullSetNs, dagSyncer, opts.Logger, setPutHook, setDeleteHook, opts.crdtOpts.DeltaFactory)
+	set, err := newCRDTSet(ctx, store, fullSetNs, dagSyncer, opts.Logger, hooks, opts.crdtOpts.DeltaFactory)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("error setting up crdt set: %w", err)

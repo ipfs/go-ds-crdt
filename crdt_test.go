@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	blockstore "github.com/ipfs/boxo/blockstore"
@@ -566,39 +567,195 @@ func TestCRDTPrintDAG(t *testing.T) {
 }
 
 func TestCRDTHooks(t *testing.T) {
-	ctx := context.Background()
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+		var put int64
+		var deleted int64
 
-	var put int64
-	var deleted int64
+		opts := DefaultOptions()
+		opts.PutHook = func(k ds.Key, v []byte) {
+			atomic.AddInt64(&put, 1)
+		}
+		opts.DeleteHook = func(k ds.Key) {
+			atomic.AddInt64(&deleted, 1)
+		}
 
-	opts := DefaultOptions()
-	opts.PutHook = func(k ds.Key, v []byte) {
-		atomic.AddInt64(&put, 1)
-	}
-	opts.DeleteHook = func(k ds.Key) {
-		atomic.AddInt64(&deleted, 1)
-	}
+		replicas, closeReplicas := makeReplicas(t, opts)
+		t.Cleanup(closeReplicas)
 
-	replicas, closeReplicas := makeReplicas(t, opts)
-	defer closeReplicas()
+		k := ds.RandomKey()
+		if err := replicas[0].Put(ctx, k, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := replicas[0].Delete(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if atomic.LoadInt64(&put) != int64(len(replicas)) {
+			t.Error("all replicas should have notified Put", put)
+		}
+		if atomic.LoadInt64(&deleted) != int64(len(replicas)) {
+			t.Error("all replicas should have notified Remove", deleted)
+		}
+	})
+}
 
-	k := ds.RandomKey()
-	err := replicas[0].Put(ctx, k, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestCRDTOnPut(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		type hookCall struct {
+			key    ds.Key
+			newVal []byte
+			oldVal []byte
+		}
+		var calls []hookCall
+		var mu sync.Mutex
 
-	err = replicas[0].Delete(ctx, k)
-	if err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(100 * time.Millisecond)
-	if atomic.LoadInt64(&put) != int64(len(replicas)) {
-		t.Error("all replicas should have notified Put", put)
-	}
-	if atomic.LoadInt64(&deleted) != int64(len(replicas)) {
-		t.Error("all replicas should have notified Remove", deleted)
-	}
+		opts := DefaultOptions()
+		opts.OnPut = func(k ds.Key, newVal, oldVal []byte) {
+			mu.Lock()
+			calls = append(calls, hookCall{k, newVal, oldVal})
+			mu.Unlock()
+		}
+
+		replicas, closeReplicas := makeReplicas(t, opts)
+		t.Cleanup(closeReplicas)
+
+		k := ds.NewKey("/testkey")
+		ctx := t.Context()
+
+		// First put: all replicas should fire onPut with newVal="first", oldVal=nil.
+		if err := replicas[0].Put(ctx, k, []byte("first")); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+
+		mu.Lock()
+		if len(calls) != len(replicas) {
+			t.Errorf("expected %d OnPut calls (one per replica), got %d", len(replicas), len(calls))
+		}
+		for i, c := range calls {
+			if string(c.newVal) != "first" {
+				t.Errorf("call[%d]: expected newVal %q, got %q", i, "first", c.newVal)
+			}
+			if c.oldVal != nil {
+				t.Errorf("call[%d]: expected oldVal nil on first put, got %q", i, c.oldVal)
+			}
+		}
+		calls = nil
+		mu.Unlock()
+
+		// Second put: all replicas should fire onPut with newVal="second", oldVal="first".
+		if err := replicas[0].Put(ctx, k, []byte("second")); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(calls) != len(replicas) {
+			t.Errorf("expected %d OnPut calls on second put, got %d", len(replicas), len(calls))
+		}
+		for i, c := range calls {
+			if string(c.newVal) != "second" {
+				t.Errorf("call[%d]: expected newVal %q, got %q", i, "second", c.newVal)
+			}
+			if string(c.oldVal) != "first" {
+				t.Errorf("call[%d]: expected oldVal %q, got %q", i, "first", c.oldVal)
+			}
+		}
+	})
+}
+
+func TestCRDTOnDelete(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		type hookCall struct {
+			key     ds.Key
+			lastVal []byte
+		}
+		var calls []hookCall
+		var mu sync.Mutex
+
+		opts := DefaultOptions()
+		opts.OnDelete = func(k ds.Key, lastVal []byte) {
+			mu.Lock()
+			calls = append(calls, hookCall{k, lastVal})
+			mu.Unlock()
+		}
+
+		replicas, closeReplicas := makeReplicas(t, opts)
+		t.Cleanup(closeReplicas)
+
+		ctx := t.Context()
+		k := ds.NewKey("/testkey")
+		if err := replicas[0].Put(ctx, k, []byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+
+		if err := replicas[0].Delete(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+
+		mu.Lock()
+		if len(calls) != len(replicas) {
+			t.Errorf("expected %d OnDelete calls (one per replica), got %d", len(replicas), len(calls))
+		}
+		for i, c := range calls {
+			if string(c.lastVal) != "hello" {
+				t.Errorf("call[%d]: expected lastVal %q, got %q", i, "hello", c.lastVal)
+			}
+		}
+		calls = nil
+		mu.Unlock()
+
+		// Delete the same key again — it no longer exists. Rmv produces no
+		// tombstones so Delete returns early without publishing — the hook
+		// must not fire.
+		if err := replicas[0].Delete(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+
+		mu.Lock()
+		defer mu.Unlock()
+		if n := len(calls); n != 0 {
+			t.Errorf("OnDelete should not be called for a non-existent key, got %d calls", n)
+		}
+	})
+}
+
+func TestCRDTHooksMutuallyExclusive(t *testing.T) {
+	t.Parallel()
+	store := dssync.MutexWrap(ds.NewMapDatastore())
+	dagService := mdutils.Mock()
+	namespace := ds.NewKey("/test")
+
+	t.Run("PutHook and OnPut", func(t *testing.T) {
+		bcasts, cancelBcasts := newBroadcasters(t, 1)
+		t.Cleanup(cancelBcasts)
+		opts := DefaultOptions()
+		opts.PutHook = func(ds.Key, []byte) {}
+		opts.OnPut = func(ds.Key, []byte, []byte) {}
+		_, err := New(store, namespace, dagService, bcasts[0], opts)
+		if err == nil {
+			t.Fatal("expected error when both PutHook and OnPut are set")
+		}
+	})
+
+	t.Run("DeleteHook and OnDelete", func(t *testing.T) {
+		bcasts, cancelBcasts := newBroadcasters(t, 1)
+		t.Cleanup(cancelBcasts)
+		opts := DefaultOptions()
+		opts.DeleteHook = func(ds.Key) {}
+		opts.OnDelete = func(ds.Key, []byte) {}
+		_, err := New(store, namespace, dagService, bcasts[0], opts)
+		if err == nil {
+			t.Fatal("expected error when both DeleteHook and OnDelete are set")
+		}
+	})
 }
 
 func TestCRDTBatch(t *testing.T) {
