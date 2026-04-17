@@ -1,0 +1,32 @@
+# Dependabot updates only the root go.mod/go.sum. This repo also has a module
+# at examples/globaldb whose go.sum depends transitively on the root's deps, so
+# it must be re-tidied to keep go-check CI green.
+name: Dependabot Tidy
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  tidy:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - working-directory: examples/globaldb
+        run: |
+          go mod tidy
+          git diff --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: go mod tidy examples/globaldb"
+          git push
