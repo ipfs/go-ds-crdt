@@ -607,23 +607,23 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	// key -> tombstonedBlockID. Carries the tombstoned blocks for each
 	// element in this delta.
 	deletedElems := make(map[string][]string)
-	// newVals holds the winning value for keys that were partially tombstoned
-	// (tombstone removed a previous winner but a surviving element took over).
-	// A key absent from this map was fully deleted. Doubles as the
-	// fully-deleted oracle, so it is allocated whenever any hook is registered;
-	// nil means no hooks are configured and the firing loop is skipped entirely.
-	var newVals map[string][]byte
+
+	var newVals, prevVals map[string][]byte
 	if s.hooks.putHook != nil || s.hooks.onPut != nil || s.hooks.deleteHook != nil || s.hooks.onDelete != nil {
+		// newVals holds the winning value for keys that were partially tombstoned
+		// (tombstone removed a previous winner but a surviving element took over).
+		// A key absent from this map was fully deleted. Doubles as the
+		// fully-deleted oracle, so it is allocated whenever any hook is registered;
+		// nil means no hooks are configured and the firing loop is skipped entirely.
 		newVals = make(map[string][]byte)
-	}
-	// prevVals caches the value at the time each key is first seen in this
-	// delta, before any write. Only keys that existed in the store are added;
-	// absent keys are omitted so the two-value map lookup (v, ok) cleanly
-	// distinguishes "had a value" from "was not in the store".
-	var prevVals map[string][]byte
-	if newVals != nil {
+
+		// prevVals caches the value at the time each key is first seen in this
+		// delta, before any write. Only keys that existed in the store are added;
+		// absent keys are omitted so the two-value map lookup (v, ok) cleanly
+		// distinguishes "had a value" from "was not in the store".
 		prevVals = make(map[string][]byte)
 	}
+
 	var errs []error
 	for _, e := range tombs {
 		// /namespace/tombs/<key>/<id>
