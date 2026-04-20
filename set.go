@@ -40,9 +40,9 @@ type Set interface {
 // putHook or onPut may be set; likewise for deleteHook and onDelete.
 type setHooks struct {
 	putHook    func(key ds.Key, v []byte)
-	onPut      func(key ds.Key, newVal, oldVal []byte)
+	onPut      func(PutEvent)
 	deleteHook func(key ds.Key)
-	onDelete   func(key ds.Key, lastVal []byte)
+	onDelete   func(DeleteEvent)
 }
 
 // set implements an Add-Wins Observed-Remove Set using delta-CRDTs
@@ -85,11 +85,18 @@ func newCRDTSet(
 	return set, nil
 }
 
-// triggerPutHook calls the appropriate put hook with newVal and oldVal.
-// oldVal must have been fetched from the store before the write.
-func (s *set) triggerPutHook(key string, newVal, oldVal []byte) {
+// triggerPutHook calls the appropriate put hook with newVal, oldVal, and the
+// triggering delta. oldVal must have been fetched from the store before the
+// write. delta is the merged delta that caused the update, or nil when the
+// update did not originate from a merged delta (e.g. PurgeDAG).
+func (s *set) triggerPutHook(key string, newVal, oldVal []byte, delta Delta) {
 	if s.hooks.onPut != nil {
-		s.hooks.onPut(ds.NewKey(key), newVal, oldVal)
+		s.hooks.onPut(PutEvent{
+			Key:      ds.NewKey(key),
+			OldValue: oldVal,
+			NewValue: newVal,
+			Delta:    delta,
+		})
 		return
 	}
 	if s.hooks.putHook != nil {
@@ -97,11 +104,16 @@ func (s *set) triggerPutHook(key string, newVal, oldVal []byte) {
 	}
 }
 
-// triggerDeleteHook calls the appropriate delete hook with lastVal,
-// the value that was stored before the deletion.
-func (s *set) triggerDeleteHook(key string, lastVal []byte) {
+// triggerDeleteHook calls the appropriate delete hook with lastVal (the value
+// stored before the deletion) and the triggering tombstone delta, or nil when
+// the removal did not originate from a merged delta (e.g. PurgeDAG).
+func (s *set) triggerDeleteHook(key string, lastVal []byte, delta Delta) {
 	if s.hooks.onDelete != nil {
-		s.hooks.onDelete(ds.NewKey(key), lastVal)
+		s.hooks.onDelete(DeleteEvent{
+			Key:       ds.NewKey(key),
+			LastValue: lastVal,
+			Delta:     delta,
+		})
 		return
 	}
 	if s.hooks.deleteHook != nil {
@@ -370,13 +382,20 @@ func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, 
 
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
-func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, prio uint64) error {
+// delta is the triggering delta forwarded to the put hook when the write is
+// considered the prevalent value. delta must not be nil; its priority drives
+// the write decision.
+func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, delta Delta) error {
+	if delta == nil {
+		return errors.New("setValue: delta must not be nil")
+	}
 	// If this key was tombstoned already, do not store/update the value.
 	deleted, err := s.inTombsKeyID(ctx, key, id)
 	if err != nil || deleted {
 		return err
 	}
 
+	prio := delta.GetPriority()
 	curPrio, err := s.getPriority(ctx, key)
 	if err != nil {
 		return err
@@ -418,7 +437,7 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 	}
 
 	// trigger add hook
-	s.triggerPutHook(key, value, oldVal)
+	s.triggerPutHook(key, value, oldVal, delta)
 	return nil
 }
 
@@ -543,12 +562,18 @@ NEXT:
 // but with the batching optimization the locks would need to be hold until
 // the batch is written), and one lock per key might be way worse than a single
 // global lock in the end.
-func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio uint64) error {
+//
+// delta is the triggering delta; it supplies the write priority and is
+// forwarded to the put hook. delta must not be nil when elems is non-empty.
+func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, delta Delta) error {
 	s.putElemsMux.Lock()
 	defer s.putElemsMux.Unlock()
 
 	if len(elems) == 0 {
 		return nil
+	}
+	if delta == nil {
+		return errors.New("putElems: delta must not be nil when elems is non-empty")
 	}
 
 	var store ds.Write = s.store
@@ -574,7 +599,7 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 		// update the value if applicable:
 		// * higher priority than we currently have.
 		// * not tombstoned before.
-		err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
+		err = s.setValue(ctx, store, key, id, e.GetValue(), delta)
 		if err != nil {
 			return err
 		}
@@ -589,7 +614,11 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 	return nil
 }
 
-func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
+// putTombs applies tombstones and recomputes winners for the affected keys.
+// delta is the tombstone delta that triggered the removal and is forwarded to
+// put/delete hooks. delta may be nil when the caller has no originating delta
+// (e.g. the purge path), since it is only used for hook forwarding.
+func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, delta Delta) error {
 	if len(tombs) == 0 {
 		return nil
 	}
@@ -700,13 +729,13 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 				if bytes.Equal(newVal, oldVal) {
 					continue // value unchanged, skip hook
 				}
-				s.triggerPutHook(del, newVal, oldVal)
+				s.triggerPutHook(del, newVal, oldVal, delta)
 			} else {
 				lastVal, ok := prevVals[del]
 				if !ok {
 					continue // key had no value before tombstone, nothing to notify
 				}
-				s.triggerDeleteHook(del, lastVal)
+				s.triggerDeleteHook(del, lastVal, delta)
 			}
 		}
 	}
@@ -725,12 +754,12 @@ func (s *set) Merge(ctx context.Context, d Delta, id string) error {
 		return err
 	}
 
-	err = s.putTombs(ctx, tombs)
+	err = s.putTombs(ctx, tombs, d)
 	if err != nil {
 		return err
 	}
 
-	return s.putElems(ctx, elems, id, d.GetPriority())
+	return s.putElems(ctx, elems, id, d)
 }
 
 // currently unused
@@ -876,7 +905,7 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := errors.Join(errs...); err != nil {
 			return err
 		}
-		s.triggerDeleteHook(key, oldVal)
+		s.triggerDeleteHook(key, oldVal, nil)
 	} else {
 		if err := s.store.Put(ctx, valueK, bestVal); err != nil {
 			return err
@@ -884,7 +913,7 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := s.setPriority(ctx, s.store, key, bestPrio); err != nil {
 			return err
 		}
-		s.triggerPutHook(key, bestVal, oldVal)
+		s.triggerPutHook(key, bestVal, oldVal, nil)
 	}
 
 	return nil

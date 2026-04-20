@@ -607,14 +607,19 @@ func TestCRDTOnPut(t *testing.T) {
 			key    ds.Key
 			newVal []byte
 			oldVal []byte
+			prio   uint64
 		}
 		var calls []hookCall
 		var mu sync.Mutex
 
 		opts := DefaultOptions()
-		opts.OnPut = func(k ds.Key, newVal, oldVal []byte) {
+		opts.OnPut = func(e PutEvent) {
 			mu.Lock()
-			calls = append(calls, hookCall{k, newVal, oldVal})
+			var prio uint64
+			if e.Delta != nil {
+				prio = e.Delta.GetPriority()
+			}
+			calls = append(calls, hookCall{e.Key, e.NewValue, e.OldValue, prio})
 			mu.Unlock()
 		}
 
@@ -640,6 +645,9 @@ func TestCRDTOnPut(t *testing.T) {
 			}
 			if c.oldVal != nil {
 				t.Errorf("call[%d]: expected oldVal nil on first put, got %q", i, c.oldVal)
+			}
+			if c.prio == 0 {
+				t.Errorf("call[%d]: expected non-zero delta priority, got 0 (delta not forwarded?)", i)
 			}
 		}
 		calls = nil
@@ -671,16 +679,17 @@ func TestCRDTOnDelete(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		type hookCall struct {
-			key     ds.Key
-			lastVal []byte
+			key      ds.Key
+			lastVal  []byte
+			hasDelta bool
 		}
 		var calls []hookCall
 		var mu sync.Mutex
 
 		opts := DefaultOptions()
-		opts.OnDelete = func(k ds.Key, lastVal []byte) {
+		opts.OnDelete = func(e DeleteEvent) {
 			mu.Lock()
-			calls = append(calls, hookCall{k, lastVal})
+			calls = append(calls, hookCall{e.Key, e.LastValue, e.Delta != nil})
 			mu.Unlock()
 		}
 
@@ -706,6 +715,9 @@ func TestCRDTOnDelete(t *testing.T) {
 		for i, c := range calls {
 			if string(c.lastVal) != "hello" {
 				t.Errorf("call[%d]: expected lastVal %q, got %q", i, "hello", c.lastVal)
+			}
+			if !c.hasDelta {
+				t.Errorf("call[%d]: expected non-nil Delta from tombstone merge, got nil", i)
 			}
 		}
 		calls = nil
@@ -738,7 +750,7 @@ func TestCRDTHooksMutuallyExclusive(t *testing.T) {
 		t.Cleanup(cancelBcasts)
 		opts := DefaultOptions()
 		opts.PutHook = func(ds.Key, []byte) {}
-		opts.OnPut = func(ds.Key, []byte, []byte) {}
+		opts.OnPut = func(PutEvent) {}
 		_, err := New(store, namespace, dagService, bcasts[0], opts)
 		if err == nil {
 			t.Fatal("expected error when both PutHook and OnPut are set")
@@ -750,7 +762,7 @@ func TestCRDTHooksMutuallyExclusive(t *testing.T) {
 		t.Cleanup(cancelBcasts)
 		opts := DefaultOptions()
 		opts.DeleteHook = func(ds.Key) {}
-		opts.OnDelete = func(ds.Key, []byte) {}
+		opts.OnDelete = func(DeleteEvent) {}
 		_, err := New(store, namespace, dagService, bcasts[0], opts)
 		if err == nil {
 			t.Fatal("expected error when both DeleteHook and OnDelete are set")
