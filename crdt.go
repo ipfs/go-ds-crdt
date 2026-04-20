@@ -77,6 +77,30 @@ type SessionDAGService interface {
 	Session(context.Context) ipld.NodeGetter
 }
 
+// PutEvent describes a materialised-view update delivered to OnPut.
+// Delta is the triggering delta: the one whose merge caused the state change.
+// For partial-tombstone puts (where a tombstone removed the previous winner
+// and a surviving element took over), Delta is the tombstone delta, not the
+// older delta that originally wrote the surviving value. Delta is nil when
+// the update did not originate from a merged delta (e.g. PurgeDAG).
+// Consumers must not retain Delta past the callback or mutate it.
+type PutEvent struct {
+	Key      ds.Key
+	OldValue []byte
+	NewValue []byte
+	Delta    Delta
+}
+
+// DeleteEvent describes a materialised-view removal delivered to OnDelete.
+// Delta is the tombstone delta that triggered the removal, or nil when the
+// removal did not originate from a merged delta (e.g. PurgeDAG). Consumers
+// must not retain Delta past the callback or mutate it.
+type DeleteEvent struct {
+	Key       ds.Key
+	LastValue []byte
+	Delta     Delta
+}
+
 // Options holds configurable values for Datastore.
 type Options struct {
 	Logger logging.StandardLogger
@@ -96,7 +120,7 @@ type Options struct {
 	// read per put. Mutually exclusive with PutHook. Default: nil.
 	// The callback is invoked while internal locks are held; it must not
 	// call back into the Datastore or it will deadlock.
-	OnPut func(k ds.Key, newVal, oldVal []byte)
+	OnPut func(PutEvent)
 	// DeleteHook is triggered whenever a version of an element is
 	// successfully removed from the datastore (either by a local or remote
 	// update). Unordered and concurrent updates may result in the DeleteHook
@@ -110,7 +134,7 @@ type Options struct {
 	// delete. Mutually exclusive with DeleteHook. Default: nil.
 	// The callback is invoked while internal locks are held; it must not
 	// call back into the Datastore or it will deadlock.
-	OnDelete func(k ds.Key, lastVal []byte)
+	OnDelete func(DeleteEvent)
 	// NumWorkers specifies the number of workers ready to
 	// retrieve and merge deltas while walking the DAGs. Default:
 	// 5.
