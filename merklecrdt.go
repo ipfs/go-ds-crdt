@@ -151,6 +151,7 @@ type InternalNamespaces struct {
 	Set             string
 	ProcessedBlocks string
 	DirtyBitKey     string
+	BadShutdownKey  string
 	VersionKey      string
 }
 
@@ -199,6 +200,9 @@ func NewMerkleCRDT(
 		}
 		if ns := in.DirtyBitKey; ns != "" {
 			opts.crdtOpts.Namespaces.DirtyBitKey = ns
+		}
+		if ns := in.BadShutdownKey; ns != "" {
+			opts.crdtOpts.Namespaces.BadShutdownKey = ns
 		}
 		if ns := in.VersionKey; ns != "" {
 			opts.crdtOpts.Namespaces.VersionKey = ns
