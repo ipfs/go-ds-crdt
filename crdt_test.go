@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	blockstore "github.com/ipfs/boxo/blockstore"
@@ -1652,4 +1653,217 @@ func TestPurgeDAGCleanStore(t *testing.T) {
 	if len(remaining) != 1 {
 		t.Errorf("expected exactly 1 key (version) remaining, got %d: %v", len(remaining), remaining)
 	}
+}
+
+// holdingDAGSvc wraps an ipld.DAGService and blocks fetches of any CID for
+// which hold() has been called. The fetch unblocks when release() is called
+// or when the fetch context is cancelled. Used to simulate a peer that has
+// not yet received a specific block.
+type holdingDAGSvc struct {
+	ipld.DAGService
+	mu    sync.Mutex
+	holds map[cid.Cid]chan struct{}
+}
+
+func (h *holdingDAGSvc) hold(c cid.Cid) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.holds == nil {
+		h.holds = make(map[cid.Cid]chan struct{})
+	}
+	h.holds[c] = make(chan struct{})
+}
+
+func (h *holdingDAGSvc) release(c cid.Cid) {
+	h.mu.Lock()
+	ch, ok := h.holds[c]
+	delete(h.holds, c)
+	h.mu.Unlock()
+	if ok {
+		close(ch)
+	}
+}
+
+func (h *holdingDAGSvc) wait(ctx context.Context, c cid.Cid) error {
+	h.mu.Lock()
+	ch, ok := h.holds[c]
+	h.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *holdingDAGSvc) Get(ctx context.Context, c cid.Cid) (ipld.Node, error) {
+	if err := h.wait(ctx, c); err != nil {
+		return nil, err
+	}
+	return h.DAGService.Get(ctx, c)
+}
+
+func (h *holdingDAGSvc) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipld.NodeOption {
+	out := make(chan *ipld.NodeOption, len(cids))
+	go func() {
+		defer close(out)
+		for _, c := range cids {
+			if err := h.wait(ctx, c); err != nil {
+				out <- &ipld.NodeOption{Err: err}
+				return
+			}
+		}
+		for opt := range h.DAGService.GetMany(ctx, cids) {
+			out <- opt
+		}
+	}()
+	return out
+}
+
+// TestPartialSyncCleanCloseRecovery exercises a 2-peer scenario where peer0
+// publishes three blocks and peer1 misses the middle one. peer0 is configured
+// with BroadcastBatchDelay so that the 2nd and 3rd Puts are folded into a
+// single broadcast advertising block 3 as the head (block 2 never appears in
+// a broadcast). peer1 receives the broadcast, fetches and processes block 3,
+// and then blocks fetching its parent (block 2). peer1 is closed cleanly in
+// that state, then reopened with the hold released. The test then waits
+// through two rebroadcast intervals to see whether rebroadcasts alone drive
+// peer1 to recover the missing block.
+func TestPartialSyncCleanCloseRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+
+		bs := mdutils.Bserv()
+		dagserv := merkledag.NewDAGService(bs)
+
+		bcasts, cancelBcasts := newBroadcasters(t, 2)
+		t.Cleanup(cancelBcasts)
+
+		const (
+			batchDelay          = time.Second
+			rebroadcastInterval = time.Minute
+		)
+
+		mkOpts := func(name string, batch time.Duration) *Options {
+			o := DefaultOptions()
+			o.Logger = &testLogger{name: name + ": ", l: DefaultOptions().Logger}
+			o.RebroadcastInterval = rebroadcastInterval
+			o.RepairInterval = time.Hour
+			o.BroadcastBatchDelay = batch
+			o.NumWorkers = 1
+			o.DAGSyncerTimeout = time.Hour
+			return o
+		}
+
+		mapDs0 := dssync.MutexWrap(ds.NewMapDatastore())
+		peer0, err := New(mapDs0, ds.NewKey("crdttest"), dagserv, bcasts[0], mkOpts("p0", batchDelay))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = peer0.Close() })
+
+		holder := &holdingDAGSvc{DAGService: dagserv}
+		mapDs1 := dssync.MutexWrap(ds.NewMapDatastore())
+		peer1, err := New(mapDs1, ds.NewKey("crdttest"), holder, bcasts[1], mkOpts("p1", 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Phase 1: peer0 writes block 1; peer1 syncs it.
+		if err := peer0.Put(ctx, ds.NewKey("/k1"), []byte("v1")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(batchDelay)
+		synctest.Wait()
+		h0, _, _ := peer0.heads.List(ctx)
+		h1, _, _ := peer1.heads.List(ctx)
+		if len(h0) != 1 || len(h1) != 1 || !h0[0].Cid.Equals(h1[0].Cid) {
+			t.Fatalf("peer1 should share peer0's head: p0=%v p1=%v", h0, h1)
+		}
+		block1 := h0[0].Cid
+
+		// Phase 2: hold block 2, then publish k2 and k3 back-to-back so they
+		// batch into a single broadcast advertising block 3 as the only head.
+		if err := peer0.Put(ctx, ds.NewKey("/k2"), []byte("v2")); err != nil {
+			t.Fatal(err)
+		}
+		h0, _, _ = peer0.heads.List(ctx)
+		block2 := h0[0].Cid
+		if block2.Equals(block1) {
+			t.Fatal("peer0 head should have advanced past block 1")
+		}
+		holder.hold(block2)
+		if err := peer0.Put(ctx, ds.NewKey("/k3"), []byte("v3")); err != nil {
+			t.Fatal(err)
+		}
+		h0, _, _ = peer0.heads.List(ctx)
+		block3 := h0[0].Cid
+
+		// Let the batch timer fire once. peer1 receives [block3], processes
+		// block 3, then blocks fetching block 2 on holder.
+		time.Sleep(batchDelay)
+		synctest.Wait()
+
+		p3, err := peer1.isProcessed(ctx, block3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !p3 {
+			t.Fatal("peer1 should have processed block 3")
+		}
+		p2, err := peer1.isProcessed(ctx, block2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p2 {
+			t.Fatal("peer1 should not have processed block 2 while it is held")
+		}
+		// peer1's head must still be block1: block3 is processed but not
+		// promoted to head because its child block2 is queued for processing
+		// (queuedChildren.Visit returns true on first visit), so processNode
+		// takes the "keep walking down" branch instead of adding block3 as a
+		// head. The head only advances once block2 is processed.
+		h1Mid, _, err := peer1.heads.List(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(h1Mid) != 1 || !h1Mid[0].Cid.Equals(block1) {
+			t.Fatalf("peer1 head should still be block1 (%s) while block2 is held, got %v", block1, h1Mid)
+		}
+
+		// Clean close while block 2 is still held. ctx cancellation
+		// propagates into holder.wait, so the in-flight fetch returns
+		// without waiting on any external error.
+		if err := peer1.Close(); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+
+		// Reopen peer1 with block 2 released, and wait through two
+		// rebroadcast intervals to see whether rebroadcasts alone recover
+		// the missing block.
+		holder.release(block2)
+		peer1b, err := New(mapDs1, ds.NewKey("crdttest"), holder, bcasts[1], mkOpts("p1b", 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = peer1b.Close() })
+
+		time.Sleep(3 * rebroadcastInterval)
+		synctest.Wait()
+
+		p2After, _ := peer1b.isProcessed(ctx, block2)
+		p3After, _ := peer1b.isProcessed(ctx, block3)
+		hAfter, _, _ := peer1b.heads.List(ctx)
+		dirtyAfter := peer1b.IsDirty(ctx)
+
+		if p2After && len(hAfter) == 1 && hAfter[0].Cid.Equals(block3) && !dirtyAfter {
+			return
+		}
+		t.Fatalf("peer1 did not recover after 3 rebroadcasts: block2.processed=%v block3.processed=%v heads=%v dirty=%v (want head=%s, block2 processed, dirty=false)",
+			p2After, p3After, hAfter, dirtyAfter, block3)
+	})
 }
