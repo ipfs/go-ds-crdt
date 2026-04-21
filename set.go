@@ -676,7 +676,10 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, delta Delta) er
 			return err
 		}
 
-		if v == nil {
+		// p == 0 means findBestValue found no surviving element: real deltas
+		// always have priority >= 1 (assigned as height+1 in addDAGNode), so a
+		// zero priority can only come from the zero-value init.
+		if p == 0 {
 			delete(newVals, key)
 			if err = store.Delete(ctx, valueK); err != nil {
 				errs = append(errs, err)
@@ -896,7 +899,10 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		oldVal, _ = s.store.Get(ctx, valueK)
 	}
 
-	if bestVal == nil {
+	// bestPrio == 0 means findBestValue found no surviving element: real deltas
+	// always have priority >= 1 (assigned as height+1 in addDAGNode), so a zero
+	// priority can only come from the zero-value init.
+	if bestPrio == 0 {
 		var errs []error
 		if err := s.store.Delete(ctx, valueK); err != nil && !errors.Is(err, ds.ErrNotFound) {
 			errs = append(errs, err)
