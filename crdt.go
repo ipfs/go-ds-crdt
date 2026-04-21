@@ -76,28 +76,35 @@ type SessionDAGService interface {
 	Session(context.Context) ipld.NodeGetter
 }
 
-// PutEvent describes a materialised-view update delivered to OnPut.
-// Delta is the triggering delta: the one whose merge caused the state change.
-// For partial-tombstone puts (where a tombstone removed the previous winner
-// and a surviving element took over), Delta is the tombstone delta, not the
-// older delta that originally wrote the surviving value. Delta is nil when
-// the update did not originate from a merged delta (e.g. PurgeDAG).
-// Consumers must not retain Delta past the callback or mutate it.
+// PutEvent describes a materialised-view update delivered to PutHook.
 type PutEvent struct {
-	Key      ds.Key
+	// Key whose value was updated.
+	Key ds.Key
+	// OldValue is the previous value for the key, if any. It is populated only
+	// when HookLoadPreviousValue is true, otherwise it is nil.
 	OldValue []byte
+	// NewValue is the new value for the key after the update.
 	NewValue []byte
-	Delta    Delta
+	// Delta is the triggering delta: the one whose merge caused the state
+	// change. For partial-tombstone puts (where a tombstone removed the previous
+	// winner and a surviving element took over), Delta is the tombstone delta,
+	// not the older delta that originally wrote the surviving value. Delta is
+	// nil when the update did not originate from a merged delta (e.g. PurgeDAG).
+	// Consumers must not retain Delta past the callback or mutate it.
+	Delta Delta
 }
 
-// DeleteEvent describes a materialised-view removal delivered to OnDelete.
-// Delta is the tombstone delta that triggered the removal, or nil when the
-// removal did not originate from a merged delta (e.g. PurgeDAG). Consumers
-// must not retain Delta past the callback or mutate it.
+// DeleteEvent describes a materialised-view removal delivered to DeleteHook.
 type DeleteEvent struct {
-	Key       ds.Key
+	// Key whose value was updated.
+	Key ds.Key
+	// LastValue is the previous value for the key, if any. It is populated only
+	// when HookLoadPreviousValue is true, otherwise it is nil.
 	LastValue []byte
-	Delta     Delta
+	// Delta is the tombstone delta that triggered the removal, or nil when the
+	// removal did not originate from a merged delta (e.g. PurgeDAG). Consumers
+	// must not retain Delta past the callback or mutate it.
+	Delta Delta
 }
 
 // Options holds configurable values for Datastore.
@@ -111,29 +118,37 @@ type Options struct {
 	RebroadcastInterval time.Duration
 	// PutHook is triggered whenever an element is successfully added to the
 	// datastore (either by a local or remote update), and only when that
-	// addition is considered the prevalent value. Default: nil.
-	// Mutually exclusive with OnPut.
-	PutHook func(k ds.Key, v []byte)
-	// OnPut is like PutHook but also receives the previous value for the key
-	// (nil if the key did not exist before). This incurs an extra datastore
-	// read per put. Mutually exclusive with PutHook. Default: nil.
+	// addition is considered the prevalent value. For partial-tombstone puts
+	// (where a tombstone removed the previous winner and a surviving element
+	// took over), the hook fires with the surviving value. Default: nil.
+	//
+	// PutEvent.OldValue is populated only when HookLoadPreviousValue is true,
+	// otherwise it is nil. When HookLoadPreviousValue is true, the hook is not
+	// fired for partial tombstones where the winning value did not change.
+	//
 	// The callback is invoked while internal locks are held; it must not
 	// call back into the Datastore or it will deadlock.
-	OnPut func(PutEvent)
-	// DeleteHook is triggered whenever a version of an element is
-	// successfully removed from the datastore (either by a local or remote
-	// update). Unordered and concurrent updates may result in the DeleteHook
-	// being triggered even though the element is still present in the
-	// datastore because it was re-added or not fully tombstoned. If that is
-	// relevant, use Has() to check if the removed element is still part of
-	// the datastore. Default: nil. Mutually exclusive with OnDelete.
-	DeleteHook func(k ds.Key)
-	// OnDelete is like DeleteHook but also receives the last known value for
-	// the key before it was removed. This incurs an extra datastore read per
-	// delete. Mutually exclusive with DeleteHook. Default: nil.
+	PutHook func(PutEvent)
+	// DeleteHook is triggered whenever an element is fully removed from the
+	// datastore (either by a local or remote update), i.e. when no surviving
+	// element exists for the key after tombstone processing. Default: nil.
+	//
+	// DeleteEvent.LastValue is populated only when HookLoadPreviousValue is true,
+	// otherwise it is nil. When HookLoadPreviousValue is true, the hook is not
+	// fired for tombstones targeting keys that had no prior value in the
+	// datastore.
+	//
 	// The callback is invoked while internal locks are held; it must not
 	// call back into the Datastore or it will deadlock.
-	OnDelete func(DeleteEvent)
+	DeleteHook func(DeleteEvent)
+	// HookLoadPreviousValue controls whether PutHook/DeleteHook receive the
+	// previous value for the key. When true, the datastore is read before
+	// each hook-relevant write so that PutEvent.OldValue and
+	// DeleteEvent.LastValue can be populated; this incurs one extra read per
+	// triggered hook. When true, the hook is also skipped when the observed
+	// value would not actually change (see PutHook/DeleteHook doc). Default:
+	// false.
+	HookLoadPreviousValue bool
 	// NumWorkers specifies the number of workers ready to
 	// retrieve and merge deltas while walking the DAGs. Default:
 	// 5.
@@ -219,14 +234,13 @@ func (opts *Options) verify() error {
 // DefaultOptions initializes an Options object with sensible defaults.
 func DefaultOptions() *Options {
 	return &Options{
-		Logger:              logging.Logger("crdt"),
-		RebroadcastInterval: time.Minute,
-		PutHook:             nil,
-		OnPut:               nil,
-		DeleteHook:          nil,
-		OnDelete:            nil,
-		NumWorkers:          5,
-		DAGSyncerTimeout:    5 * time.Minute,
+		Logger:                logging.Logger("crdt"),
+		RebroadcastInterval:   time.Minute,
+		PutHook:               nil,
+		DeleteHook:            nil,
+		HookLoadPreviousValue: false,
+		NumWorkers:            5,
+		DAGSyncerTimeout:      5 * time.Minute,
 		// always keeping
 		// https://github.com/libp2p/go-libp2p-core/blob/master/network/network.go#L23
 		// in sight
@@ -330,17 +344,10 @@ func New(
 		return nil, err
 	}
 
-	if opts.PutHook != nil && opts.OnPut != nil {
-		return nil, errors.New("PutHook and OnPut are mutually exclusive")
-	}
-	if opts.DeleteHook != nil && opts.OnDelete != nil {
-		return nil, errors.New("DeleteHook and OnDelete are mutually exclusive")
-	}
 	hooks := setHooks{
-		putHook:    opts.PutHook,
-		onPut:      opts.OnPut,
-		deleteHook: opts.DeleteHook,
-		onDelete:   opts.OnDelete,
+		putHook:               opts.PutHook,
+		deleteHook:            opts.DeleteHook,
+		hookLoadPreviousValue: opts.HookLoadPreviousValue,
 	}
 
 	// <namespace>/set
