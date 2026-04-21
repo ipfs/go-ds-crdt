@@ -45,11 +45,12 @@ var (
 
 // datastore namespace keys. Short keys save space and memory.
 const (
-	headsNs           = "h" // heads
-	dagHeadsNs        = "a" // dagHeads - heads for named dags.
-	setNs             = "s" // set
-	processedBlocksNs = "b" // blocks
-	dirtyBitKey       = "d" // dirty
+	headsNs           = "h"  // heads
+	dagHeadsNs        = "a"  // dagHeads - heads for named dags.
+	setNs             = "s"  // set
+	processedBlocksNs = "b"  // blocks
+	dirtyBitKey       = "d"  // dirty
+	badShutdownKey    = "bs" // bad-shutdown: set on New, cleared on clean Close
 	versionKey        = "crdt_version"
 )
 
@@ -173,6 +174,7 @@ func (opts *Options) verify() error {
 		opts.crdtOpts.Namespaces.Set == "",
 		opts.crdtOpts.Namespaces.ProcessedBlocks == "",
 		opts.crdtOpts.Namespaces.DirtyBitKey == "",
+		opts.crdtOpts.Namespaces.BadShutdownKey == "",
 		opts.crdtOpts.Namespaces.VersionKey == "":
 		panic("one or several InternalNamespaces are unset, and this should never happen")
 	}
@@ -205,6 +207,7 @@ func DefaultOptions() *Options {
 				Set:             setNs,
 				ProcessedBlocks: processedBlocksNs,
 				DirtyBitKey:     dirtyBitKey,
+				BadShutdownKey:  badShutdownKey,
 				VersionKey:      versionKey,
 			},
 		},
@@ -350,6 +353,26 @@ func New(
 	if err != nil {
 		cancel()
 		return nil, err
+	}
+
+	// Detect whether the previous run ended with a clean Close(). If the
+	// bad-shutdown key is present at startup, the process died without clearing
+	// it (crash, kill, OOM, power loss); mark the store dirty so the repair loop
+	// walks the DAG and recovers any partially-processed branches.
+	hadBadShutdown, err := dstore.store.Has(ctx, dstore.badShutdownKey())
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("error checking bad-shutdown key: %w", err)
+	}
+	if hadBadShutdown {
+		dstore.logger.Warn("previous shutdown was not clean; marking datastore as dirty to trigger repair")
+		dstore.MarkDirty(ctx)
+	}
+	// Set the bad-shutdown key so that if we crash before the next clean
+	// Close(), we will know on the next startup and trigger a repair.
+	if err := dstore.store.Put(ctx, dstore.badShutdownKey(), nil); err != nil {
+		cancel()
+		return nil, fmt.Errorf("error writing bad-shutdown key: %w", err)
 	}
 
 	headList, maxHeight, err := dstore.heads.List(ctx)
@@ -950,6 +973,13 @@ func (store *Datastore) dirtyKey() ds.Key {
 	return store.namespace.ChildString(store.opts.crdtOpts.Namespaces.DirtyBitKey)
 }
 
+// badShutdownKey is written on New and removed on a clean Close. Its presence
+// at startup indicates the previous run did not Close() cleanly, so the store
+// should be treated as dirty and repaired.
+func (store *Datastore) badShutdownKey() ds.Key {
+	return store.namespace.ChildString(store.opts.crdtOpts.Namespaces.BadShutdownKey)
+}
+
 // MarkDirty marks the Datastore as dirty.
 func (store *Datastore) MarkDirty(ctx context.Context) {
 	store.logger.Warn("marking datastore as dirty")
@@ -1327,10 +1357,17 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 
 // Close shuts down the CRDT datastore. It should not be used afterwards.
 func (store *Datastore) Close() error {
+	closeCtx := context.Background()
 	store.cancel()
 	store.wg.Wait()
-	if store.IsDirty(store.ctx) {
+	if store.IsDirty(closeCtx) {
 		store.logger.Warn("datastore is being closed marked as dirty")
+	}
+	// Clear the bad-shutdown key last, after all workers have exited, so
+	// any dirty marks they still needed to write have had a chance to
+	// land. Use a background context — store.ctx was cancelled above.
+	if err := store.store.Delete(closeCtx, store.badShutdownKey()); err != nil {
+		store.logger.Errorf("error clearing bad-shutdown key: %s", err)
 	}
 	return nil
 }
