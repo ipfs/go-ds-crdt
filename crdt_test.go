@@ -573,10 +573,10 @@ func TestCRDTHooks(t *testing.T) {
 		var deleted int64
 
 		opts := DefaultOptions()
-		opts.PutHook = func(k ds.Key, v []byte) {
+		opts.PutHook = func(PutEvent) {
 			atomic.AddInt64(&put, 1)
 		}
-		opts.DeleteHook = func(k ds.Key) {
+		opts.DeleteHook = func(DeleteEvent) {
 			atomic.AddInt64(&deleted, 1)
 		}
 
@@ -600,7 +600,9 @@ func TestCRDTHooks(t *testing.T) {
 	})
 }
 
-func TestCRDTOnPut(t *testing.T) {
+// TestCRDTPutHookLoadsPreviousValue verifies that PutHook receives OldValue
+// populated when HookLoadPreviousValue is enabled.
+func TestCRDTPutHookLoadsPreviousValue(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		type hookCall struct {
@@ -613,7 +615,8 @@ func TestCRDTOnPut(t *testing.T) {
 		var mu sync.Mutex
 
 		opts := DefaultOptions()
-		opts.OnPut = func(e PutEvent) {
+		opts.HookLoadPreviousValue = true
+		opts.PutHook = func(e PutEvent) {
 			mu.Lock()
 			var prio uint64
 			if e.Delta != nil {
@@ -629,7 +632,7 @@ func TestCRDTOnPut(t *testing.T) {
 		k := ds.NewKey("/testkey")
 		ctx := t.Context()
 
-		// First put: all replicas should fire onPut with newVal="first", oldVal=nil.
+		// First put: all replicas should fire PutHook with newVal="first", oldVal=nil.
 		if err := replicas[0].Put(ctx, k, []byte("first")); err != nil {
 			t.Fatal(err)
 		}
@@ -637,7 +640,7 @@ func TestCRDTOnPut(t *testing.T) {
 
 		mu.Lock()
 		if len(calls) != len(replicas) {
-			t.Errorf("expected %d OnPut calls (one per replica), got %d", len(replicas), len(calls))
+			t.Errorf("expected %d PutHook calls (one per replica), got %d", len(replicas), len(calls))
 		}
 		for i, c := range calls {
 			if string(c.newVal) != "first" {
@@ -653,7 +656,7 @@ func TestCRDTOnPut(t *testing.T) {
 		calls = nil
 		mu.Unlock()
 
-		// Second put: all replicas should fire onPut with newVal="second", oldVal="first".
+		// Second put: all replicas should fire PutHook with newVal="second", oldVal="first".
 		if err := replicas[0].Put(ctx, k, []byte("second")); err != nil {
 			t.Fatal(err)
 		}
@@ -662,7 +665,7 @@ func TestCRDTOnPut(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		if len(calls) != len(replicas) {
-			t.Errorf("expected %d OnPut calls on second put, got %d", len(replicas), len(calls))
+			t.Errorf("expected %d PutHook calls on second put, got %d", len(replicas), len(calls))
 		}
 		for i, c := range calls {
 			if string(c.newVal) != "second" {
@@ -675,7 +678,10 @@ func TestCRDTOnPut(t *testing.T) {
 	})
 }
 
-func TestCRDTOnDelete(t *testing.T) {
+// TestCRDTDeleteHookLoadsPreviousValue verifies that DeleteHook receives
+// LastValue populated when HookLoadPreviousValue is enabled, and is suppressed for
+// tombstones targeting keys with no prior value.
+func TestCRDTDeleteHookLoadsPreviousValue(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		type hookCall struct {
@@ -687,7 +693,8 @@ func TestCRDTOnDelete(t *testing.T) {
 		var mu sync.Mutex
 
 		opts := DefaultOptions()
-		opts.OnDelete = func(e DeleteEvent) {
+		opts.HookLoadPreviousValue = true
+		opts.DeleteHook = func(e DeleteEvent) {
 			mu.Lock()
 			calls = append(calls, hookCall{e.Key, e.LastValue, e.Delta != nil})
 			mu.Unlock()
@@ -710,7 +717,7 @@ func TestCRDTOnDelete(t *testing.T) {
 
 		mu.Lock()
 		if len(calls) != len(replicas) {
-			t.Errorf("expected %d OnDelete calls (one per replica), got %d", len(replicas), len(calls))
+			t.Errorf("expected %d DeleteHook calls (one per replica), got %d", len(replicas), len(calls))
 		}
 		for i, c := range calls {
 			if string(c.lastVal) != "hello" {
@@ -734,38 +741,7 @@ func TestCRDTOnDelete(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		if n := len(calls); n != 0 {
-			t.Errorf("OnDelete should not be called for a non-existent key, got %d calls", n)
-		}
-	})
-}
-
-func TestCRDTHooksMutuallyExclusive(t *testing.T) {
-	t.Parallel()
-	store := dssync.MutexWrap(ds.NewMapDatastore())
-	dagService := mdutils.Mock()
-	namespace := ds.NewKey("/test")
-
-	t.Run("PutHook and OnPut", func(t *testing.T) {
-		bcasts, cancelBcasts := newBroadcasters(t, 1)
-		t.Cleanup(cancelBcasts)
-		opts := DefaultOptions()
-		opts.PutHook = func(ds.Key, []byte) {}
-		opts.OnPut = func(PutEvent) {}
-		_, err := New(store, namespace, dagService, bcasts[0], opts)
-		if err == nil {
-			t.Fatal("expected error when both PutHook and OnPut are set")
-		}
-	})
-
-	t.Run("DeleteHook and OnDelete", func(t *testing.T) {
-		bcasts, cancelBcasts := newBroadcasters(t, 1)
-		t.Cleanup(cancelBcasts)
-		opts := DefaultOptions()
-		opts.DeleteHook = func(ds.Key) {}
-		opts.OnDelete = func(DeleteEvent) {}
-		_, err := New(store, namespace, dagService, bcasts[0], opts)
-		if err == nil {
-			t.Fatal("expected error when both DeleteHook and OnDelete are set")
+			t.Errorf("DeleteHook should not be called for a non-existent key, got %d calls", n)
 		}
 	})
 }

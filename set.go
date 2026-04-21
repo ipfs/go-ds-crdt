@@ -36,13 +36,12 @@ type Set interface {
 	InSet(ctx context.Context, key string) (bool, error)
 }
 
-// setHooks holds the hook functions for put and delete events. Only one of
-// putHook or onPut may be set; likewise for deleteHook and onDelete.
+// setHooks holds the hook functions for put and delete events and whether
+// the hooks should be invoked with the previous value loaded from the store.
 type setHooks struct {
-	putHook    func(key ds.Key, v []byte)
-	onPut      func(PutEvent)
-	deleteHook func(key ds.Key)
-	onDelete   func(DeleteEvent)
+	putHook               func(PutEvent)
+	deleteHook            func(DeleteEvent)
+	hookLoadPreviousValue bool
 }
 
 // set implements an Add-Wins Observed-Remove Set using delta-CRDTs
@@ -85,40 +84,36 @@ func newCRDTSet(
 	return set, nil
 }
 
-// triggerPutHook calls the appropriate put hook with newVal, oldVal, and the
-// triggering delta. oldVal must have been fetched from the store before the
-// write. delta is the merged delta that caused the update, or nil when the
-// update did not originate from a merged delta (e.g. PurgeDAG).
+// triggerPutHook calls the put hook with newVal, oldVal, and the triggering
+// delta. oldVal must have been fetched from the store before the write (or be
+// nil if hookLoadPreviousValue is false). delta is the merged delta that caused
+// the update, or nil when the update did not originate from a merged delta
+// (e.g. PurgeDAG).
 func (s *set) triggerPutHook(key string, newVal, oldVal []byte, delta Delta) {
-	if s.hooks.onPut != nil {
-		s.hooks.onPut(PutEvent{
-			Key:      ds.NewKey(key),
-			OldValue: oldVal,
-			NewValue: newVal,
-			Delta:    delta,
-		})
+	if s.hooks.putHook == nil {
 		return
 	}
-	if s.hooks.putHook != nil {
-		s.hooks.putHook(ds.NewKey(key), newVal)
-	}
+	s.hooks.putHook(PutEvent{
+		Key:      ds.NewKey(key),
+		OldValue: oldVal,
+		NewValue: newVal,
+		Delta:    delta,
+	})
 }
 
-// triggerDeleteHook calls the appropriate delete hook with lastVal (the value
-// stored before the deletion) and the triggering tombstone delta, or nil when
-// the removal did not originate from a merged delta (e.g. PurgeDAG).
+// triggerDeleteHook calls the delete hook with lastVal (the value stored
+// before the deletion, or nil if hookLoadPreviousValue is false) and the
+// triggering tombstone delta, or nil when the removal did not originate from
+// a merged delta (e.g. PurgeDAG).
 func (s *set) triggerDeleteHook(key string, lastVal []byte, delta Delta) {
-	if s.hooks.onDelete != nil {
-		s.hooks.onDelete(DeleteEvent{
-			Key:       ds.NewKey(key),
-			LastValue: lastVal,
-			Delta:     delta,
-		})
+	if s.hooks.deleteHook == nil {
 		return
 	}
-	if s.hooks.deleteHook != nil {
-		s.hooks.deleteHook(ds.NewKey(key))
-	}
+	s.hooks.deleteHook(DeleteEvent{
+		Key:       ds.NewKey(key),
+		LastValue: lastVal,
+		Delta:     delta,
+	})
 }
 
 // Add returns a new delta-set adding the given key/value.
@@ -408,20 +403,20 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 
 	var oldVal []byte
 	if prio == curPrio {
-		oldVal, err = s.store.Get(ctx, valueK)
-		if err != nil && !errors.Is(err, ds.ErrNotFound) {
-			s.logger.Errorf("error reading current value for key %s: %s", key, err)
-		}
+		oldVal, _ = s.store.Get(ctx, valueK)
 		// new value greater than old
 		if bytes.Compare(oldVal, value) >= 0 {
 			return nil
 		}
-	} else if s.hooks.onPut != nil {
-		// Fetch old value before any write for the onPut hook.
-		oldVal, err = s.store.Get(ctx, valueK)
-		if err != nil && !errors.Is(err, ds.ErrNotFound) {
-			s.logger.Errorf("error reading current value for onPut hook: key %s: %s", key, err)
-		}
+	} else if s.hooks.hookLoadPreviousValue && s.hooks.putHook != nil {
+		// Fetch old value before the write so the hook receives it.
+		oldVal, _ = s.store.Get(ctx, valueK)
+	}
+
+	// The oldVal read above always happens when prio == curPrio (needed for
+	// the Compare). Only forward it to the hook when hookLoadPreviousValue is set.
+	if !s.hooks.hookLoadPreviousValue {
+		oldVal = nil
 	}
 
 	// store value
@@ -638,7 +633,7 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, delta Delta) er
 	deletedElems := make(map[string][]string)
 
 	var newVals, prevVals map[string][]byte
-	if s.hooks.putHook != nil || s.hooks.onPut != nil || s.hooks.deleteHook != nil || s.hooks.onDelete != nil {
+	if s.hooks.putHook != nil || s.hooks.deleteHook != nil {
 		// newVals holds the winning value for keys that were partially tombstoned
 		// (tombstone removed a previous winner but a surviving element took over).
 		// A key absent from this map was fully deleted. Doubles as the
@@ -646,11 +641,13 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, delta Delta) er
 		// nil means no hooks are configured and the firing loop is skipped entirely.
 		newVals = make(map[string][]byte)
 
-		// prevVals caches the value at the time each key is first seen in this
-		// delta, before any write. Only keys that existed in the store are added;
-		// absent keys are omitted so the two-value map lookup (v, ok) cleanly
-		// distinguishes "had a value" from "was not in the store".
-		prevVals = make(map[string][]byte)
+		if s.hooks.hookLoadPreviousValue {
+			// prevVals caches the value at the time each key is first seen in this
+			// delta, before any write. Only keys that existed in the store are added;
+			// absent keys are omitted so the two-value map lookup (v, ok) cleanly
+			// distinguishes "had a value" from "was not in the store".
+			prevVals = make(map[string][]byte)
+		}
 	}
 
 	var errs []error
@@ -664,13 +661,11 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, delta Delta) er
 		// this key, so hooks receive the pre-tombstone value.
 		if prevVals != nil {
 			if _, seen := prevVals[key]; !seen {
-				curVal, err := s.store.Get(ctx, valueK)
-				if err == nil {
+				if curVal, err := s.store.Get(ctx, valueK); err == nil {
 					prevVals[key] = curVal
-				} else if !errors.Is(err, ds.ErrNotFound) {
-					s.logger.Errorf("error reading value before tombstone for key %s: %s", key, err)
+					// Any error (including ErrNotFound): omit from map; hook
+					// firing uses (v, ok) to detect absence.
 				}
-				// ErrNotFound: omit from map; hook firing uses (v, ok) to detect absence.
 			}
 		}
 		deletedElems[key] = append(deletedElems[key], id)
@@ -722,18 +717,28 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, delta Delta) er
 	// Skipped entirely when no hooks are registered (newVals == nil).
 	// Fully deleted keys (absent from newVals) trigger the delete hook;
 	// partially tombstoned keys (present in newVals) trigger the put hook.
+	// When hookLoadPreviousValue is set, prevVals is used to suppress no-op hook
+	// firings (value unchanged, or tombstone for a key that had no value).
 	if newVals != nil {
 		for del := range deletedElems {
 			if newVal, partial := newVals[del]; partial {
-				oldVal := prevVals[del] // nil if key was absent
-				if bytes.Equal(newVal, oldVal) {
-					continue // value unchanged, skip hook
+				var oldVal []byte
+				if prevVals != nil {
+					oldVal = prevVals[del] // nil if key was absent
+					if bytes.Equal(newVal, oldVal) {
+						// TODO: maybe check priority instead of skipping after byte comparison.
+						continue // value unchanged, skip hook
+					}
 				}
 				s.triggerPutHook(del, newVal, oldVal, delta)
 			} else {
-				lastVal, ok := prevVals[del]
-				if !ok {
-					continue // key had no value before tombstone, nothing to notify
+				var lastVal []byte
+				if prevVals != nil {
+					var ok bool
+					lastVal, ok = prevVals[del]
+					if !ok {
+						continue // key had no value before tombstone, nothing to notify
+					}
 				}
 				s.triggerDeleteHook(del, lastVal, delta)
 			}
@@ -887,11 +892,8 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 	// Fetch old value before modifying the value key, so hooks receive the
 	// pre-purge value. Only read when a hook that needs it is configured.
 	var oldVal []byte
-	if s.hooks.onPut != nil || s.hooks.onDelete != nil {
-		oldVal, err = s.store.Get(ctx, valueK)
-		if err != nil && !errors.Is(err, ds.ErrNotFound) {
-			s.logger.Errorf("error reading value before purge for hook: key %s: %s", key, err)
-		}
+	if s.hooks.hookLoadPreviousValue && (s.hooks.putHook != nil || s.hooks.deleteHook != nil) {
+		oldVal, _ = s.store.Get(ctx, valueK)
 	}
 
 	if bestVal == nil {

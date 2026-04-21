@@ -57,8 +57,8 @@ func TestPutTombsEmpty(t *testing.T) {
 	ctx := t.Context()
 	var fired bool
 	s := newTestSet(t, mdutils.Mock(), setHooks{
-		putHook:    func(ds.Key, []byte) { fired = true },
-		deleteHook: func(ds.Key) { fired = true },
+		putHook:    func(PutEvent) { fired = true },
+		deleteHook: func(DeleteEvent) { fired = true },
 	})
 
 	if err := s.putTombs(ctx, nil, nil); err != nil {
@@ -103,7 +103,7 @@ func TestPutTombsFullDelete(t *testing.T) {
 		ctx := t.Context()
 		dag := mdutils.Mock()
 		var keys []ds.Key
-		s := newTestSet(t, dag, setHooks{deleteHook: func(k ds.Key) { keys = append(keys, k) }})
+		s := newTestSet(t, dag, setHooks{deleteHook: func(e DeleteEvent) { keys = append(keys, e.Key) }})
 		id := addElem(t, s, dag, "foo", []byte("hello"), 1)
 
 		if err := s.putTombs(ctx, []*pb.Element{{Key: "foo", Id: id}}, nil); err != nil {
@@ -114,14 +114,15 @@ func TestPutTombsFullDelete(t *testing.T) {
 		}
 	})
 
-	t.Run("onDelete receives lastVal", func(t *testing.T) {
+	t.Run("deleteHook receives lastVal with hookLoadPreviousValue", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()
 		dag := mdutils.Mock()
 		var gotKey ds.Key
 		var gotVal []byte
 		s := newTestSet(t, dag, setHooks{
-			onDelete: func(e DeleteEvent) { gotKey, gotVal = e.Key, e.LastValue },
+			deleteHook:            func(e DeleteEvent) { gotKey, gotVal = e.Key, e.LastValue },
+			hookLoadPreviousValue: true,
 		})
 		id := addElem(t, s, dag, "foo", []byte("hello"), 1)
 
@@ -129,17 +130,17 @@ func TestPutTombsFullDelete(t *testing.T) {
 			t.Fatal(err)
 		}
 		if gotKey.String() != ds.NewKey("foo").String() {
-			t.Errorf("onDelete key = %q, want /foo", gotKey)
+			t.Errorf("deleteHook key = %q, want /foo", gotKey)
 		}
 		if string(gotVal) != "hello" {
-			t.Errorf("onDelete lastVal = %q, want hello", gotVal)
+			t.Errorf("deleteHook lastVal = %q, want hello", gotVal)
 		}
 	})
 }
 
 // TestPutTombsNilValue verifies correct hook behavior when a key's stored value
 // is nil (e.g. Put(ctx, k, nil)). A nil stored value is distinct from "key not
-// found": delete hooks must fire, and onDelete must receive nil as lastVal.
+// found": delete hooks must fire, and deleteHook must receive nil as lastVal.
 func TestPutTombsNilValue(t *testing.T) {
 	t.Parallel()
 
@@ -149,7 +150,7 @@ func TestPutTombsNilValue(t *testing.T) {
 		dag := mdutils.Mock()
 		var deleteFired bool
 		s := newTestSet(t, dag, setHooks{
-			deleteHook: func(ds.Key) { deleteFired = true },
+			deleteHook: func(DeleteEvent) { deleteFired = true },
 		})
 		id := addElem(t, s, dag, "foo", nil, 1)
 
@@ -161,7 +162,7 @@ func TestPutTombsNilValue(t *testing.T) {
 		}
 	})
 
-	t.Run("onDelete receives nil lastVal", func(t *testing.T) {
+	t.Run("deleteHook receives nil lastVal", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()
 		dag := mdutils.Mock()
@@ -169,7 +170,8 @@ func TestPutTombsNilValue(t *testing.T) {
 		var gotVal []byte
 		var called bool
 		s := newTestSet(t, dag, setHooks{
-			onDelete: func(e DeleteEvent) { gotKey, gotVal, called = e.Key, e.LastValue, true },
+			deleteHook:            func(e DeleteEvent) { gotKey, gotVal, called = e.Key, e.LastValue, true },
+			hookLoadPreviousValue: true,
 		})
 		id := addElem(t, s, dag, "foo", nil, 1)
 
@@ -177,13 +179,13 @@ func TestPutTombsNilValue(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !called {
-			t.Fatal("onDelete must be called")
+			t.Fatal("deleteHook must be called")
 		}
 		if gotKey.String() != ds.NewKey("foo").String() {
-			t.Errorf("onDelete key = %q, want /foo", gotKey)
+			t.Errorf("deleteHook key = %q, want /foo", gotKey)
 		}
 		if gotVal != nil {
-			t.Errorf("onDelete lastVal = %q, want nil", gotVal)
+			t.Errorf("deleteHook lastVal = %q, want nil", gotVal)
 		}
 	})
 
@@ -195,8 +197,9 @@ func TestPutTombsNilValue(t *testing.T) {
 		var deleteLastVal []byte
 		var putFired bool
 		s := newTestSet(t, dag, setHooks{
-			onPut:    func(PutEvent) { putFired = true },
-			onDelete: func(e DeleteEvent) { deleteFired = true; deleteLastVal = e.LastValue },
+			putHook:               func(PutEvent) { putFired = true },
+			deleteHook:            func(e DeleteEvent) { deleteFired = true; deleteLastVal = e.LastValue },
+			hookLoadPreviousValue: true,
 		})
 		// "aaa" wins over nil lexicographically; store value is "aaa".
 		id1 := addElem(t, s, dag, "foo", nil, 1)           // loses
@@ -205,11 +208,11 @@ func TestPutTombsNilValue(t *testing.T) {
 
 		// NOTE: this test documents a known limitation. After tombstoning id2,
 		// id1 (nil value) is still a live, non-tombstoned element — so the key
-		// should logically remain in the set with a nil value and fire onPut.
+		// should logically remain in the set with a nil value and fire putHook.
 		// However, findBestValue returns nil for both "no survivors" and
 		// "one survivor whose value is nil", so putTombs cannot distinguish the
 		// two cases. It takes the full-delete path, removes the value key from
-		// the store, and fires onDelete. As a result InSet returns false even
+		// the store, and fires deleteHook. As a result InSet returns false even
 		// though a surviving element exists. Fixing this requires findBestValue
 		// to return a separate found bool alongside the value.
 		if err := s.putTombs(ctx, []*pb.Element{{Key: "foo", Id: id2}}, nil); err != nil {
@@ -217,13 +220,13 @@ func TestPutTombsNilValue(t *testing.T) {
 		}
 		_ = id1
 		if putFired {
-			t.Error("onPut must not fire; nil survivor is treated as full delete")
+			t.Error("putHook must not fire; nil survivor is treated as full delete")
 		}
 		if !deleteFired {
-			t.Fatal("onDelete must fire when nil survivor is treated as full delete")
+			t.Fatal("deleteHook must fire when nil survivor is treated as full delete")
 		}
 		if string(deleteLastVal) != "aaa" {
-			t.Errorf("onDelete lastVal = %q, want aaa", deleteLastVal)
+			t.Errorf("deleteHook lastVal = %q, want aaa", deleteLastVal)
 		}
 	})
 }
@@ -261,8 +264,9 @@ func TestPutTombsPartialTombstone(t *testing.T) {
 		dag := mdutils.Mock()
 		var putFired, deleteFired bool
 		s := newTestSet(t, dag, setHooks{
-			putHook:    func(ds.Key, []byte) { putFired = true },
-			deleteHook: func(ds.Key) { deleteFired = true },
+			putHook:               func(PutEvent) { putFired = true },
+			deleteHook:            func(DeleteEvent) { deleteFired = true },
+			hookLoadPreviousValue: true,
 		})
 		id1 := addElem(t, s, dag, "foo", []byte("aaa"), 1) // "aaa" loses
 		addElem(t, s, dag, "foo", []byte("bbb"), 1)        // "bbb" wins
@@ -284,8 +288,8 @@ func TestPutTombsPartialTombstone(t *testing.T) {
 		var putVals [][]byte
 		var deleteFired bool
 		s := newTestSet(t, dag, setHooks{
-			putHook:    func(_ ds.Key, v []byte) { putVals = append(putVals, v) },
-			deleteHook: func(ds.Key) { deleteFired = true },
+			putHook:    func(e PutEvent) { putVals = append(putVals, e.NewValue) },
+			deleteHook: func(DeleteEvent) { deleteFired = true },
 		})
 		addElem(t, s, dag, "foo", []byte("aaa"), 1)
 		id2 := addElem(t, s, dag, "foo", []byte("bbb"), 1) // "bbb" wins, is current value
@@ -304,32 +308,33 @@ func TestPutTombsPartialTombstone(t *testing.T) {
 		}
 	})
 
-	t.Run("onPut receives newVal and oldVal", func(t *testing.T) {
+	t.Run("putHook receives newVal and oldVal with hookLoadPreviousValue", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()
 		dag := mdutils.Mock()
 		type call struct{ newVal, oldVal []byte }
 		var calls []call
 		s := newTestSet(t, dag, setHooks{
-			onPut: func(e PutEvent) { calls = append(calls, call{e.NewValue, e.OldValue}) },
+			putHook:               func(e PutEvent) { calls = append(calls, call{e.NewValue, e.OldValue}) },
+			hookLoadPreviousValue: true,
 		})
 		addElem(t, s, dag, "foo", []byte("aaa"), 1)
 		id2 := addElem(t, s, dag, "foo", []byte("bbb"), 1) // "bbb" wins, is current value
 		calls = nil
 
 		// Tombstone the current winner ("bbb"). "aaa" becomes the new winner:
-		// onPut must fire with newVal="aaa", oldVal="bbb".
+		// putHook must fire with newVal="aaa", oldVal="bbb".
 		if err := s.putTombs(ctx, []*pb.Element{{Key: "foo", Id: id2}}, nil); err != nil {
 			t.Fatal(err)
 		}
 		if len(calls) != 1 {
-			t.Fatalf("expected 1 onPut call, got %d", len(calls))
+			t.Fatalf("expected 1 putHook call, got %d", len(calls))
 		}
 		if string(calls[0].newVal) != "aaa" {
-			t.Errorf("onPut newVal = %q, want aaa", calls[0].newVal)
+			t.Errorf("putHook newVal = %q, want aaa", calls[0].newVal)
 		}
 		if string(calls[0].oldVal) != "bbb" {
-			t.Errorf("onPut oldVal = %q, want bbb", calls[0].oldVal)
+			t.Errorf("putHook oldVal = %q, want bbb", calls[0].oldVal)
 		}
 	})
 }
@@ -341,21 +346,22 @@ func TestPutTombsMultipleKeys(t *testing.T) {
 	ctx := t.Context()
 	dag := mdutils.Mock()
 	deleted := make(map[string][]byte)
-	var onPutCalled bool
+	var putCalled bool
 	s := newTestSet(t, dag, setHooks{
-		onDelete: func(e DeleteEvent) { deleted[e.Key.String()] = e.LastValue },
-		onPut:    func(PutEvent) { onPutCalled = true },
+		deleteHook:            func(e DeleteEvent) { deleted[e.Key.String()] = e.LastValue },
+		putHook:               func(PutEvent) { putCalled = true },
+		hookLoadPreviousValue: true,
 	})
 	id1 := addElem(t, s, dag, "key1", []byte("val1"), 1)
 	id2 := addElem(t, s, dag, "key2", []byte("val2"), 1)
-	onPutCalled = false // discard calls from addElem setup
+	putCalled = false // discard calls from addElem setup
 
 	tombs := []*pb.Element{{Key: "key1", Id: id1}, {Key: "key2", Id: id2}}
 	if err := s.putTombs(ctx, tombs, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(deleted) != 2 {
-		t.Fatalf("expected 2 onDelete calls, got %d", len(deleted))
+		t.Fatalf("expected 2 deleteHook calls, got %d", len(deleted))
 	}
 	if string(deleted[ds.NewKey("key1").String()]) != "val1" {
 		t.Errorf("key1 lastVal = %q, want val1", deleted[ds.NewKey("key1").String()])
@@ -363,21 +369,23 @@ func TestPutTombsMultipleKeys(t *testing.T) {
 	if string(deleted[ds.NewKey("key2").String()]) != "val2" {
 		t.Errorf("key2 lastVal = %q, want val2", deleted[ds.NewKey("key2").String()])
 	}
-	if onPutCalled {
-		t.Error("onPut must not fire for full-delete tombstones")
+	if putCalled {
+		t.Error("putHook must not fire for full-delete tombstones")
 	}
 }
 
 // TestPutTombsNonExistentKey verifies that tombstoning a block ID for a key
-// that was never PUT does not crash: the tomb is recorded, and no hooks fire
-// since there was no prior value to report.
+// that was never PUT does not crash: the tomb is recorded, and when
+// hookLoadPreviousValue is set, no hooks fire since there was no prior value to
+// report.
 func TestPutTombsNonExistentKey(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	var putFired, deleteFired bool
 	s := newTestSet(t, mdutils.Mock(), setHooks{
-		onPut:    func(PutEvent) { putFired = true },
-		onDelete: func(DeleteEvent) { deleteFired = true },
+		putHook:               func(PutEvent) { putFired = true },
+		deleteHook:            func(DeleteEvent) { deleteFired = true },
+		hookLoadPreviousValue: true,
 	})
 
 	if err := s.putTombs(ctx, []*pb.Element{{Key: "ghost", Id: "fakeid"}}, nil); err != nil {
@@ -394,16 +402,16 @@ func TestPutTombsNonExistentKey(t *testing.T) {
 		t.Error("key must not be in set")
 	}
 	if putFired {
-		t.Error("onPut must not fire for a key that was never PUT")
+		t.Error("putHook must not fire for a key that was never PUT")
 	}
 	if deleteFired {
-		t.Error("onDelete must not fire when key had no prior value")
+		t.Error("deleteHook must not fire when key had no prior value")
 	}
 }
 
 // TestPutTombsPrevValsFirstEncounterOnly verifies that prevVals is captured
-// before any write for a key: onDelete receives the pre-call value even when
-// multiple tombs for the same key appear in one delta.
+// before any write for a key: deleteHook receives the pre-call value even
+// when multiple tombs for the same key appear in one delta.
 func TestPutTombsPrevValsFirstEncounterOnly(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -411,8 +419,9 @@ func TestPutTombsPrevValsFirstEncounterOnly(t *testing.T) {
 	var putFired bool
 	var lastVals [][]byte
 	s := newTestSet(t, dag, setHooks{
-		putHook:  func(ds.Key, []byte) { putFired = true },
-		onDelete: func(e DeleteEvent) { lastVals = append(lastVals, e.LastValue) },
+		putHook:               func(PutEvent) { putFired = true },
+		deleteHook:            func(e DeleteEvent) { lastVals = append(lastVals, e.LastValue) },
+		hookLoadPreviousValue: true,
 	})
 	id1 := addElem(t, s, dag, "foo", []byte("first"), 1)
 	id2 := addElem(t, s, dag, "foo", []byte("second"), 2) // wins (higher prio)
@@ -426,10 +435,10 @@ func TestPutTombsPrevValsFirstEncounterOnly(t *testing.T) {
 		t.Error("putHook must not fire when tombstoning a key with a surviving element")
 	}
 	if len(lastVals) != 1 {
-		t.Fatalf("expected 1 onDelete call, got %d", len(lastVals))
+		t.Fatalf("expected 1 deleteHook call, got %d", len(lastVals))
 	}
 	if string(lastVals[0]) != "second" {
-		t.Errorf("onDelete lastVal = %q, want second", lastVals[0])
+		t.Errorf("deleteHook lastVal = %q, want second", lastVals[0])
 	}
 }
 
@@ -440,7 +449,10 @@ func TestPutTombsIdempotent(t *testing.T) {
 	ctx := t.Context()
 	dag := mdutils.Mock()
 	var deleteFiredCount uint8
-	s := newTestSet(t, dag, setHooks{deleteHook: func(ds.Key) { deleteFiredCount++ }})
+	s := newTestSet(t, dag, setHooks{
+		deleteHook:            func(DeleteEvent) { deleteFiredCount++ },
+		hookLoadPreviousValue: true,
+	})
 	id := addElem(t, s, dag, "foo", []byte("hello"), 1)
 	tombs := []*pb.Element{{Key: "foo", Id: id}}
 
@@ -458,13 +470,13 @@ func TestPutTombsIdempotent(t *testing.T) {
 }
 
 // TestPutElemsDeltaForwarded verifies that the Delta passed to putElems is
-// forwarded identically to the onPut hook.
+// forwarded identically to the putHook.
 func TestPutElemsDeltaForwarded(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	var gotDelta Delta
 	s := newTestSet(t, mdutils.Mock(), setHooks{
-		onPut: func(e PutEvent) { gotDelta = e.Delta },
+		putHook: func(e PutEvent) { gotDelta = e.Delta },
 	})
 
 	var prio uint64 = 42
@@ -473,7 +485,7 @@ func TestPutElemsDeltaForwarded(t *testing.T) {
 		t.Fatal(err)
 	}
 	if gotDelta != d {
-		t.Fatalf("onPut delta pointer mismatch: got %p want %p", gotDelta, d)
+		t.Fatalf("putHook delta pointer mismatch: got %p want %p", gotDelta, d)
 	}
 	if gotDelta.GetPriority() != prio {
 		t.Errorf("forwarded delta priority = %d, want %d", gotDelta.GetPriority(), prio)
@@ -484,14 +496,14 @@ func TestPutElemsDeltaForwarded(t *testing.T) {
 }
 
 // TestPutTombsFullDeleteDeltaForwarded verifies that a tombstone-only delta is
-// forwarded to the onDelete hook when a key is fully deleted.
+// forwarded to the deleteHook when a key is fully deleted.
 func TestPutTombsFullDeleteDeltaForwarded(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	dag := mdutils.Mock()
 	var gotDelta Delta
 	s := newTestSet(t, dag, setHooks{
-		onDelete: func(e DeleteEvent) { gotDelta = e.Delta },
+		deleteHook: func(e DeleteEvent) { gotDelta = e.Delta },
 	})
 	id := addElem(t, s, dag, "foo", []byte("hello"), 1)
 
@@ -501,7 +513,7 @@ func TestPutTombsFullDeleteDeltaForwarded(t *testing.T) {
 		t.Fatal(err)
 	}
 	if gotDelta != tombDelta {
-		t.Fatalf("onDelete delta pointer mismatch: got %p want %p", gotDelta, tombDelta)
+		t.Fatalf("deleteHook delta pointer mismatch: got %p want %p", gotDelta, tombDelta)
 	}
 	if gotDelta.GetDagName() != "tomb-dag" {
 		t.Errorf("forwarded delta dagName = %q, want tomb-dag", gotDelta.GetDagName())
@@ -509,7 +521,7 @@ func TestPutTombsFullDeleteDeltaForwarded(t *testing.T) {
 }
 
 // TestPutTombsPartialPutDeltaForwarded verifies that when a tombstone removes
-// the current winner and a surviving element takes over, the onPut hook
+// the current winner and a surviving element takes over, the putHook
 // receives the tombstone delta (the one that triggered the MV change), not
 // the original put delta.
 func TestPutTombsPartialPutDeltaForwarded(t *testing.T) {
@@ -520,11 +532,12 @@ func TestPutTombsPartialPutDeltaForwarded(t *testing.T) {
 	// Only capture the hook call triggered by putTombs; ignore the addElem puts.
 	var capture bool
 	s := newTestSet(t, dag, setHooks{
-		onPut: func(e PutEvent) {
+		putHook: func(e PutEvent) {
 			if capture {
 				gotEvent = e
 			}
 		},
+		hookLoadPreviousValue: true,
 	})
 	// Seed two elements; "aaa" at prio 2 is the current winner.
 	addElem(t, s, dag, "foo", []byte("zzz"), 1)
@@ -532,15 +545,15 @@ func TestPutTombsPartialPutDeltaForwarded(t *testing.T) {
 
 	capture = true
 	tombDelta := &pbDelta{Delta: &pb.Delta{DagName: "tomb-dag", Priority: 3}}
-	// Tombstone the winner so "zzz" takes over — that changes the MV and fires onPut.
+	// Tombstone the winner so "zzz" takes over — that changes the MV and fires putHook.
 	if err := s.putTombs(ctx, []*pb.Element{{Key: "foo", Id: id2}}, tombDelta); err != nil {
 		t.Fatal(err)
 	}
 	if gotEvent.Delta != tombDelta {
-		t.Fatalf("partial-put onPut delta should be the tombstone delta: got %p want %p", gotEvent.Delta, tombDelta)
+		t.Fatalf("partial-put putHook delta should be the tombstone delta: got %p want %p", gotEvent.Delta, tombDelta)
 	}
 	if string(gotEvent.NewValue) != "zzz" || string(gotEvent.OldValue) != "aaa" {
-		t.Errorf("onPut values = (new=%q, old=%q), want (new=zzz, old=aaa)", gotEvent.NewValue, gotEvent.OldValue)
+		t.Errorf("putHook values = (new=%q, old=%q), want (new=zzz, old=aaa)", gotEvent.NewValue, gotEvent.OldValue)
 	}
 }
 
@@ -551,7 +564,7 @@ func TestCustomDeltaTypeAssert(t *testing.T) {
 	ctx := t.Context()
 	var gotCutsomField int64
 	s := newTestSet(t, mdutils.Mock(), setHooks{
-		onPut: func(e PutEvent) {
+		putHook: func(e PutEvent) {
 			if cd, ok := e.Delta.(*customDelta); ok {
 				gotCutsomField = cd.CustomField
 			}
@@ -601,14 +614,15 @@ func TestPutTombsHigherPriorityWins(t *testing.T) {
 func TestPurgeKeyBlocksDeltaNil(t *testing.T) {
 	t.Parallel()
 
-	t.Run("full purge fires onDelete with nil delta", func(t *testing.T) {
+	t.Run("full purge fires deleteHook with nil delta", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()
 		dag := mdutils.Mock()
 		var gotEvent DeleteEvent
 		var fired bool
 		s := newTestSet(t, dag, setHooks{
-			onDelete: func(e DeleteEvent) { gotEvent = e; fired = true },
+			deleteHook:            func(e DeleteEvent) { gotEvent = e; fired = true },
+			hookLoadPreviousValue: true,
 		})
 		id := addElem(t, s, dag, "foo", []byte("hello"), 1)
 
@@ -617,24 +631,24 @@ func TestPurgeKeyBlocksDeltaNil(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !fired {
-			t.Fatal("onDelete should fire for full purge")
+			t.Fatal("deleteHook should fire for full purge")
 		}
 		if gotEvent.Delta != nil {
-			t.Errorf("onDelete delta = %v, want nil (no originating delta on purge path)", gotEvent.Delta)
+			t.Errorf("deleteHook delta = %v, want nil (no originating delta on purge path)", gotEvent.Delta)
 		}
 		if string(gotEvent.LastValue) != "hello" {
-			t.Errorf("onDelete lastValue = %q, want hello", gotEvent.LastValue)
+			t.Errorf("deleteHook lastValue = %q, want hello", gotEvent.LastValue)
 		}
 	})
 
-	t.Run("partial purge fires onPut with nil delta", func(t *testing.T) {
+	t.Run("partial purge fires putHook with nil delta", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()
 		dag := mdutils.Mock()
 		var gotEvent PutEvent
 		var fired bool
 		s := newTestSet(t, dag, setHooks{
-			onPut: func(e PutEvent) { gotEvent = e; fired = true },
+			putHook: func(e PutEvent) { gotEvent = e; fired = true },
 		})
 		id1 := addElem(t, s, dag, "foo", []byte("zzz"), 1)
 		addElem(t, s, dag, "foo", []byte("aaa"), 2)
@@ -644,10 +658,10 @@ func TestPurgeKeyBlocksDeltaNil(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !fired {
-			t.Fatal("onPut should fire when partial purge changes the winner")
+			t.Fatal("putHook should fire when partial purge changes the winner")
 		}
 		if gotEvent.Delta != nil {
-			t.Errorf("onPut delta = %v, want nil (no originating delta on purge path)", gotEvent.Delta)
+			t.Errorf("putHook delta = %v, want nil (no originating delta on purge path)", gotEvent.Delta)
 		}
 	})
 }
