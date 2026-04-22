@@ -141,7 +141,8 @@ type Options struct {
 	// PutEvent.OldValue and PutEvent.OldPriority are populated only when
 	// HookLoadPreviousValue is true, otherwise they are zero-valued. When
 	// HookLoadPreviousValue is true, the hook is not fired for partial
-	// tombstones where the winning value did not change.
+	// tombstones where the winning element is unchanged (same value and
+	// priority); a same-value/different-priority swap still fires the hook.
 	//
 	// The callback is invoked while internal locks are held; it must not
 	// call back into the Datastore or it will deadlock.
