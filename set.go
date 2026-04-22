@@ -916,12 +916,12 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 
 	// Fetch old value and priority before modifying the value key, so hooks
 	// receive the pre-purge snapshot. Only read when a hook that needs it is
-	// configured.
-	var oldVal []byte
-	var oldPrio uint64
+	// configured. A missing key yields prev.value == nil (Get returns nil on
+	// ErrNotFound), which is used below to detect "no prior value".
+	var prev keyState
 	if s.hooks.hookLoadPreviousValue && (s.hooks.putHook != nil || s.hooks.deleteHook != nil) {
-		oldVal, _ = s.store.Get(ctx, valueK)
-		oldPrio, _ = s.getPriority(ctx, key)
+		prev.value, _ = s.store.Get(ctx, valueK)
+		prev.priority, _ = s.getPriority(ctx, key)
 	}
 
 	// bestPrio == 0 means findBestValue found no surviving element: real deltas
@@ -938,7 +938,14 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := errors.Join(errs...); err != nil {
 			return err
 		}
-		s.triggerDeleteHook(key, oldVal, oldPrio, nil)
+		// Suppress the delete hook when the key had no prior value in the
+		// store. Matches putTombs' "nothing to notify" rule. Only active when
+		// hookLoadPreviousValue is set, since that's when we know the prior
+		// state.
+		if s.hooks.hookLoadPreviousValue && prev.value == nil {
+			return nil
+		}
+		s.triggerDeleteHook(key, prev.value, prev.priority, nil)
 	} else {
 		if err := s.store.Put(ctx, valueK, bestVal); err != nil {
 			return err
@@ -946,7 +953,7 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := s.setPriority(ctx, s.store, key, bestPrio); err != nil {
 			return err
 		}
-		s.triggerPutHook(key, bestVal, oldVal, bestPrio, oldPrio, nil)
+		s.triggerPutHook(key, bestVal, prev.value, bestPrio, prev.priority, nil)
 	}
 
 	return nil
