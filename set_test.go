@@ -846,6 +846,73 @@ func TestPurgeKeyBlocksPriorities(t *testing.T) {
 	})
 }
 
+// TestPurgeKeyBlocksSuppression covers the two edge cases where purgeKeyBlocks
+// needs to make a decision about whether to fire a hook:
+//  1. full purge on a key that had no prior value → deleteHook must NOT fire
+//     (nothing to notify — there was no value to delete)
+//  2. partial purge where the surviving value equals the pre-purge value →
+//     putHook must STILL fire, because a partial purge always replaces the
+//     winning element and therefore changes the priority
+func TestPurgeKeyBlocksSuppression(t *testing.T) {
+	t.Parallel()
+
+	t.Run("full purge on key with no prior value suppresses deleteHook", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		dag := mdutils.Mock()
+		var deleteFired bool
+		s := newTestSet(t, dag, setHooks{
+			deleteHook:            func(DeleteEvent) { deleteFired = true },
+			hookLoadPreviousValue: true,
+		})
+		// Create a real block for an unrelated key so we have a valid CID, but
+		// never insert an element under "ghost": the value key for "ghost" is
+		// absent, so hadPrior must be false.
+		blockID := addElem(t, s, dag, "other", []byte("x"), 1)
+		c := blockIDToCid(t, blockID)
+
+		if err := s.purgeKeyBlocks(ctx, "ghost", map[cid.Cid]struct{}{c: {}}, true, false); err != nil {
+			t.Fatal(err)
+		}
+		if deleteFired {
+			t.Error("deleteHook must not fire when purged key had no prior value")
+		}
+	})
+
+	t.Run("partial purge with unchanged value still fires putHook (priority changed)", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		dag := mdutils.Mock()
+		var gotEvent PutEvent
+		var fired bool
+		s := newTestSet(t, dag, setHooks{
+			putHook:               func(e PutEvent) { gotEvent = e; fired = true },
+			hookLoadPreviousValue: true,
+		})
+		// Two elements with the SAME value at different priorities. The higher
+		// priority (id2) currently wins. Purging id2 leaves id1 — identical
+		// value, but lower priority. The priority change IS a state transition
+		// and must be surfaced via the put hook.
+		addElem(t, s, dag, "foo", []byte("same"), 1)
+		id2 := addElem(t, s, dag, "foo", []byte("same"), 2)
+		fired = false // reset: the second addElem fires putHook
+
+		c := blockIDToCid(t, id2)
+		if err := s.purgeKeyBlocks(ctx, "foo", map[cid.Cid]struct{}{c: {}}, true, false); err != nil {
+			t.Fatal(err)
+		}
+		if !fired {
+			t.Fatal("putHook must fire on partial purge, even when value is unchanged, to surface the priority change")
+		}
+		if gotEvent.OldPriority != 2 {
+			t.Errorf("OldPriority = %d, want 2", gotEvent.OldPriority)
+		}
+		if gotEvent.NewPriority != 1 {
+			t.Errorf("NewPriority = %d, want 1", gotEvent.NewPriority)
+		}
+	})
+}
+
 // blockIDToCid converts the blockKey returned by addElem (a datastore-keyed
 // multihash) back into a CID, for use with purgeKeyBlocks.
 func blockIDToCid(t *testing.T, blockID string) cid.Cid {
