@@ -85,6 +85,18 @@ type PutEvent struct {
 	OldValue []byte
 	// NewValue is the new value for the key after the update.
 	NewValue []byte
+	// OldPriority is the priority of OldValue. It is populated only when
+	// HookLoadPreviousValue is true, otherwise it is 0. It is also 0 when the
+	// key had no prior value (real deltas always have priority >= 1, so a zero
+	// OldPriority means "no previous value"); in that case OldValue is nil as
+	// well.
+	OldPriority uint64
+	// NewPriority is the priority of NewValue. For normal puts this matches
+	// Delta.GetPriority(). For partial-tombstone puts (where a tombstone removed
+	// the previous winner and a surviving element took over), NewPriority is the
+	// surviving element's priority, which differs from the tombstone delta's
+	// priority.
+	NewPriority uint64
 	// Delta is the triggering delta: the one whose merge caused the state
 	// change. For partial-tombstone puts (where a tombstone removed the previous
 	// winner and a surviving element took over), Delta is the tombstone delta,
@@ -101,6 +113,9 @@ type DeleteEvent struct {
 	// LastValue is the previous value for the key, if any. It is populated only
 	// when HookLoadPreviousValue is true, otherwise it is nil.
 	LastValue []byte
+	// LastPriority is the priority of LastValue. It is populated only when
+	// HookLoadPreviousValue is true, otherwise it is 0.
+	LastPriority uint64
 	// Delta is the tombstone delta that triggered the removal, or nil when the
 	// removal did not originate from a merged delta (e.g. PurgeDAG). Consumers
 	// must not retain Delta past the callback or mutate it.
@@ -122,9 +137,10 @@ type Options struct {
 	// (where a tombstone removed the previous winner and a surviving element
 	// took over), the hook fires with the surviving value. Default: nil.
 	//
-	// PutEvent.OldValue is populated only when HookLoadPreviousValue is true,
-	// otherwise it is nil. When HookLoadPreviousValue is true, the hook is not
-	// fired for partial tombstones where the winning value did not change.
+	// PutEvent.OldValue and PutEvent.OldPriority are populated only when
+	// HookLoadPreviousValue is true, otherwise they are zero-valued. When
+	// HookLoadPreviousValue is true, the hook is not fired for partial
+	// tombstones where the winning value did not change.
 	//
 	// The callback is invoked while internal locks are held; it must not
 	// call back into the Datastore or it will deadlock.
@@ -133,21 +149,22 @@ type Options struct {
 	// datastore (either by a local or remote update), i.e. when no surviving
 	// element exists for the key after tombstone processing. Default: nil.
 	//
-	// DeleteEvent.LastValue is populated only when HookLoadPreviousValue is true,
-	// otherwise it is nil. When HookLoadPreviousValue is true, the hook is not
-	// fired for tombstones targeting keys that had no prior value in the
-	// datastore.
+	// DeleteEvent.LastValue and DeleteEvent.LastPriority are populated only when
+	// HookLoadPreviousValue is true, otherwise they are zero-valued. When
+	// HookLoadPreviousValue is true, the hook is not fired for tombstones
+	// targeting keys that had no prior value in the datastore.
 	//
 	// The callback is invoked while internal locks are held; it must not
 	// call back into the Datastore or it will deadlock.
 	DeleteHook func(DeleteEvent)
 	// HookLoadPreviousValue controls whether PutHook/DeleteHook receive the
-	// previous value for the key. When true, the datastore is read before
-	// each hook-relevant write so that PutEvent.OldValue and
-	// DeleteEvent.LastValue can be populated; this incurs one extra read per
-	// triggered hook. When true, the hook is also skipped when the observed
-	// value would not actually change (see PutHook/DeleteHook doc). Default:
-	// false.
+	// previous value and priority for the key. When true, the datastore is read
+	// before each hook-relevant write so that PutEvent.OldValue /
+	// PutEvent.OldPriority and DeleteEvent.LastValue / DeleteEvent.LastPriority
+	// can be populated; this incurs one extra read per triggered hook. When
+	// true, the hook is also skipped when the observed value would not actually
+	// change (see PutHook/DeleteHook doc).
+	// Default: false.
 	HookLoadPreviousValue bool
 	// NumWorkers specifies the number of workers ready to
 	// retrieve and merge deltas while walking the DAGs. Default:

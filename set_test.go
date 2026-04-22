@@ -564,6 +564,129 @@ func TestPutTombsPartialPutDeltaForwarded(t *testing.T) {
 	}
 }
 
+// TestPutElemsPrioritiesReported verifies that PutEvent.NewPriority matches
+// the delta priority for a normal put and PutEvent.OldPriority carries the
+// replaced value's priority when HookLoadPreviousValue is set.
+func TestPutElemsPrioritiesReported(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dag := mdutils.Mock()
+	var gotEvent PutEvent
+	capture := false
+	s := newTestSet(t, dag, setHooks{
+		putHook: func(e PutEvent) {
+			if capture {
+				gotEvent = e
+			}
+		},
+		hookLoadPreviousValue: true,
+	})
+	var oldPrio uint64 = 3
+	addElem(t, s, dag, "foo", []byte("old"), oldPrio)
+
+	capture = true
+	var newPrio uint64 = 7
+	d := &pbDelta{Delta: &pb.Delta{Priority: newPrio}}
+	if err := s.putElems(ctx, []*pb.Element{{Key: "foo", Value: []byte("new")}}, "block-new", d); err != nil {
+		t.Fatal(err)
+	}
+	if gotEvent.NewPriority != newPrio {
+		t.Errorf("NewPriority = %d, want %d (delta priority)", gotEvent.NewPriority, newPrio)
+	}
+	if gotEvent.OldPriority != oldPrio {
+		t.Errorf("OldPriority = %d, want %d (prior value's priority)", gotEvent.OldPriority, oldPrio)
+	}
+}
+
+// TestPutElemsOldPriorityZeroWhenNotLoaded verifies that OldPriority is 0
+// when HookLoadPreviousValue is false, matching the OldValue behavior.
+func TestPutElemsOldPriorityZeroWhenNotLoaded(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dag := mdutils.Mock()
+	var gotEvent PutEvent
+	capture := false
+	s := newTestSet(t, dag, setHooks{
+		putHook: func(e PutEvent) {
+			if capture {
+				gotEvent = e
+			}
+		},
+	})
+	addElem(t, s, dag, "foo", []byte("old"), 3)
+
+	capture = true
+	var newPrio uint64 = 7
+	d := &pbDelta{Delta: &pb.Delta{Priority: newPrio}}
+	if err := s.putElems(ctx, []*pb.Element{{Key: "foo", Value: []byte("new")}}, "block-new", d); err != nil {
+		t.Fatal(err)
+	}
+	if gotEvent.NewPriority != newPrio {
+		t.Errorf("NewPriority = %d, want %d", gotEvent.NewPriority, newPrio)
+	}
+	if gotEvent.OldPriority != 0 {
+		t.Errorf("OldPriority = %d, want 0 (HookLoadPreviousValue is false)", gotEvent.OldPriority)
+	}
+}
+
+// TestPutTombsPartialPutPriorities verifies that for a partial-tombstone put
+// NewPriority carries the surviving element's priority (not the tombstone
+// delta's priority) and OldPriority carries the previous winner's priority.
+// This is the case where NewPriority cannot be inferred from Delta.
+func TestPutTombsPartialPutPriorities(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dag := mdutils.Mock()
+	var gotEvent PutEvent
+	capture := false
+	s := newTestSet(t, dag, setHooks{
+		putHook: func(e PutEvent) {
+			if capture {
+				gotEvent = e
+			}
+		},
+		hookLoadPreviousValue: true,
+	})
+	// Seed two elements; "aaa" at prio 2 is the current winner.
+	addElem(t, s, dag, "foo", []byte("zzz"), 1)
+	id2 := addElem(t, s, dag, "foo", []byte("aaa"), 2)
+
+	capture = true
+	// Tombstone delta priority (5) is deliberately different from the
+	// surviving element priority (1) to prove they are distinct.
+	tombDelta := &pbDelta{Delta: &pb.Delta{Priority: 5}}
+	if err := s.putTombs(ctx, []*pb.Element{{Key: "foo", Id: id2}}, tombDelta); err != nil {
+		t.Fatal(err)
+	}
+	if gotEvent.NewPriority != 1 {
+		t.Errorf("NewPriority = %d, want 1 (surviving element's priority, not the tombstone delta's)", gotEvent.NewPriority)
+	}
+	if gotEvent.OldPriority != 2 {
+		t.Errorf("OldPriority = %d, want 2 (tombstoned winner's priority)", gotEvent.OldPriority)
+	}
+}
+
+// TestPutTombsFullDeleteLastPriority verifies that the DeleteEvent carries
+// the priority of the removed value when HookLoadPreviousValue is set.
+func TestPutTombsFullDeleteLastPriority(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dag := mdutils.Mock()
+	var gotEvent DeleteEvent
+	s := newTestSet(t, dag, setHooks{
+		deleteHook:            func(e DeleteEvent) { gotEvent = e },
+		hookLoadPreviousValue: true,
+	})
+	id := addElem(t, s, dag, "foo", []byte("hello"), 4)
+
+	if err := s.putTombs(ctx, []*pb.Element{{Key: "foo", Id: id}}, &pbDelta{Delta: &pb.Delta{Priority: 9}}); err != nil {
+		t.Fatal(err)
+	}
+	if gotEvent.LastPriority != 4 {
+		t.Errorf("LastPriority = %d, want 4 (deleted value's priority)", gotEvent.LastPriority)
+	}
+}
+
 // TestCustomDeltaTypeAssert verifies that callbacks can type-assert the Delta
 // back to a concrete implementation to reach application-specific fields
 func TestCustomDeltaTypeAssert(t *testing.T) {
@@ -669,6 +792,56 @@ func TestPurgeKeyBlocksDeltaNil(t *testing.T) {
 		}
 		if gotEvent.Delta != nil {
 			t.Errorf("putHook delta = %v, want nil (no originating delta on purge path)", gotEvent.Delta)
+		}
+	})
+}
+
+// TestPurgeKeyBlocksPriorities verifies that hooks fired from the purge path
+// carry the correct old/new priorities when HookLoadPreviousValue is set.
+func TestPurgeKeyBlocksPriorities(t *testing.T) {
+	t.Parallel()
+
+	t.Run("full purge reports LastPriority", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		dag := mdutils.Mock()
+		var gotEvent DeleteEvent
+		s := newTestSet(t, dag, setHooks{
+			deleteHook:            func(e DeleteEvent) { gotEvent = e },
+			hookLoadPreviousValue: true,
+		})
+		id := addElem(t, s, dag, "foo", []byte("hello"), 6)
+
+		c := blockIDToCid(t, id)
+		if err := s.purgeKeyBlocks(ctx, "foo", map[cid.Cid]struct{}{c: {}}, true, false); err != nil {
+			t.Fatal(err)
+		}
+		if gotEvent.LastPriority != 6 {
+			t.Errorf("LastPriority = %d, want 6", gotEvent.LastPriority)
+		}
+	})
+
+	t.Run("partial purge reports old and new priorities", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		dag := mdutils.Mock()
+		var gotEvent PutEvent
+		s := newTestSet(t, dag, setHooks{
+			putHook:               func(e PutEvent) { gotEvent = e },
+			hookLoadPreviousValue: true,
+		})
+		addElem(t, s, dag, "foo", []byte("zzz"), 1)
+		id2 := addElem(t, s, dag, "foo", []byte("aaa"), 2) // current winner
+
+		c2 := blockIDToCid(t, id2)
+		if err := s.purgeKeyBlocks(ctx, "foo", map[cid.Cid]struct{}{c2: {}}, true, false); err != nil {
+			t.Fatal(err)
+		}
+		if gotEvent.OldPriority != 2 {
+			t.Errorf("OldPriority = %d, want 2 (purged winner's priority)", gotEvent.OldPriority)
+		}
+		if gotEvent.NewPriority != 1 {
+			t.Errorf("NewPriority = %d, want 1 (surviving element's priority)", gotEvent.NewPriority)
 		}
 	})
 }
