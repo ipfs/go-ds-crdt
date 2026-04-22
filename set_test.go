@@ -189,44 +189,51 @@ func TestPutTombsNilValue(t *testing.T) {
 		}
 	})
 
-	t.Run("nil survivor treated as full delete", func(t *testing.T) {
+	t.Run("nil survivor keeps key with nil value", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()
 		dag := mdutils.Mock()
 		var deleteFired bool
-		var deleteLastVal []byte
 		var putFired bool
+		var putOldVal, putNewVal []byte
 		s := newTestSet(t, dag, setHooks{
-			putHook:               func(PutEvent) { putFired = true },
-			deleteHook:            func(e DeleteEvent) { deleteFired = true; deleteLastVal = e.LastValue },
+			putHook: func(e PutEvent) {
+				putFired = true
+				putOldVal = e.OldValue
+				putNewVal = e.NewValue
+			},
+			deleteHook:            func(DeleteEvent) { deleteFired = true },
 			hookLoadPreviousValue: true,
 		})
 		// "aaa" wins over nil lexicographically; store value is "aaa".
-		id1 := addElem(t, s, dag, "foo", nil, 1)           // loses
+		addElem(t, s, dag, "foo", nil, 1)                  // loses
 		id2 := addElem(t, s, dag, "foo", []byte("aaa"), 1) // wins
 		putFired = false
 
-		// NOTE: this test documents a known limitation. After tombstoning id2,
-		// id1 (nil value) is still a live, non-tombstoned element — so the key
-		// should logically remain in the set with a nil value and fire putHook.
-		// However, findBestValue returns nil for both "no survivors" and
-		// "one survivor whose value is nil", so putTombs cannot distinguish the
-		// two cases. It takes the full-delete path, removes the value key from
-		// the store, and fires deleteHook. As a result InSet returns false even
-		// though a surviving element exists. Fixing this requires findBestValue
-		// to return a separate found bool alongside the value.
+		// After tombstoning id2, id1 (nil value) is still a live, non-tombstoned
+		// element — the key must remain in the set with a nil value.
+		// putTombs distinguishes "no survivors" from "nil-valued survivor" via
+		// priority (p == 0 iff no survivor), so this takes the partial-tombstone
+		// path: value is replaced with nil and putHook fires.
 		if err := s.putTombs(ctx, []*pb.Element{{Key: "foo", Id: id2}}, nil); err != nil {
 			t.Fatal(err)
 		}
-		_ = id1
-		if putFired {
-			t.Error("putHook must not fire; nil survivor is treated as full delete")
+		if deleteFired {
+			t.Error("deleteHook must not fire; a survivor remains")
 		}
-		if !deleteFired {
-			t.Fatal("deleteHook must fire when nil survivor is treated as full delete")
+		if !putFired {
+			t.Fatal("putHook must fire; value changed from aaa to nil")
 		}
-		if string(deleteLastVal) != "aaa" {
-			t.Errorf("deleteHook lastVal = %q, want aaa", deleteLastVal)
+		if string(putOldVal) != "aaa" {
+			t.Errorf("putHook OldValue = %q, want aaa", putOldVal)
+		}
+		if putNewVal != nil {
+			t.Errorf("putHook NewValue = %q, want nil", putNewVal)
+		}
+		if inSet, err := s.InSet(ctx, "foo"); err != nil {
+			t.Fatalf("InSet: %v", err)
+		} else if !inSet {
+			t.Error("key should remain in set while nil-valued survivor exists")
 		}
 	})
 }
