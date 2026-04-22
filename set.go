@@ -743,16 +743,16 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, delta Delta) er
 	// deleted keys (absent from newStates) trigger the delete hook; partially
 	// tombstoned keys (present in newStates) trigger the put hook. When
 	// hookLoadPreviousValue is set, prevStates is used to suppress no-op hook
-	// firings (value unchanged, or tombstone for a key that had no value).
+	// firings (winning element unchanged — same value and priority — or
+	// tombstone for a key that had no value).
 	if newStates != nil {
 		for del := range deletedElems {
 			if newState, partial := newStates[del]; partial {
 				var prev keyState
 				if prevStates != nil {
 					prev = prevStates[del] // zero-valued if key was absent
-					if bytes.Equal(newState.value, prev.value) {
-						// TODO: maybe check priority instead of skipping after byte comparison.
-						continue // value unchanged, skip hook
+					if newState.priority == prev.priority && bytes.Equal(newState.value, prev.value) {
+						continue // same winning element, genuine no-op
 					}
 				}
 				s.triggerPutHook(del, newState.value, prev.value, newState.priority, prev.priority, delta)

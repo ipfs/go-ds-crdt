@@ -1,6 +1,7 @@
 package crdt
 
 import (
+	"bytes"
 	"testing"
 
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
@@ -663,6 +664,48 @@ func TestPutTombsPartialPutPriorities(t *testing.T) {
 	}
 	if gotEvent.OldPriority != 2 {
 		t.Errorf("OldPriority = %d, want 2 (tombstoned winner's priority)", gotEvent.OldPriority)
+	}
+}
+
+// TestPutTombsPartialPutSameValueDifferentPriority verifies that when a
+// tombstone removes the current winner and a surviving element with the SAME
+// value bytes but a different priority takes over, the putHook still fires —
+// the priority change is a state transition that must be surfaced even though
+// the value bytes are unchanged.
+func TestPutTombsPartialPutSameValueDifferentPriority(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dag := mdutils.Mock()
+	var gotEvent PutEvent
+	var fired bool
+	s := newTestSet(t, dag, setHooks{
+		putHook:               func(e PutEvent) { gotEvent = e; fired = true },
+		hookLoadPreviousValue: true,
+	})
+	// Two elements with the SAME value at different priorities. The higher
+	// priority (id2) currently wins. Tombstoning id2 leaves id1 — identical
+	// value, but lower priority.
+	addElem(t, s, dag, "foo", []byte("same"), 1)
+	id2 := addElem(t, s, dag, "foo", []byte("same"), 2)
+	fired = false // reset: the second addElem fires putHook
+
+	if err := s.putTombs(ctx, []*pb.Element{{Key: "foo", Id: id2}}, &pbDelta{Delta: &pb.Delta{Priority: 5}}); err != nil {
+		t.Fatal(err)
+	}
+	if !fired {
+		t.Fatal("putHook must fire on partial tombstone, even when value is unchanged, to surface the priority change")
+	}
+	if gotEvent.OldPriority != 2 {
+		t.Errorf("OldPriority = %d, want 2", gotEvent.OldPriority)
+	}
+	if gotEvent.NewPriority != 1 {
+		t.Errorf("NewPriority = %d, want 1", gotEvent.NewPriority)
+	}
+	if !bytes.Equal(gotEvent.OldValue, []byte("same")) {
+		t.Errorf("OldValue = %q, want same", gotEvent.OldValue)
+	}
+	if !bytes.Equal(gotEvent.NewValue, []byte("same")) {
+		t.Errorf("NewValue = %q, want same", gotEvent.NewValue)
 	}
 }
 
