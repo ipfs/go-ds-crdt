@@ -670,7 +670,7 @@ func (store *Datastore) broadcastBatchWorker(ctx context.Context) {
 		case <-t.C:
 			err := store.broadcastHeads(ctx, heads)
 			if err != nil {
-				store.logger.Errorf("error broadcasting heads batch %s: %w", heads, err)
+				store.logger.Errorf("error broadcasting heads batch %s: %s", heads, err)
 			}
 			heads = nil
 			t.Reset(store.opts.BroadcastBatchDelay)
