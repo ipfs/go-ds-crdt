@@ -782,6 +782,152 @@ func TestPutTombsHigherPriorityWins(t *testing.T) {
 	}
 }
 
+// TestCRDTPutElemsDuplicateKeyInSameDelta verifies that when a single delta
+// contains multiple elements for the same key, putElems treats the group as
+// one logical key transition:
+//
+//  1. The put hook fires exactly once per key, not once per element. Firing
+//     per-element makes downstream observers (e.g. usage accountants) count a
+//     single key insertion N times.
+//  2. The winning value follows CRDT conflict resolution across the elements
+//     — all share the delta's priority, so the lex-largest value wins —
+//     independent of the elements' order in the slice.
+//  3. The PutEvent reports the pre-delta store snapshot as OldValue, not a
+//     sibling element's value from earlier in the same iteration.
+//
+// The test mirrors putTombs' per-key deduplication pattern (see
+// TestPutTombsMultipleKeys and the newStates/prevStates handling in
+// putTombs) and is expected to fail against the current putElems
+// implementation, which iterates elements independently and emits one
+// PutEvent per element.
+func TestCRDTPutElemsDuplicateKeyInSameDelta(t *testing.T) {
+	t.Parallel()
+
+	t.Run("hook fires once per key", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		var events []PutEvent
+		s := newTestSet(t, mdutils.Mock(), setHooks{
+			putHook:               func(e PutEvent) { events = append(events, e) },
+			hookLoadPreviousValue: true,
+		})
+
+		d := &pbDelta{Delta: &pb.Delta{Priority: 1}}
+		elems := []*pb.Element{
+			{Key: "foo", Value: []byte("zzz")},
+			{Key: "foo", Value: []byte("aaa")},
+		}
+		if err := s.putElems(ctx, elems, "block-multi", d); err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 1 {
+			t.Fatalf("putHook call count = %d, want 1 (one hook per key, not per element)", len(events))
+		}
+	})
+
+	t.Run("winning value is lex-largest regardless of order", func(t *testing.T) {
+		t.Parallel()
+
+		// Element ordering within the delta must not affect the outcome:
+		// conflict resolution across same-key, same-priority elements picks
+		// the lex-largest value.
+		for _, tc := range []struct {
+			name  string
+			elems []*pb.Element
+		}{
+			{
+				name: "ascending (aaa then zzz)",
+				elems: []*pb.Element{
+					{Key: "foo", Value: []byte("aaa")},
+					{Key: "foo", Value: []byte("zzz")},
+				},
+			},
+			{
+				name: "descending (zzz then aaa)",
+				elems: []*pb.Element{
+					{Key: "foo", Value: []byte("zzz")},
+					{Key: "foo", Value: []byte("aaa")},
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				ctx := t.Context()
+				var events []PutEvent
+				s := newTestSet(t, mdutils.Mock(), setHooks{
+					putHook:               func(e PutEvent) { events = append(events, e) },
+					hookLoadPreviousValue: true,
+				})
+
+				d := &pbDelta{Delta: &pb.Delta{Priority: 1}}
+				if err := s.putElems(ctx, tc.elems, "block-multi", d); err != nil {
+					t.Fatal(err)
+				}
+				if len(events) != 1 {
+					t.Fatalf("putHook call count = %d, want 1", len(events))
+				}
+				if !bytes.Equal(events[0].NewValue, []byte("zzz")) {
+					t.Errorf("NewValue = %q, want zzz (lex-largest at tied priority)", events[0].NewValue)
+				}
+				if events[0].OldValue != nil {
+					t.Errorf("OldValue = %q, want nil (key did not exist pre-delta)", events[0].OldValue)
+				}
+				val, err := s.Element(ctx, "foo")
+				if err != nil {
+					t.Fatalf("Element: %v", err)
+				}
+				if !bytes.Equal(val, []byte("zzz")) {
+					t.Errorf("stored value = %q, want zzz (CRDT winner must not depend on element order in delta)", val)
+				}
+			})
+		}
+	})
+
+	t.Run("OldValue is pre-delta snapshot, not a sibling in-delta value", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		dag := mdutils.Mock()
+		var events []PutEvent
+		capture := false
+		s := newTestSet(t, dag, setHooks{
+			putHook: func(e PutEvent) {
+				if capture {
+					events = append(events, e)
+				}
+			},
+			hookLoadPreviousValue: true,
+		})
+
+		// Seed the store so the key has a committed pre-delta value.
+		addElem(t, s, dag, "foo", []byte("seed"), 1)
+
+		capture = true
+		d := &pbDelta{Delta: &pb.Delta{Priority: 2}}
+		elems := []*pb.Element{
+			{Key: "foo", Value: []byte("a")},
+			{Key: "foo", Value: []byte("z")}, // in-delta winner at equal priority
+		}
+		if err := s.putElems(ctx, elems, "block-multi", d); err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 1 {
+			t.Fatalf("putHook call count = %d, want 1", len(events))
+		}
+		if !bytes.Equal(events[0].OldValue, []byte("seed")) {
+			t.Errorf("OldValue = %q, want seed (pre-delta committed value)", events[0].OldValue)
+		}
+		if !bytes.Equal(events[0].NewValue, []byte("z")) {
+			t.Errorf("NewValue = %q, want z (in-delta lex-largest)", events[0].NewValue)
+		}
+		if events[0].OldPriority != 1 {
+			t.Errorf("OldPriority = %d, want 1 (seed's priority)", events[0].OldPriority)
+		}
+		if events[0].NewPriority != 2 {
+			t.Errorf("NewPriority = %d, want 2 (delta priority)", events[0].NewPriority)
+		}
+	})
+}
+
 // TestPurgeKeyBlocksDeltaNil verifies that hooks fired from the purge path
 // receive a nil Delta, since no originating delta triggered the state change.
 func TestPurgeKeyBlocksDeltaNil(t *testing.T) {
