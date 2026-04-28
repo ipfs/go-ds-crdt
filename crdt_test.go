@@ -1653,3 +1653,142 @@ func TestPurgeDAGCleanStore(t *testing.T) {
 		t.Errorf("expected exactly 1 key (version) remaining, got %d: %v", len(remaining), remaining)
 	}
 }
+
+// faultyDAGSvc wraps a DAGService and returns an error for GetMany when the
+// number of GetMany calls reaches the configured failure threshold.
+type faultyDAGSvc struct {
+	ipld.DAGService
+	threshold int64        // fail on the Nth GetMany call and beyond
+	calls     atomic.Int64 // total GetMany calls so far
+}
+
+func (f *faultyDAGSvc) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipld.NodeOption {
+	n := f.calls.Add(1)
+	if n >= f.threshold {
+		ch := make(chan *ipld.NodeOption, 1)
+		ch <- &ipld.NodeOption{Err: fmt.Errorf("simulated fetch failure")}
+		close(ch)
+		return ch
+	}
+	return f.DAGService.GetMany(ctx, cids)
+}
+
+// TestCRDTBranchPartialFailureLeavesNoTrace verifies that when a branch walk
+// fails partway through (e.g. a child-block fetch times out), no nodes are
+// permanently marked processed and no head replacement occurs. This ensures
+// that a subsequent retry can complete the walk and advance the head normally.
+func TestCRDTBranchPartialFailureLeavesNoTrace(t *testing.T) {
+	ctx := t.Context()
+
+	// Build a three-node chain A → B → C on a source DAG service.
+	// Each publish creates a new node whose links point to the previous head.
+	bs := mdutils.Bserv()
+	dagserv := merkledag.NewDAGService(bs)
+	sourceDag := &mockDAGSvc{DAGService: dagserv, bs: bs.Blockstore()}
+
+	srcOpts := DefaultOptions()
+	srcOpts.Logger = &testLogger{name: "src: ", l: DefaultOptions().Logger}
+	src, err := New(
+		dssync.MutexWrap(ds.NewMapDatastore()),
+		ds.NewKey("crdttest"),
+		sourceDag,
+		&nullBroadcaster{},
+		srcOpts,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { src.Close() })
+
+	// Publish three entries to build a 3-node chain.
+	for i := range 3 {
+		if err := src.Put(ctx, ds.NewKey(fmt.Sprintf("k%d", i)), []byte("v")); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	// The source's current heads represent the tip of the chain (node A).
+	srcHeads, _, err := src.heads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(srcHeads) != 1 {
+		t.Fatalf("expected 1 head, got %d", len(srcHeads))
+	}
+	tipHead := srcHeads[0]
+
+	// Build a destination replica backed by the same block store but using a
+	// faulty DAG service that errors on the 3rd GetMany call. The walk of a
+	// 3-node chain issues:
+	//   call 1: fetch tip (A)
+	//   call 2: fetch A's child (B)
+	//   call 3: fetch B's child (C) → error
+	// So tip (A) and B get merged and added to pending, but the walk errors
+	// before committing. With the fix neither A nor B should be on disk.
+	faulty := &faultyDAGSvc{DAGService: dagserv, threshold: 3}
+	dstOpts := DefaultOptions()
+	dstOpts.Logger = &testLogger{name: "dst: ", l: DefaultOptions().Logger}
+	dstOpts.DAGSyncerTimeout = 5 * time.Second
+
+	dst, err := New(
+		dssync.MutexWrap(ds.NewMapDatastore()),
+		ds.NewKey("crdttest"),
+		faulty,
+		&nullBroadcaster{},
+		dstOpts,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dst.Close() })
+
+	// Trigger a branch walk from the tip. It should fail partway.
+	err = dst.handleBlock(ctx, tipHead)
+	if err == nil {
+		t.Errorf("expected handleBlock to return an error after a partial walk failure")
+	}
+
+	// The tip block must NOT be marked processed: the walk never completed.
+	processed, err := dst.isProcessed(ctx, tipHead.Cid)
+	if err != nil {
+		t.Fatalf("isProcessed: %v", err)
+	}
+	if processed {
+		t.Errorf("bug reproduced: tip %s is marked processed after a failed walk — retries will silently skip it", tipHead.Cid)
+	}
+
+	// Head list on the destination should be empty (no head was committed).
+	dstHeads, _, err := dst.heads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dstHeads) != 0 {
+		t.Errorf("expected no heads after failed walk, got %d", len(dstHeads))
+	}
+
+	// Now retry with a working DAG service (point dst at the original dagserv).
+	dst.dagService = dagserv
+
+	err = dst.handleBlock(ctx, tipHead)
+	if err != nil {
+		t.Fatalf("retry handleBlock: %v", err)
+	}
+
+	// After a successful walk the tip must be marked processed.
+	processed, err = dst.isProcessed(ctx, tipHead.Cid)
+	if err != nil {
+		t.Fatalf("isProcessed after retry: %v", err)
+	}
+	if !processed {
+		t.Errorf("tip %s should be processed after successful retry", tipHead.Cid)
+	}
+
+	// The destination head must now equal the source head (chain fully synced).
+	dstHeadsAfter, _, err := dst.heads.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dstHeadsAfter) != 1 || dstHeadsAfter[0].Cid != tipHead.Cid {
+		t.Errorf("expected head %s after retry, got %v", tipHead.Cid, dstHeadsAfter)
+	}
+}
