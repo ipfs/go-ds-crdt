@@ -948,27 +948,8 @@ func (store *Datastore) sendJobWorker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain any jobs that were queued in sendJobs but not yet
-			// forwarded to jobQueue. session.Add(1) was already called
-			// for each of these, so we must call session.Done() to
-			// unblock handleBranch. Without this, session.Wait() would
-			// block forever, leaking the goroutine and preventing the
-			// inFlightCids defer from running.
-			hasPending := len(store.jobQueue) > 0
-			for {
-				select {
-				case j := <-store.sendJobs:
-					hasPending = true
-					j.walk.recordError(ctx.Err())
-					j.session.Done()
-				default:
-					if hasPending {
-						store.MarkDirty(ctx)
-					}
-					close(store.jobQueue)
-					return
-				}
-			}
+			close(store.jobQueue)
+			return
 		case j := <-store.sendJobs:
 			store.jobQueue <- j
 		}
