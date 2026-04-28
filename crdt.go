@@ -461,11 +461,11 @@ func (store *Datastore) handleNext(ctx context.Context) {
 
 		// markHeadsAsSeen asap so that we don't rebroadcast them.
 		for _, heads := range receivedHeads {
+			store.seenHeadsMux.Lock()
 			for _, head := range heads {
-				store.seenHeadsMux.Lock()
 				store.seenHeads[head.Cid] = struct{}{}
-				store.seenHeadsMux.Unlock()
 			}
+			store.seenHeadsMux.Unlock()
 		}
 
 		var wg sync.WaitGroup
@@ -720,7 +720,7 @@ func (store *Datastore) rebroadcastHeads(ctx context.Context) {
 	var headsToBroadcast []Head
 	store.seenHeadsMux.RLock()
 	{
-		headsToBroadcast = make([]Head, 0, len(store.seenHeads))
+		headsToBroadcast = make([]Head, 0, len(heads))
 		for _, h := range heads {
 			if _, ok := store.seenHeads[h.Cid]; !ok {
 				headsToBroadcast = append(headsToBroadcast, h)
@@ -1032,9 +1032,6 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 		child := l.Cid
 
 		oldHead, isHead := store.heads.Get(ctx, child)
-		if err != nil {
-			return nil, fmt.Errorf("error checking if %s is head: %w", child, err)
-		}
 
 		isProcessed, err := store.isProcessed(ctx, child)
 		if err != nil {
@@ -1075,8 +1072,8 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 					// from processing the other links.
 					store.logger.Error(fmt.Errorf("error adding head %s: %w", root, err))
 				}
+				addedAsHead = true
 			}
-			addedAsHead = true
 			continue
 		}
 
