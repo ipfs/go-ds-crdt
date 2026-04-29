@@ -132,11 +132,14 @@ type Options struct {
 	// been already broadcasted by other replicas in the
 	// interval. Default: 1m.
 	RebroadcastInterval time.Duration
-	// PutHook is triggered whenever an element is successfully added to the
-	// datastore (either by a local or remote update), and only when that
-	// addition is considered the prevalent value. For partial-tombstone puts
-	// (where a tombstone removed the previous winner and a surviving element
-	// took over), the hook fires with the surviving value. Default: nil.
+	// PutHook is triggered whenever the materialised view for a key is
+	// updated (either by a local or remote update). It fires once per key
+	// per merged delta, even when the delta carries multiple elements for
+	// the same key — in that case the lex-largest value wins at the shared
+	// delta priority and only the winner is reported. For partial-tombstone
+	// puts (where a tombstone removed the previous winner and a surviving
+	// element took over), the hook fires with the surviving value.
+	// Default: nil.
 	//
 	// PutEvent.OldValue and PutEvent.OldPriority are populated only when
 	// HookLoadPreviousValue is true, otherwise they are zero-valued. When
