@@ -1723,7 +1723,7 @@ func (h *holdingDAGSvc) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipl
 	return out
 }
 
-// TestPartialSyncCleanCloseRecovery exercises a 2-peer scenario where peer0
+// TestCRDTPartialSyncCleanCloseRecovery exercises a 2-peer scenario where peer0
 // publishes three blocks and peer1 misses the middle one. peer0 is configured
 // with BroadcastBatchDelay so that the 2nd and 3rd Puts are folded into a
 // single broadcast advertising block 3 as the head (block 2 never appears in
@@ -1732,7 +1732,7 @@ func (h *holdingDAGSvc) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipl
 // that state, then reopened with the hold released. The test then waits
 // through two rebroadcast intervals to see whether rebroadcasts alone drive
 // peer1 to recover the missing block.
-func TestPartialSyncCleanCloseRecovery(t *testing.T) {
+func TestCRDTPartialSyncCleanCloseRecovery(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := t.Context()
 
@@ -1821,17 +1821,23 @@ func TestPartialSyncCleanCloseRecovery(t *testing.T) {
 		if p2 {
 			t.Fatal("peer1 should not have processed block 2 while it is held")
 		}
-		// peer1's head must still be block1: block3 is processed but not
-		// promoted to head because its child block2 is queued for processing
-		// (queuedChildren.Visit returns true on first visit), so processNode
-		// takes the "keep walking down" branch instead of adding block3 as a
-		// head. The head only advances once block2 is processed.
+		// peer1 should have block3 registered as a candidate head before
+		// walking the branch (so a partial walk is recoverable). block1
+		// may still be present because the heads.Replace at the bottom of
+		// the walk only fires once block2 is processed.
 		h1Mid, _, err := peer1.heads.List(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(h1Mid) != 1 || !h1Mid[0].Cid.Equals(block1) {
-			t.Fatalf("peer1 head should still be block1 (%s) while block2 is held, got %v", block1, h1Mid)
+		hasBlock3 := false
+		for _, h := range h1Mid {
+			if h.Cid.Equals(block3) {
+				hasBlock3 = true
+				break
+			}
+		}
+		if !hasBlock3 {
+			t.Fatalf("peer1 should have pre-registered block3 (%s) as a head before walking, got %v", block3, h1Mid)
 		}
 
 		// Clean close while block 2 is still held. ctx cancellation
