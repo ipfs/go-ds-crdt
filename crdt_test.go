@@ -2047,3 +2047,151 @@ func TestCRDTPartialSyncCleanCloseRecovery(t *testing.T) {
 			p2After, p3After, hAfter, dirtyAfter, block3)
 	})
 }
+
+// TestCRDTConcurrentWalksLeaveAncestorAsHead demonstrates that two
+// concurrent branch walks can finish with both an ancestor (H1) and its
+// descendant (H2) listed as heads, even though only H2 is a real tip.
+//
+// The peer holds a fetch for B0 (ancestor of H1) so the H1 walk is stuck
+// after marking H1 processed. While stuck, the peer receives a broadcast
+// for H2 (descendant of H1). With MultiHeadProcessing on, the H2 walk
+// runs concurrently and replaces H1 with H2 (H1 is in heads either
+// because it was pre-registered, or it gets added by processNode when
+// the H1 walker eventually reaches block1 and runs heads.Replace with
+// root=H1). When B0 is released, the stuck walker resumes and runs
+// processNode(B0, root=H1) which calls heads.Replace(block1, H1) - this
+// re-adds H1 as a head even though H2 (its descendant) is already a
+// head, leaving both in the set permanently.
+func TestCRDTConcurrentWalksLeaveAncestorAsHead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+
+		bs := mdutils.Bserv()
+		dagserv := merkledag.NewDAGService(bs)
+
+		bcasts, cancelBcasts := newBroadcasters(t, 2)
+		t.Cleanup(cancelBcasts)
+
+		const batchDelay = time.Second
+
+		mkOpts := func(name string, batch time.Duration, multiHead bool) *Options {
+			o := DefaultOptions()
+			o.Logger = &testLogger{name: name + ": ", l: DefaultOptions().Logger}
+			o.RebroadcastInterval = time.Hour
+			o.RepairInterval = time.Hour
+			o.BroadcastBatchDelay = batch
+			o.NumWorkers = 5
+			o.DAGSyncerTimeout = time.Hour
+			o.MultiHeadProcessing = multiHead
+			return o
+		}
+
+		mapDs0 := dssync.MutexWrap(ds.NewMapDatastore())
+		peer0, err := New(mapDs0, ds.NewKey("crdttest"), dagserv, bcasts[0], mkOpts("p0", batchDelay, false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = peer0.Close() })
+
+		holder := &holdingDAGSvc{DAGService: dagserv}
+		mapDs1 := dssync.MutexWrap(ds.NewMapDatastore())
+		peer1, err := New(mapDs1, ds.NewKey("crdttest"), holder, bcasts[1], mkOpts("p1", 0, true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = peer1.Close() })
+
+		// Phase 1: peer0 writes k1 → block1, peer1 syncs.
+		if err := peer0.Put(ctx, ds.NewKey("/k1"), []byte("v1")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(batchDelay)
+		synctest.Wait()
+		h0, _, _ := peer0.heads.List(ctx)
+		block1 := h0[0].Cid
+		h1, _, _ := peer1.heads.List(ctx)
+		if len(h1) != 1 || !h1[0].Cid.Equals(block1) {
+			t.Fatalf("phase 1: peer1 head should be block1, got %v", h1)
+		}
+
+		// Phase 2: peer0 writes k2 → B0 and k3 → H1 in the same batch, so
+		// the broadcast advertises only H1. Hold B0 on peer1 so the H1
+		// walk gets stuck after marking H1 processed.
+		if err := peer0.Put(ctx, ds.NewKey("/k2"), []byte("v2")); err != nil {
+			t.Fatal(err)
+		}
+		h0, _, _ = peer0.heads.List(ctx)
+		B0 := h0[0].Cid
+		holder.hold(B0)
+		if err := peer0.Put(ctx, ds.NewKey("/k3"), []byte("v3")); err != nil {
+			t.Fatal(err)
+		}
+		h0, _, _ = peer0.heads.List(ctx)
+		H1 := h0[0].Cid
+
+		time.Sleep(batchDelay)
+		synctest.Wait()
+
+		processedH1, _ := peer1.isProcessed(ctx, H1)
+		processedB0, _ := peer1.isProcessed(ctx, B0)
+		if !processedH1 {
+			t.Fatal("phase 2: peer1 should have processed H1")
+		}
+		if processedB0 {
+			t.Fatal("phase 2: peer1 should NOT have processed B0 (held)")
+		}
+
+		// Phase 3: peer0 writes k4 → H2. Broadcast [H2] goes out after
+		// batchDelay. peer1 receives it concurrently with the still-stuck
+		// H1 walk (MultiHeadProcessing=true), processes H2, and ends up
+		// with H2 as a head.
+		if err := peer0.Put(ctx, ds.NewKey("/k4"), []byte("v4")); err != nil {
+			t.Fatal(err)
+		}
+		h0, _, _ = peer0.heads.List(ctx)
+		H2 := h0[0].Cid
+
+		time.Sleep(batchDelay)
+		synctest.Wait()
+
+		processedH2, _ := peer1.isProcessed(ctx, H2)
+		if !processedH2 {
+			t.Fatal("phase 3: peer1 should have processed H2 while H1 walk is stuck")
+		}
+
+		// Phase 4: release B0. The stuck H1 walker resumes and walks down
+		// to block1 with root=H1. processNode(B0, root=H1) reaches block1
+		// (which is still a head) and does heads.Replace(block1, H1) -
+		// re-adding H1 even though H2 has superseded it.
+		holder.release(B0)
+		time.Sleep(batchDelay)
+		synctest.Wait()
+
+		processedB0After, _ := peer1.isProcessed(ctx, B0)
+		if !processedB0After {
+			t.Fatal("phase 4: peer1 should have processed B0 after release")
+		}
+
+		finalHeads, _, _ := peer1.heads.List(ctx)
+		hasH1 := false
+		hasH2 := false
+		for _, h := range finalHeads {
+			if h.Cid.Equals(H1) {
+				hasH1 = true
+			}
+			if h.Cid.Equals(H2) {
+				hasH2 = true
+			}
+		}
+		if !hasH2 {
+			t.Errorf("expected H2 (%s) in heads, got %v", H2, finalHeads)
+		}
+		if hasH1 {
+			t.Errorf("BUG: H1 (%s) is an ancestor of H2 (%s) but is in heads: %v",
+				H1, H2, finalHeads)
+		}
+		if len(finalHeads) != 1 {
+			t.Errorf("expected exactly 1 head (H2), got %d: %v", len(finalHeads), finalHeads)
+		}
+	})
+}
