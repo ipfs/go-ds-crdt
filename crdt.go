@@ -820,6 +820,36 @@ func (store *Datastore) handleBranch(ctx context.Context, head Head, c cid.Cid) 
 		dg = &crdtNodeGetter{NodeGetter: sessionMaker.Session(cctx)}
 	}
 
+	// Pre-register the new head before walking the branch. The existing
+	// head-promotion logic in processNode only fires once the walk reaches
+	// the bottom (heads.Replace at the old head, or heads.Add at a
+	// genesis/already-queued node), which can be many nodes deep. If the
+	// process crashes or is closed cleanly mid-walk, the new head would
+	// otherwise never be persisted, the merged-but-unfinished branch would
+	// stay marked as processed, and repairDAG (which walks from heads
+	// only) would be unable to reach it. Pre-registering means a partial
+	// walk leaves a recoverable trace: repair will find the new head and
+	// re-walk down to fill in the unprocessed portion.
+	//
+	// Skip when head.Cid != c (called from repairDAG mid-branch) or when
+	// the CID is already a head (idempotent fast path).
+	if head.Cid == c {
+		if _, isHead := store.heads.Get(ctx, head.Cid); !isHead {
+			if head.Height == 0 {
+				prioCtx, prioCancel := context.WithTimeout(ctx, store.opts.DAGSyncerTimeout)
+				prio, err := store.getPriority(prioCtx, dg, c)
+				prioCancel()
+				if err != nil {
+					return fmt.Errorf("error getting priority for new head %s: %w", c, err)
+				}
+				head.Height = prio
+			}
+			if err := store.heads.Add(ctx, head); err != nil {
+				return fmt.Errorf("error pre-registering head %s: %w", head.Cid, err)
+			}
+		}
+	}
+
 	var session sync.WaitGroup
 	err := store.sendNewJobs(ctx, &session, dg, head, []cid.Cid{c})
 	session.Wait()
