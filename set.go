@@ -372,83 +372,6 @@ func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, 
 	return writeStore.Put(ctx, prioK, buf[0:n])
 }
 
-// sets a value if priority is higher. When equal, it sets if the
-// value is lexicographically higher than the current value.
-// delta is the triggering delta forwarded to the put hook when the write is
-// considered the prevalent value. delta must not be nil; its priority drives
-// the write decision.
-// setValue writes value at the given priority for key when the delta wins
-// (higher priority, or equal priority with a greater byte value). It returns
-// a non-nil *PutEvent describing the change when a put hook is registered
-// and the write actually happened; otherwise it returns (nil, nil). The
-// caller is responsible for firing the hook (typically after the surrounding
-// batch is committed, so the hook callback observes post-write state).
-func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, delta Delta) (*PutEvent, error) {
-	if delta == nil {
-		return nil, errors.New("setValue: delta must not be nil")
-	}
-	// If this key was tombstoned already, do not store/update the value.
-	deleted, err := s.inTombsKeyID(ctx, key, id)
-	if err != nil || deleted {
-		return nil, err
-	}
-
-	prio := delta.GetPriority()
-	curPrio, err := s.getPriority(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-
-	if prio < curPrio {
-		return nil, nil
-	}
-	valueK := s.valueKey(key)
-
-	var oldVal []byte
-	if prio == curPrio {
-		oldVal, _ = s.store.Get(ctx, valueK)
-		// new value greater than old
-		if bytes.Compare(oldVal, value) >= 0 {
-			return nil, nil
-		}
-	} else if s.hooks.hookLoadPreviousValue && s.hooks.putHook != nil {
-		// Fetch old value before the write so the hook receives it.
-		oldVal, _ = s.store.Get(ctx, valueK)
-	}
-
-	// The oldVal read above always happens when prio == curPrio (needed for
-	// the Compare). Only forward it to the hook when hookLoadPreviousValue is set.
-	oldPrio := curPrio
-	if !s.hooks.hookLoadPreviousValue {
-		oldVal = nil
-		oldPrio = 0
-	}
-
-	// store value
-	err = writeStore.Put(ctx, valueK, value)
-	if err != nil {
-		return nil, err
-	}
-
-	// store priority
-	err = s.setPriority(ctx, writeStore, key, prio)
-	if err != nil {
-		return nil, err
-	}
-
-	if s.hooks.putHook == nil {
-		return nil, nil
-	}
-	return &PutEvent{
-		Key:         ds.NewKey(key),
-		OldValue:    oldVal,
-		NewValue:    value,
-		OldPriority: oldPrio,
-		NewPriority: prio,
-		Delta:       delta,
-	}, nil
-}
-
 // findBestValue looks for all entries for the given key, figures out their
 // priority from their delta (skipping the blocks by the given pendingTombIDs)
 // and returns the value with the highest priority that is not tombstoned nor
@@ -594,35 +517,118 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, delt
 		}
 	}
 
-	// Collect put events during the loop and fire the hooks after the batch
-	// commit so callbacks reading from s.store observe the post-merge
-	// snapshot. Mirrors putTombs. nil when no put hook is registered, so the
-	// firing loop becomes a no-op.
-	var events []PutEvent
-	if s.hooks.putHook != nil {
-		events = make([]PutEvent, 0, len(elems))
+	// Per-key accumulator: resolve the winning value across all same-key
+	// elements in this delta before writing, so the store and the put hook
+	// reflect CRDT semantics (lex-largest wins at tied priority) independent
+	// of element order, and so the hook fires once per key rather than once
+	// per element.
+	type putKeyState struct {
+		bestVal    []byte
+		skipWrite  bool // delta loses to the current store winner for this key
+		prev       keyState
+		prevLoaded bool // prev snapshot has been read from the store
 	}
+
+	prio := delta.GetPriority()
+	loadPrev := s.hooks.hookLoadPreviousValue && s.hooks.putHook != nil
+	states := make(map[string]*putKeyState)
 
 	for _, e := range elems {
 		e.Id = id // overwrite the identifier as it would come unset
 		key := e.GetKey()
 		// /namespace/elems/<key>/<id>
 		k := s.elemsPrefix(key).ChildString(id)
-		err := store.Put(ctx, k, nil)
-		if err != nil {
+		if err := store.Put(ctx, k, nil); err != nil {
 			return err
 		}
 
-		// update the value if applicable:
-		// * higher priority than we currently have.
-		// * not tombstoned before.
-		evt, err := s.setValue(ctx, store, key, id, e.GetValue(), delta)
+		// Skip tombstoned elements: they cannot contribute to the in-delta
+		// winner (mirrors setValue's inTombsKeyID check).
+		deleted, err := s.inTombsKeyID(ctx, key, id)
 		if err != nil {
 			return err
 		}
-		if evt != nil {
-			events = append(events, *evt)
+		if deleted {
+			continue
 		}
+
+		st, ok := states[key]
+		if !ok {
+			st = &putKeyState{}
+			states[key] = st
+
+			curPrio, err := s.getPriority(ctx, key)
+			if err != nil {
+				return err
+			}
+			if prio < curPrio {
+				st.skipWrite = true
+			} else if prio == curPrio {
+				// Tied priority: the store's current value is a competitor in
+				// the lex-largest tiebreak. Seed bestVal with it and snapshot
+				// it as prev so the post-loop no-op check can suppress a
+				// redundant write when no in-delta elem beats curVal.
+				curVal, _ := s.store.Get(ctx, s.valueKey(key))
+				st.bestVal = curVal
+				st.prev = keyState{value: curVal, priority: curPrio}
+				st.prevLoaded = true
+			} else {
+				// prio > curPrio: delta always wins, no tiebreak needed
+				// bestVal stays nil and will be replaced by any in-delta value.
+				if loadPrev {
+					curVal, _ := s.store.Get(ctx, s.valueKey(key))
+					st.prev = keyState{value: curVal, priority: curPrio}
+					st.prevLoaded = true
+				}
+			}
+		}
+
+		if st.skipWrite {
+			continue
+		}
+
+		if v := e.GetValue(); bytes.Compare(v, st.bestVal) > 0 {
+			st.bestVal = v
+		}
+	}
+
+	var events []PutEvent
+	if s.hooks.putHook != nil {
+		events = make([]PutEvent, 0, len(states))
+	}
+
+	for key, st := range states {
+		if st.skipWrite {
+			continue
+		}
+		// Suppress no-op writes: when the chosen value and priority match
+		// what is already in the store (tied priority, equal bytes), nothing
+		// changes. Mirrors setValue's equal-bytes skip.
+		if st.prevLoaded && prio == st.prev.priority && bytes.Equal(st.bestVal, st.prev.value) {
+			continue
+		}
+
+		if err := store.Put(ctx, s.valueKey(key), st.bestVal); err != nil {
+			return err
+		}
+		if err := s.setPriority(ctx, store, key, prio); err != nil {
+			return err
+		}
+
+		if s.hooks.putHook == nil {
+			continue
+		}
+		evt := PutEvent{
+			Key:         ds.NewKey(key),
+			NewValue:    st.bestVal,
+			NewPriority: prio,
+			Delta:       delta,
+		}
+		if loadPrev {
+			evt.OldValue = st.prev.value
+			evt.OldPriority = st.prev.priority
+		}
+		events = append(events, evt)
 	}
 
 	if batching {
