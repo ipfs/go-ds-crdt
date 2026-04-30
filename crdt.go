@@ -173,6 +173,8 @@ func (opts *Options) verify() error {
 	case opts.crdtOpts.Namespaces.Heads == "",
 		opts.crdtOpts.Namespaces.Set == "",
 		opts.crdtOpts.Namespaces.ProcessedBlocks == "",
+		opts.crdtOpts.Namespaces.PendingBlocks == "",
+		opts.crdtOpts.Namespaces.InflightHeads == "",
 		opts.crdtOpts.Namespaces.DirtyBitKey == "",
 		opts.crdtOpts.Namespaces.BadShutdownKey == "",
 		opts.crdtOpts.Namespaces.VersionKey == "":
@@ -206,6 +208,8 @@ func DefaultOptions() *Options {
 				DAGHeads:        dagHeadsNs,
 				Set:             setNs,
 				ProcessedBlocks: processedBlocksNs,
+				PendingBlocks:   pendingBlocksNs,
+				InflightHeads:   inflightHeadsNs,
 				DirtyBitKey:     dirtyBitKey,
 				BadShutdownKey:  badShutdownKey,
 				VersionKey:      versionKey,
@@ -246,6 +250,17 @@ type Datastore struct {
 	// keep track of children to be fetched so only one job does every
 	// child
 	queuedChildren *cidSafeSet
+
+	// nextTraversalID hands out a fresh, monotonically-increasing ID to
+	// each branch walk. The ID is written to pendingBlocks/<cid> so the
+	// next walk that reaches the region can tell whether the original walk
+	// is still alive (live tag → boundary) or has died (stalled tag →
+	// re-descend). Process-local; not persisted.
+	nextTraversalID atomic.Uint64
+	// activeTraversals is the set of IDs currently in flight. Empty on
+	// startup, which makes every persisted tag read as stalled and lets
+	// repair pick up where the previous run left off.
+	activeTraversals *activeTraversals
 }
 
 type dagJob struct {
@@ -253,8 +268,65 @@ type dagJob struct {
 	session    *sync.WaitGroup // A waitgroup to wait for all related jobs to conclude
 	nodeGetter *crdtNodeGetter // a node getter to use
 	root       Head            // the root of the branch we are walking down
+	parent     cid.Cid         // CID whose link pointed to this node (cid.Undef for tip)
 	delta      Delta           // the current delta
 	node       ipld.Node       // the current ipld Node
+	walk       *walkState      // shared state for the branch-walk this job belongs to
+}
+
+// walkState carries per-walk shared state across worker goroutines. Each
+// branch-walk constructs one walkState and threads it through every
+// processNode call.
+//
+//   - firstErr lets workers report the first failure back to handleBranch,
+//     which then skips finalize and leaves the inflightHeads anchor in
+//     place for repair.
+//   - tipCid identifies this walk's recovery anchor so processNode does
+//     not remove it during subsumption.
+//   - frontier collects every CID this walk pended whose links are all
+//     already-processed boundaries at the moment processNode classified
+//     them. finalizeWalk drives the bottom-up promote cascade from this
+//     set: every other pending CID this walk reaches is reachable from a
+//     frontier CID via the pending parent-edges recorded by markPending.
+type walkState struct {
+	id     uint64
+	tipCid cid.Cid
+
+	errMu    sync.RWMutex
+	firstErr error
+
+	fmu      sync.Mutex
+	frontier []cid.Cid
+}
+
+func newWalkState(id uint64, tipCid cid.Cid) *walkState {
+	return &walkState{id: id, tipCid: tipCid}
+}
+
+func (w *walkState) recordError(err error) {
+	if err == nil {
+		return
+	}
+	w.errMu.Lock()
+	defer w.errMu.Unlock()
+	if w.firstErr == nil {
+		w.firstErr = err
+	}
+}
+
+func (w *walkState) firstError() error {
+	w.errMu.RLock()
+	defer w.errMu.RUnlock()
+	return w.firstErr
+}
+
+// recordFrontier marks c as a finalize seed: every child link of c was
+// classified as a processed boundary at processNode time, so c is ready to
+// promote without re-reading its IPLD node.
+func (w *walkState) recordFrontier(c cid.Cid) {
+	w.fmu.Lock()
+	w.frontier = append(w.frontier, c)
+	w.fmu.Unlock()
 }
 
 type broadcastBatchHead struct {
@@ -347,6 +419,7 @@ func New(
 		jobQueue:         make(chan *dagJob, opts.NumWorkers),
 		sendJobs:         make(chan *dagJob),
 		queuedChildren:   newCidSafeSet(),
+		activeTraversals: newActiveTraversals(),
 	}
 
 	err = dstore.applyMigrations(ctx)
@@ -820,10 +893,30 @@ func (store *Datastore) handleBranch(ctx context.Context, head Head, c cid.Cid) 
 		dg = &crdtNodeGetter{NodeGetter: sessionMaker.Session(cctx)}
 	}
 
+	// Allocate a traversal-id and register it as live. The defer ensures
+	// we unregister on every exit path (success, error, panic) so a
+	// later walk reaching this region after our death sees a stalled tag
+	// and re-descends.
+	walk := newWalkState(store.nextTraversalID.Add(1), c)
+	store.activeTraversals.register(walk.id)
+	defer store.activeTraversals.unregister(walk.id)
+
+	// Write the inflight tip BEFORE merging anything. This is the
+	// recovery anchor: if we die after this point, the entry survives
+	// and repairPending re-drives the walk on next startup or repair.
+	tip := Head{Cid: c, HeadValue: HeadValue{Height: head.Height, DAGName: head.DAGName}}
+	if err := store.addInflightHead(ctx, tip); err != nil {
+		return fmt.Errorf("error writing inflight head: %w", err)
+	}
+
 	var session sync.WaitGroup
-	err := store.sendNewJobs(ctx, &session, dg, head, []cid.Cid{c})
+	jobErr := store.sendNewJobs(cctx, &session, dg, head, cid.Undef, []cid.Cid{c}, walk)
 	session.Wait()
-	return err
+	if err := errors.Join(jobErr, walk.firstError()); err != nil {
+		return err
+	}
+
+	return store.finalizeWalk(ctx, tip, walk)
 }
 
 // dagWorker should run in its own goroutine. Workers are launched during
@@ -843,20 +936,24 @@ func (store *Datastore) dagWorker() {
 			ctx,
 			job.nodeGetter,
 			job.root,
+			job.parent,
 			job.delta,
 			job.node,
+			job.walk,
 		)
 		if err != nil {
 			store.logger.Error(err)
 			store.MarkDirty(ctx)
+			job.walk.recordError(err)
 			job.session.Done()
 			continue
 		}
 		go func(j *dagJob) {
-			err := store.sendNewJobs(ctx, j.session, j.nodeGetter, j.root, children)
+			err := store.sendNewJobs(ctx, j.session, j.nodeGetter, j.root, j.node.Cid(), children, j.walk)
 			if err != nil {
 				store.logger.Error(err)
 				store.MarkDirty(ctx)
+				j.walk.recordError(err)
 			}
 			j.session.Done()
 		}(job)
@@ -865,8 +962,11 @@ func (store *Datastore) dagWorker() {
 
 // sendNewJobs calls getDeltas (GetMany) on the crdtNodeGetter with the given
 // children and sends each response to the workers. It will block until all
-// jobs have been queued.
-func (store *Datastore) sendNewJobs(ctx context.Context, session *sync.WaitGroup, ng *crdtNodeGetter, root Head, children []cid.Cid) error {
+// jobs have been queued. parent is the CID whose link points to each child;
+// it is recorded on each child's pending entry so finalize can traverse from
+// child back to parent. parent.Defined() == false signals "these children are
+// the walk's tip(s)" and no parent is recorded.
+func (store *Datastore) sendNewJobs(ctx context.Context, session *sync.WaitGroup, ng *crdtNodeGetter, root Head, parent cid.Cid, children []cid.Cid, walk *walkState) error {
 	if len(children) == 0 {
 		return nil
 	}
@@ -909,8 +1009,10 @@ loop:
 			session:    session,
 			nodeGetter: ng,
 			root:       root,
+			parent:     parent,
 			delta:      delta,
 			node:       deltaOpt.node,
+			walk:       walk,
 		}
 		select {
 		case store.sendJobs <- job:
@@ -1008,8 +1110,10 @@ func (store *Datastore) MarkClean(ctx context.Context) {
 }
 
 // processNode merges the delta in a node and has the logic about what to do
-// then.
-func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, root Head, delta Delta, node ipld.Node) ([]cid.Cid, error) {
+// then. parent is the CID whose link points to this node (cid.Undef if this
+// is the walk's tip); it is recorded under pending/<current>/p/<parent> so
+// finalize can traverse from this node back to its caller.
+func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, root Head, parent cid.Cid, delta Delta, node ipld.Node, walk *walkState) ([]cid.Cid, error) {
 	// First,  merge the delta in this node.
 	current := node.Cid()
 	blockKey := dshelp.MultihashToDsKey(current.Hash()).String()
@@ -1021,12 +1125,18 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 		return nil, fmt.Errorf("error merging delta from %s: %w", current, err)
 	}
 
-	// Record that we have processed the node so that any other worker
-	// can skip it.
-	err = store.markProcessed(ctx, current)
-	if err != nil {
-		// marking as dirty here will not help, as we have not made this block a head, so we will not re-traverse it when fixing the datastore.
-		return nil, fmt.Errorf("error recording %s as processed: %w", current, err)
+	// Mark the merged-but-not-yet-promoted CID with this walk's traversal-id
+	// and record parent->current as a pending edge. Ordering is load-bearing:
+	// set.Merge MUST commit before pendingBlocks/<cid>. The reverse order
+	// would leave a live pending tag pointing at unmerged data, and the next
+	// walk would silently skip the region.
+	//
+	// markPending also handles inflight subsumption when descending into an
+	// already-pending CID: if current was a peer walk's tip we have now
+	// joined under our anchor chain, markPending removes its inflightHeads
+	// entry once the parent edge is on disk.
+	if err := store.markPending(ctx, current, walk.id, parent, root.DAGName); err != nil {
+		return nil, fmt.Errorf("error marking %s pending: %w", current, err)
 	}
 
 	// Remove from the set that has the children which are queued for
@@ -1057,15 +1167,71 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 	//
 	// For every other child, add our node as Head.
 
+	// allChildrenProcessed tracks whether every link of current is already
+	// in the processed namespace at this moment. If so, current is a
+	// finalize seed: readyToPromote will pass trivially for it during
+	// finalizeWalk (no link is pending), so it can be promoted as soon as
+	// the cascade reaches it. Any non-processed child (live-pending peer,
+	// queued for our walk, or fresh descent) means current will be reached
+	// via the upward parent-edge cascade from one of those children
+	// instead, and we skip seeding it here. Leaves (len(links) == 0)
+	// trivially satisfy this.
+	allChildrenProcessed := true
+
 	addedAsHead := false // small optimization to avoid adding as head multiple times.
 	for _, l := range links {
 		child := l.Cid
 
 		oldHead, isHead := store.heads.Get(ctx, child)
 
-		isProcessed, err := store.isProcessed(ctx, child)
+		// Classify the child:
+		//   processed → boundary, no parent edge to record (child is gone).
+		//   live-pending under another walk → boundary; record current as
+		//     a parent on the child so when that other walk finalizes
+		//     it can cascade-promote this node too.
+		//   otherwise → descend (or skip if a peer in our walk already
+		//     queued it). The descent's markPending records the parent
+		//     edge; for the queuedChildren-skip case we add the edge below.
+		processed, err := store.isProcessed(ctx, child)
 		if err != nil {
 			return nil, fmt.Errorf("error checking for known block %s: %w", child, err)
+		}
+		if !processed {
+			allChildrenProcessed = false
+		}
+		var isBoundary bool
+		if processed {
+			isBoundary = true
+		} else {
+			tag, present, err := store.pendingTag(ctx, child)
+			if err != nil {
+				return nil, fmt.Errorf("error checking pending tag for %s: %w", child, err)
+			}
+			if present && store.activeTraversals.isLive(tag) && tag != walk.id {
+				isBoundary = true
+				// Record our parent edge on the peer's pending CID so
+				// that when the peer's finalize promotes child, our
+				// current node is enqueued and can be promoted in turn.
+				if err := store.store.Put(ctx, store.pendingParentKey(child, current), nil); err != nil {
+					return nil, fmt.Errorf("error recording boundary parent on %s: %w", child, err)
+				}
+				// Boundary subsumption: child is the peer walk's recovery
+				// anchor (or sits below it in inflightHeads). Now that the
+				// parent edge from current → child is on disk, child is
+				// reachable from our walk's anchor too, and the chain
+				// extends transitively up to whichever walk's tip is the
+				// topmost in the joined region. Remove the peer's anchor
+				// so finalize-time cleanup only fires for true topmost
+				// CIDs (those with no pending parents).
+				//
+				// Order is load-bearing: the parent-edge write above MUST
+				// commit before this delete. Reverse order would let a
+				// crash orphan child's region — anchor gone, no parent
+				// edge for repair to follow.
+				if err := store.removeInflightHead(ctx, root.DAGName, child); err != nil {
+					return nil, fmt.Errorf("error subsuming boundary anchor %s: %w", child, err)
+				}
+			}
 		}
 
 		if isHead {
@@ -1084,7 +1250,7 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 			// both a node and its child are heads - which I'm not
 			// sure if it can happen at all, but good to safeguard
 			// for it).
-			if isProcessed {
+			if isBoundary {
 				continue
 			}
 		}
@@ -1094,12 +1260,32 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 		// head right away because we are not meant to replace an
 		// existing head. Otherwise, mark it for processing and
 		// keep going down this branch.
-		if isProcessed || !store.queuedChildren.Visit(child) {
+		if !store.queuedChildren.Visit(child) {
+			// A peer worker in our walk already queued this child. We
+			// will not call markPending for it ourselves; record our
+			// parent edge directly so finalize can cascade back to us.
+			// The peer's markPending will write meta and its own
+			// parent edge; both p/* entries coexist.
+			if !processed {
+				if err := store.store.Put(ctx, store.pendingParentKey(child, current), nil); err != nil {
+					return nil, fmt.Errorf("error recording own-walk parent edge to %s: %w", child, err)
+				}
+			}
 			if !addedAsHead {
 				err = store.heads.Add(ctx, root)
 				if err != nil {
 					// Don't let this failure prevent us
 					// from processing the other links.
+					store.logger.Error(fmt.Errorf("error adding head %s: %w", root, err))
+				}
+				addedAsHead = true
+			}
+			continue
+		}
+		if isBoundary {
+			if !addedAsHead {
+				err = store.heads.Add(ctx, root)
+				if err != nil {
 					store.logger.Error(fmt.Errorf("error adding head %s: %w", root, err))
 				}
 				addedAsHead = true
@@ -1113,6 +1299,10 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 
 	}
 
+	if allChildrenProcessed {
+		walk.recordFrontier(current)
+	}
+
 	return children, nil
 }
 
@@ -1123,6 +1313,14 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 	defer func() {
 		store.logger.Infof("DAG repair finished. Took %s", time.Since(start).Truncate(time.Second))
 	}()
+
+	// Re-drive any walks that were inflight at the time of the previous
+	// crash or failure before walking the heads. repairPending reaches
+	// regions that the heads-down walk below cannot — pending CIDs above
+	// current heads, anchored only by their inflightHeads entry.
+	if err := store.repairPending(ctx); err != nil {
+		return fmt.Errorf("error repairing pending walks: %w", err)
+	}
 
 	getter := &crdtNodeGetter{store.dagService}
 
@@ -1554,10 +1752,6 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, []He
 	height = height + 1 // This implies our minimum height is 1
 	delta.SetPriority(height)
 
-	// for _, e := range delta.GetElements() {
-	// 	e.Value = append(e.GetValue(), []byte(fmt.Sprintf(" height: %d", height))...)
-	// }
-
 	nd, err := store.putBlock(ctx, heads, delta)
 	if err != nil {
 		return Head{}, nil, err
@@ -1567,31 +1761,36 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, []He
 	newHead.DAGName = dagName
 	newHead.Height = height
 
-	// Process new block. This makes that every operation applied
-	// to this store take effect (delta is merged) before
-	// returning. Since our block references current heads, children
-	// should be empty
+	// Local publish uses the same lifecycle as a remote walk — scaled to
+	// one node — so a crash mid-publish leaves an inflightHeads anchor
+	// that repairPending completes on the next startup or repair tick.
+	walk := newWalkState(store.nextTraversalID.Add(1), newHead.Cid)
+	store.activeTraversals.register(walk.id)
+	defer store.activeTraversals.unregister(walk.id)
+
+	if err := store.addInflightHead(ctx, newHead); err != nil {
+		return Head{}, nil, fmt.Errorf("error writing inflight head: %w", err)
+	}
+
 	store.logger.Debugf("processing generated block %s", nd.Cid())
 	children, err := store.processNode(
 		ctx,
 		&crdtNodeGetter{store.dagService},
 		newHead,
+		cid.Undef,
 		delta,
 		nd,
+		walk,
 	)
 	if err != nil {
-		// store.MarkDirty(ctx) // Keep disabled: Since we are
-		// adding a new node that should become head any
-		// processing failures are unlikely to be fixed by
-		// reprocessing, unlike when processing nodes deep in
-		// the DAG.  Additionally, process node may fail due
-		// to custom delta errors on GetElement(). Those
-		// should just abort merging, and not mark the whole
-		// datastore dirty.
 		return newHead, nil, fmt.Errorf("error processing new block: %w", err)
 	}
 	if len(children) != 0 {
 		store.logger.Warnf("bug: created a block to unknown children")
+	}
+
+	if err := store.finalizeWalk(ctx, newHead, walk); err != nil {
+		return newHead, nil, fmt.Errorf("error finalizing local publish: %w", err)
 	}
 
 	return newHead, heads, nil
