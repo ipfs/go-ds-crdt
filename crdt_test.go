@@ -1903,9 +1903,12 @@ func (h *holdingDAGSvc) GetMany(ctx context.Context, cids []cid.Cid) <-chan *ipl
 // single broadcast advertising block 3 as the head (block 2 never appears in
 // a broadcast). peer1 receives the broadcast, fetches and processes block 3,
 // and then blocks fetching its parent (block 2). peer1 is closed cleanly in
-// that state, then reopened with the hold released. The test then waits
-// through two rebroadcast intervals to see whether rebroadcasts alone drive
-// peer1 to recover the missing block.
+// that state, then reopened with the hold released. The test then asserts
+// that peer1 recovers the missing block: handleBranch pre-registers block 3
+// as a head before walking, so the partial walk leaves a recoverable trace;
+// the worker marks the store dirty when its in-flight fetch is cancelled by
+// Close; on reopen the repair loop fires immediately, walks down from the
+// pre-registered head 3, finds block 2 unprocessed, and reprocesses it.
 func TestCRDTPartialSyncCleanCloseRecovery(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := t.Context()
@@ -2022,9 +2025,7 @@ func TestCRDTPartialSyncCleanCloseRecovery(t *testing.T) {
 		}
 		synctest.Wait()
 
-		// Reopen peer1 with block 2 released, and wait through two
-		// rebroadcast intervals to see whether rebroadcasts alone recover
-		// the missing block.
+		// Reopen peer1 with block 2 released, and wait for DAG to be repaired.
 		holder.release(block2)
 		peer1b, err := New(mapDs1, ds.NewKey("crdttest"), holder, bcasts[1], mkOpts("p1b", 0))
 		if err != nil {
@@ -2032,18 +2033,23 @@ func TestCRDTPartialSyncCleanCloseRecovery(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = peer1b.Close() })
 
-		time.Sleep(3 * rebroadcastInterval)
 		synctest.Wait()
 
-		p2After, _ := peer1b.isProcessed(ctx, block2)
 		p3After, _ := peer1b.isProcessed(ctx, block3)
-		hAfter, _, _ := peer1b.heads.List(ctx)
-		dirtyAfter := peer1b.IsDirty(ctx)
-
-		if p2After && len(hAfter) == 1 && hAfter[0].Cid.Equals(block3) && !dirtyAfter {
-			return
+		if !p3After {
+			t.Fatal("peer1 should have processed block 3 after release and reopen")
 		}
-		t.Fatalf("peer1 did not recover after 3 rebroadcasts: block2.processed=%v block3.processed=%v heads=%v dirty=%v (want head=%s, block2 processed, dirty=false)",
-			p2After, p3After, hAfter, dirtyAfter, block3)
+		p2After, _ := peer1b.isProcessed(ctx, block2)
+		if !p2After {
+			t.Fatal("peer1 should have processed block 2 after release and reopen")
+		}
+		hAfter, _, _ := peer1b.heads.List(ctx)
+		if len(hAfter) != 1 || !hAfter[0].Cid.Equals(block3) {
+			t.Fatalf("peer1 should have block3 as head after recovery, got %v", hAfter)
+		}
+		dirtyAfter := peer1b.IsDirty(ctx)
+		if dirtyAfter {
+			t.Fatal("peer1 should be marked clean after successful recovery")
+		}
 	})
 }
