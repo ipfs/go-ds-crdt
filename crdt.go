@@ -369,10 +369,17 @@ func New(
 		dstore.MarkDirty(ctx)
 	}
 	// Set the bad-shutdown key so that if we crash before the next clean
-	// Close(), we will know on the next startup and trigger a repair.
+	// Close(), we will know on the next startup and trigger a repair. Sync it to
+	// disk immediately, otherwise a crash before the next flush would leave the
+	// marker only in memory and the crash would go undetected on the next
+	// startup.
 	if err := dstore.store.Put(ctx, dstore.badShutdownKey(), nil); err != nil {
 		cancel()
 		return nil, fmt.Errorf("error writing bad-shutdown key: %w", err)
+	}
+	if err := dstore.store.Sync(ctx, dstore.badShutdownKey()); err != nil {
+		cancel()
+		return nil, fmt.Errorf("error syncing bad-shutdown key: %w", err)
 	}
 
 	headList, maxHeight, err := dstore.heads.List(ctx)
@@ -1371,6 +1378,8 @@ func (store *Datastore) Close() error {
 	// land. Use a background context — store.ctx was cancelled above.
 	if err := store.store.Delete(closeCtx, store.badShutdownKey()); err != nil {
 		store.logger.Errorf("error clearing bad-shutdown key: %s", err)
+	} else if err := store.store.Sync(closeCtx, store.badShutdownKey()); err != nil {
+		store.logger.Errorf("error syncing bad-shutdown key deletion: %s", err)
 	}
 	return nil
 }
