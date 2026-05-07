@@ -157,6 +157,15 @@ type InternalNamespaces struct {
 type MerkleCRDTOptions struct {
 	DeltaFactory func() Delta
 	Namespaces   InternalNamespaces
+
+	// EnableSyncLock toggles the MerkleCRDT.LockSync / LockSyncDAG
+	// admin primitive. Default: false. When false the lock methods
+	// return a no-op handle and per-session gating in the Datastore
+	// hot paths is short-circuited via a nil-receiver path. Enable
+	// only when the application actually needs to drain in-flight
+	// DAG-traversal sessions (for example, before a snapshot or an
+	// external synchronisation handoff).
+	EnableSyncLock bool
 }
 
 // A MerkleCRDT is an advanced type to manually customize the merkle-CRDT. It
@@ -203,6 +212,7 @@ func NewMerkleCRDT(
 		if ns := in.VersionKey; ns != "" {
 			opts.crdtOpts.Namespaces.VersionKey = ns
 		}
+		opts.crdtOpts.EnableSyncLock = internalOptions.EnableSyncLock
 	}
 
 	d, err := New(store, namespace, dagSyncer, bcast, opts)
@@ -297,4 +307,87 @@ func (mcrdt *MerkleCRDT) Traverse(ctx context.Context,
 	}
 
 	return traverse.Traverse(root, opts)
+}
+
+// SyncLock is a handle to an engaged sync lock obtained via LockSync
+// or LockSyncDAG. The caller must call Unlock on it (typically via
+// defer) when finished. Multiple concurrent callers each receive
+// their own SyncLock; the underlying gating remains engaged as long
+// as at least one handle is unreleased.
+type SyncLock struct {
+	state  *syncLockState
+	id     uint64
+	dag    string
+	isFull bool
+}
+
+// Unlock releases the sync lock represented by this handle.
+// Idempotent: re-calling on the same handle is a no-op. Safe on a nil
+// receiver.
+func (l *SyncLock) Unlock() {
+	if l == nil || l.state == nil {
+		return
+	}
+	if l.isFull {
+		l.state.releaseFull(l.id)
+	} else {
+		l.state.releaseDAG(l.dag, l.id)
+	}
+}
+
+// LockSync engages the datastore-wide sync lock and blocks until all
+// in-flight DAG-traversal sessions have drained. Returns a *SyncLock
+// that the caller must release via Unlock.
+//
+// On context error, the engagement is rolled back and a nil handle is
+// returned alongside the error; the caller may retry by calling
+// LockSync again.
+//
+// Sync locks gate inbound DAG traversal only. Publish and other writes
+// are unaffected.
+//
+// Multiple concurrent callers may each hold their own SyncLock
+// independently. The underlying lock is engaged iff at least one
+// handle is unreleased; releasing one handle does not affect another
+// caller's hold.
+func (mcrdt *MerkleCRDT) LockSync(ctx context.Context) (*SyncLock, error) {
+	state := mcrdt.syncLock
+	if state == nil {
+		return &SyncLock{}, nil
+	}
+	id := state.engageFull()
+	if err := state.waitFull(ctx); err != nil {
+		state.releaseFull(id)
+		return nil, err
+	}
+	return &SyncLock{state: state, id: id, isFull: true}, nil
+}
+
+// LockSyncDAG is the per-DAG variant of LockSync: it gates and drains
+// only sessions whose DAGName matches dagName. Other DAGs continue to
+// process normally.
+func (mcrdt *MerkleCRDT) LockSyncDAG(ctx context.Context, dagName string) (*SyncLock, error) {
+	state := mcrdt.syncLock
+	if state == nil {
+		return &SyncLock{}, nil
+	}
+	id := state.engageDAG(dagName)
+	if err := state.waitDAG(ctx, dagName); err != nil {
+		state.releaseDAG(dagName, id)
+		return nil, err
+	}
+	return &SyncLock{state: state, id: id, dag: dagName}, nil
+}
+
+// SyncLocked reports whether at least one datastore-wide LockSync
+// handle is currently held.
+func (mcrdt *MerkleCRDT) SyncLocked() bool {
+	return mcrdt.syncLock.fullEngaged()
+}
+
+// SyncLockedDAGs returns the sorted list of DAGNames with per-DAG sync
+// locks engaged. The full lock state is reported separately by
+// SyncLocked().
+func (mcrdt *MerkleCRDT) SyncLockedDAGs() []string {
+	return mcrdt.syncLock.dagsEngaged()
 }
