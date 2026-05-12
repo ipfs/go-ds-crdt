@@ -1274,24 +1274,14 @@ func TestMerkleCRDT_LockSync_RollbackOnCtxCancel(t *testing.T) {
 	})
 }
 
-// TestMerkleCRDT_LockSync_MultiHeadProcessing_PrematureReturn demonstrates
-// that with Options.MultiHeadProcessing=true, LockSync returns before
-// in-flight DAG-traversal work for an already-admitted broadcast has
-// finished — violating the godoc claim that "all in-flight DAG-traversal
-// sessions have drained" upon return.
-//
-// Mechanics: under MultiHeadProcessing=true, the per-dagName goroutine
-// in handleNext (crdt.go:489) spawns processHead in its own goroutine
-// (crdt.go:537) and exits immediately. The deferred syncLock.leave fires
-// while the spawned sub-goroutine is still inside handleBranch, queueing
-// dagWorker jobs and mutating heads/set state. activeDAG hits 0, so
-// LockSync's waitFull returns even though work is in flight.
-//
-// Counterpart: TestMerkleCRDT_LockDrainsInFlightSession runs the same
-// scenario with MultiHeadProcessing=false (default) and passes — the
-// session goroutine itself blocks on the gated Get, so leave is delayed
-// until the branch is fully processed.
-func TestCRDTLockSyncMultiHeadProcessingPrematureReturn(t *testing.T) {
+// TestMerkleCRDT_LockDrainsInFlightSession_MultiHead is the
+// MultiHeadProcessing=true counterpart to
+// TestMerkleCRDT_LockDrainsInFlightSession. With MultiHeadProcessing=true,
+// handleNext dispatches each head into a fire-and-forget sub-goroutine (`go
+// processHead`), so without per-spawn session accounting the outer per-DAG
+// goroutine's counter would drop to zero before the actual DAG traversal runs.
+// LockSync must still wait for the spawned sub-goroutine to drain.
+func TestMerkleCRDT_LockDrainsInFlightSession_MultiHead(t *testing.T) {
 	t.Parallel()
 
 	synctest.Test(t, func(t *testing.T) {
@@ -1366,21 +1356,21 @@ func TestCRDTLockSyncMultiHeadProcessingPrematureReturn(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// synctest.Wait blocks until every goroutine in the bubble is
-		// durably parked. By the time it returns:
-		//   - peer 1's handleNext has received the broadcast,
-		//   - the per-dagName goroutine has spawned `go processHead`
-		//     and called `leave("")` on its way out (activeDAG=0),
-		//   - the spawned sub-goroutine is parked inside Get on the
-		//     closed gate channel.
+		// synctest.Wait blocks until every goroutine in the bubble is durably
+		// parked. By the time it returns:
+		//   - peer 1's handleNext has received the broadcast
+		//   - the per-dagName goroutine has spawned `go processHead` (which
+		//     carries its own session counter) and returned
+		//   - the spawned sub-goroutine is parked inside Get on the closed gate
+		//     channel, with activeDAG[""] > 0
 		synctest.Wait()
 		if ok, _ := peer1.Has(ctx, keyB); ok {
 			t.Fatal("keyB processed despite gate closed")
 		}
 
-		// LockSync must wait for in-flight sessions to drain. Run it
-		// in a goroutine so we can observe whether it returns before
-		// the gated sub-goroutine has finished its work.
+		// LockSync must wait for the spawned processHead session to
+		// drain even though MultiHeadProcessing detaches it from the
+		// outer per-DAG goroutine.
 		lockDone := make(chan struct{})
 		var lk *SyncLock
 		var lockErr error
@@ -1392,30 +1382,25 @@ func TestCRDTLockSyncMultiHeadProcessingPrematureReturn(t *testing.T) {
 
 		select {
 		case <-lockDone:
-			// LockSync returned even though processHead is still
-			// blocked on the gate. The drain guarantee is not
-			// being honored. Continue the test to also show the
-			// concrete state-mutation that occurs after release.
+			t.Fatalf("LockSync returned prematurely while processHead "+
+				"was still parked on the gate (err=%v) — the spawned "+
+				"sub-goroutine escaped the session boundary", lockErr)
 		default:
-			t.Fatal("expected: LockSync returns prematurely under MultiHeadProcessing=true. " +
-				"If this case fires, the issue is fixed (LockSync now waits for processHead).")
 		}
-		if lockErr != nil {
-			t.Fatalf("LockSync: %v", lockErr)
+		if !peer1.SyncLocked() {
+			t.Error("expected SyncLocked()==true while drain blocks")
 		}
 
-		// The lock claims to be drained. Releasing the gate should
-		// have nothing to unblock — the sub-goroutine should already
-		// have finished. In reality the sub-goroutine is alive,
-		// processes the branch, and mutates peer 1's state while we
-		// hold the lock.
+		// Release the gate. The spawned processHead finishes its
+		// branch, calls leave, drain completes, LockSync returns.
 		gated.Release()
-		synctest.Wait()
-
-		if ok, _ := peer1.Has(ctx, keyB); ok {
-			t.Fatal("LockSync drain guarantee violated: peer 1 processed keyB " +
-				"while the sync lock was held — sub-goroutine spawned by " +
-				"MultiHeadProcessing escaped the session boundary")
+		<-lockDone
+		if lockErr != nil {
+			t.Fatalf("LockSync after release: %v", lockErr)
+		}
+		if ok, _ := peer1.Has(ctx, keyB); !ok {
+			t.Error("peer 1 should have keyB once the in-flight " +
+				"session drained and LockSync returned")
 		}
 		lk.Unlock()
 	})

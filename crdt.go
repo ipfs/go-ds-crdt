@@ -620,7 +620,20 @@ func (store *Datastore) handleNext(ctx context.Context) {
 					// the same broadcast in parallel, but do not process
 					// heads from multiple broadcasts in parallel.
 					if store.opts.MultiHeadProcessing {
-						go processHead(ctx, head)
+						// Each spawned processHead is its own
+						// session. The outer goroutine's leave()
+						// fires as soon as the spawn loop
+						// returns, so without re-entering here,
+						// LockSync would see activeDAG==0 while
+						// sub-goroutines are still traversing
+						// the DAG.
+						if store.syncLock.gateAndEnter(dagName) {
+							continue
+						}
+						go func(h Head) {
+							defer store.syncLock.leave(dagName)
+							processHead(ctx, h)
+						}(head)
 					} else {
 						processHead(ctx, head)
 					}
