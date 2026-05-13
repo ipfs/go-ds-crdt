@@ -61,38 +61,41 @@ func (s *syncLockState) Close() {
 }
 
 // gateAndEnter atomically checks whether dagName is locked. Returns true if
-// locked, in which case the caller must skip its work and not call leave.
-// Returns false otherwise, in which case counters were incremented and the
-// caller must call leave when finished.
+// the caller entered the protected region (counters were incremented; the
+// caller must call leave when finished). Returns false if the lock is engaged,
+// in which case the caller must skip its work and not call leave.
+//
+// Polarity mirrors sync.(*Mutex).TryLock: true means "got in".
 func (s *syncLockState) gateAndEnter(dagName string) bool {
 	if s == nil {
-		return false
+		return true
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.fullHandles) > 0 {
-		return true
+		return false
 	}
 	if len(s.dagHandles[dagName]) > 0 {
-		return true
+		return false
 	}
 	s.activeDAG[dagName]++
-	return false
+	return true
 }
 
 // leave decrements the session counter for a previously entered session. Must
-// be paired with a gateAndEnter that returned false.
+// be paired with a gateAndEnter that returned true.
 func (s *syncLockState) leave(dagName string) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	s.activeDAG[dagName]--
-	if s.activeDAG[dagName] == 0 {
+	defer s.mu.Unlock()
+	if s.activeDAG[dagName] <= 1 {
 		delete(s.activeDAG, dagName)
+		s.cond.Broadcast()
+		return
 	}
-	s.cond.Broadcast()
-	s.mu.Unlock()
+	s.activeDAG[dagName]--
 }
 
 // engageFull adds a hold on the full lock and returns its id. Returns
