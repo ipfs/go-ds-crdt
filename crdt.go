@@ -56,6 +56,7 @@ const (
 // Common errors.
 var (
 	ErrNoMoreBroadcast = errors.New("receiving blocks aborted since no new blocks will be broadcasted")
+	ErrClosed          = errors.New("crdt: datastore is closed")
 )
 
 // A Broadcaster provides a way to send (notify) an opaque payload to
@@ -243,6 +244,8 @@ type Datastore struct {
 	// keep track of children to be fetched so only one job does every
 	// child
 	queuedChildren *cidSafeSet
+
+	syncLock *syncLockState
 }
 
 type dagJob struct {
@@ -328,6 +331,11 @@ func New(
 		return nil, fmt.Errorf("error building heads: %w", err)
 	}
 
+	var syncLock *syncLockState
+	if opts.crdtOpts.EnableSyncLock {
+		syncLock = newSyncLockState()
+	}
+
 	dstore := &Datastore{
 		ctx:              ctx,
 		cancel:           cancel,
@@ -344,6 +352,7 @@ func New(
 		jobQueue:         make(chan *dagJob, opts.NumWorkers),
 		sendJobs:         make(chan *dagJob),
 		queuedChildren:   newCidSafeSet(),
+		syncLock:         syncLock,
 	}
 
 	err = dstore.applyMigrations(ctx)
@@ -480,6 +489,16 @@ func (store *Datastore) handleNext(ctx context.Context) {
 			go func(dagName string, heads []Head) {
 				defer wg.Done()
 
+				// Sync-locked DAGs are skipped wholesale.
+				// Heads were already marked seen above so we
+				// won't rebroadcast them; peers will
+				// rebroadcast on their interval and the heads
+				// will be re-delivered after unlock.
+				if entered := store.syncLock.gateAndEnter(dagName); !entered {
+					return
+				}
+				defer store.syncLock.leave(dagName)
+
 				// if we have no heads for the DAG name, make
 				// seen-heads heads immediately.  On a fresh
 				// start, this allows us to start building on
@@ -515,7 +534,20 @@ func (store *Datastore) handleNext(ctx context.Context) {
 					// the same broadcast in parallel, but do not process
 					// heads from multiple broadcasts in parallel.
 					if store.opts.MultiHeadProcessing {
-						go processHead(ctx, head)
+						// Each spawned processHead is its own
+						// session. The outer goroutine's leave()
+						// fires as soon as the spawn loop
+						// returns, so without re-entering here,
+						// LockSync would see activeDAG==0 while
+						// sub-goroutines are still traversing
+						// the DAG.
+						if entered := store.syncLock.gateAndEnter(dagName); !entered {
+							continue
+						}
+						go func(h Head) {
+							defer store.syncLock.leave(dagName)
+							processHead(ctx, h)
+						}(head)
 					} else {
 						processHead(ctx, head)
 					}
@@ -691,12 +723,14 @@ func (store *Datastore) repair(ctx context.Context) {
 			}
 			return
 		case <-timer.C:
-			if !store.IsDirty(ctx) {
+			switch {
+			case store.syncLock.fullEngaged():
+				store.logger.Debug("sync lock engaged; skipping repair tick")
+			case !store.IsDirty(ctx):
 				store.logger.Info("store is marked clean. No need to repair")
-			} else {
+			default:
 				store.logger.Warn("store is marked dirty. Starting DAG repair operation")
-				err := store.repairDAG(ctx)
-				if err != nil {
+				if err := store.repairDAG(ctx); err != nil {
 					store.logger.Error(err)
 				}
 			}
@@ -1146,6 +1180,11 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 		queued.Add(h.Cid)
 	}
 
+	// skippedDAGs records whether any iteration was bypassed due to a
+	// sync lock. If so we leave the dirty bit set so the next repair
+	// tick (after unlock) can finish the job.
+	skippedDAGs := false
+
 	// For logging
 	var visitedNodes uint64
 	var lastPriority uint64
@@ -1190,48 +1229,66 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 		cur := nh.node
 		head := nh.head
 
-		cctx, cancel := context.WithTimeout(ctx, store.opts.DAGSyncerTimeout)
-		n, deltaBytes, err := getter.GetDelta(cctx, cur)
-		if err != nil {
-			cancel()
-			return fmt.Errorf("error getting node for reprocessing %s: %w", cur, err)
+		// Sync-locked DAGs are skipped wholesale: no GetDelta,
+		// no link expansion, no reprocessing. gateAndEnter both
+		// gates the iteration and counts it toward the per-DAG
+		// drain so concurrent LockSyncDAG can wait for an
+		// in-flight repair iteration to finish.
+		if entered := store.syncLock.gateAndEnter(head.DAGName); !entered {
+			skippedDAGs = true
+			continue
 		}
-		cancel()
 
-		delta := store.newDelta()
-		err = delta.Unmarshal(deltaBytes)
+		err := func() error {
+			defer store.syncLock.leave(head.DAGName)
+
+			cctx, cancel := context.WithTimeout(ctx, store.opts.DAGSyncerTimeout)
+			defer cancel()
+			n, deltaBytes, err := getter.GetDelta(cctx, cur)
+			if err != nil {
+				return fmt.Errorf("error getting node for reprocessing %s: %w", cur, err)
+			}
+
+			delta := store.newDelta()
+			if err := delta.Unmarshal(deltaBytes); err != nil {
+				return err
+			}
+
+			isProcessed, err := store.isProcessed(ctx, cur)
+			if err != nil {
+				return fmt.Errorf("error checking for reprocessed block %s: %w", cur, err)
+			}
+			if !isProcessed {
+				store.logger.Debugf("reprocessing %s / %d", cur, delta.GetPriority())
+				if err := store.handleBranch(ctx, head, cur); err != nil {
+					return fmt.Errorf("error reprocessing block %s: %w", cur, err)
+				}
+			}
+
+			links := n.Links()
+			for _, l := range links {
+				if queued.Visit(l.Cid) {
+					nodes = append(nodes, nodeHead{head: head, node: l.Cid})
+				}
+			}
+
+			atomic.StoreUint64(&queuedNodes, uint64(len(nodes)))
+			atomic.AddUint64(&visitedNodes, 1)
+			atomic.StoreUint64(&lastPriority, delta.GetPriority())
+			return nil
+		}()
 		if err != nil {
 			return err
 		}
-
-		isProcessed, err := store.isProcessed(ctx, cur)
-		if err != nil {
-			return fmt.Errorf("error checking for reprocessed block %s: %w", cur, err)
-		}
-		if !isProcessed {
-			store.logger.Debugf("reprocessing %s / %d", cur, delta.GetPriority())
-			// start syncing from here.
-			// do not add children to our queue.
-			err = store.handleBranch(ctx, head, cur)
-			if err != nil {
-				return fmt.Errorf("error reprocessing block %s: %w", cur, err)
-			}
-		}
-		links := n.Links()
-		for _, l := range links {
-			if queued.Visit(l.Cid) {
-				nodes = append(nodes, (nodeHead{head: head, node: l.Cid}))
-			}
-		}
-
-		atomic.StoreUint64(&queuedNodes, uint64(len(nodes)))
-		atomic.AddUint64(&visitedNodes, 1)
-		atomic.StoreUint64(&lastPriority, delta.GetPriority())
 	}
 
-	// If we are here we have successfully reprocessed the chain until the
-	// bottom.
-	store.MarkClean(ctx)
+	// If we are here we have successfully reprocessed the chain until
+	// the bottom. Only mark clean if no iterations were skipped due to
+	// a sync lock; otherwise leave the dirty bit set so a later repair
+	// tick finishes the job.
+	if !skippedDAGs {
+		store.MarkClean(ctx)
+	}
 	return nil
 }
 
@@ -1362,6 +1419,7 @@ func (store *Datastore) Sync(ctx context.Context, prefix ds.Key) error {
 func (store *Datastore) Close() error {
 	store.cancel()
 	store.wg.Wait()
+	store.syncLock.Close()
 	if store.IsDirty(store.ctx) {
 		store.logger.Warn("datastore is being closed marked as dirty")
 	}
