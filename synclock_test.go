@@ -23,7 +23,7 @@ func TestSyncLockState_GateAndEnter(t *testing.T) {
 
 	t.Run("not locked admits and increments", func(t *testing.T) {
 		s := newSyncLockState()
-		if locked := s.gateAndEnter("a"); locked {
+		if entered := s.gateAndEnter("a"); !entered {
 			t.Fatal("expected gateAndEnter to admit when unlocked")
 		}
 		s.mu.Lock()
@@ -37,7 +37,7 @@ func TestSyncLockState_GateAndEnter(t *testing.T) {
 		s := newSyncLockState()
 		s.engageFull()
 		for _, name := range []string{"", "a", "b"} {
-			if !s.gateAndEnter(name) {
+			if s.gateAndEnter(name) {
 				t.Errorf("expected gateAndEnter(%q) to block when fully locked", name)
 			}
 		}
@@ -51,10 +51,10 @@ func TestSyncLockState_GateAndEnter(t *testing.T) {
 	t.Run("DAG lock blocks only matching DAG", func(t *testing.T) {
 		s := newSyncLockState()
 		s.engageDAG("a")
-		if !s.gateAndEnter("a") {
+		if s.gateAndEnter("a") {
 			t.Error("gateAndEnter(a) should block")
 		}
-		if s.gateAndEnter("b") {
+		if !s.gateAndEnter("b") {
 			t.Error("gateAndEnter(b) should admit")
 		}
 	})
@@ -66,7 +66,7 @@ func TestSyncLockState_LeaveBalances(t *testing.T) {
 
 	// Two sessions on "a", one on "b".
 	for _, n := range []string{"a", "a", "b"} {
-		if locked := s.gateAndEnter(n); locked {
+		if entered := s.gateAndEnter(n); !entered {
 			t.Fatalf("unexpected lock for %q", n)
 		}
 	}
@@ -193,7 +193,7 @@ func TestSyncLockState_WaitFullDrains(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newSyncLockState()
 
-		if locked := s.gateAndEnter("a"); locked {
+		if entered := s.gateAndEnter("a"); !entered {
 			t.Fatal("gateAndEnter should admit")
 		}
 
@@ -222,10 +222,10 @@ func TestSyncLockState_WaitDAGDrains(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newSyncLockState()
 
-		if locked := s.gateAndEnter("a"); locked {
+		if entered := s.gateAndEnter("a"); !entered {
 			t.Fatal("gateAndEnter(a) should admit")
 		}
-		if locked := s.gateAndEnter("b"); locked {
+		if entered := s.gateAndEnter("b"); !entered {
 			t.Fatal("gateAndEnter(b) should admit")
 		}
 
@@ -254,7 +254,7 @@ func TestSyncLockState_WaitFullCtxCancel(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newSyncLockState()
 
-		if locked := s.gateAndEnter("a"); locked {
+		if entered := s.gateAndEnter("a"); !entered {
 			t.Fatal("gateAndEnter should admit")
 		}
 		defer s.leave("a")
@@ -273,7 +273,7 @@ func TestSyncLockState_WaitClosed(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newSyncLockState()
 
-		if locked := s.gateAndEnter("a"); locked {
+		if entered := s.gateAndEnter("a"); !entered {
 			t.Fatal("gateAndEnter should admit")
 		}
 		defer s.leave("a")
@@ -304,8 +304,8 @@ func TestSyncLockState_NilSafe(t *testing.T) {
 	var s *syncLockState
 
 	// All methods must be safe to call on a nil receiver.
-	if s.gateAndEnter("a") {
-		t.Error("gateAndEnter on nil should admit (return false)")
+	if !s.gateAndEnter("a") {
+		t.Error("gateAndEnter on nil should admit (return true)")
 	}
 	s.leave("a")
 	if id := s.engageFull(); id != 0 {
@@ -338,7 +338,7 @@ func TestSyncLockState_WaitFullSucceedsOnCtxRace(t *testing.T) {
 	s := newSyncLockState()
 
 	for i := 0; i < 1<<6; i++ {
-		if locked := s.gateAndEnter("a"); locked {
+		if entered := s.gateAndEnter("a"); !entered {
 			t.Fatal("gateAndEnter should admit")
 		}
 
@@ -1214,7 +1214,7 @@ func TestMerkleCRDT_CloseWhileLocked(t *testing.T) {
 		mc := mcs[0]
 
 		// Hold an in-flight session manually so LockSync blocks.
-		if locked := mc.syncLock.gateAndEnter("a"); locked {
+		if entered := mc.syncLock.gateAndEnter("a"); !entered {
 			t.Fatal("gateAndEnter should admit")
 		}
 
@@ -1253,7 +1253,7 @@ func TestMerkleCRDT_LockSync_RollbackOnCtxCancel(t *testing.T) {
 		t.Cleanup(closeFn)
 		mc := mcs[0]
 
-		if locked := mc.syncLock.gateAndEnter("a"); locked {
+		if entered := mc.syncLock.gateAndEnter("a"); !entered {
 			t.Fatal("gateAndEnter should admit")
 		}
 		defer mc.syncLock.leave("a")

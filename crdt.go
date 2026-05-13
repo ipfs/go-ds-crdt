@@ -580,7 +580,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 				// won't rebroadcast them; peers will
 				// rebroadcast on their interval and the heads
 				// will be re-delivered after unlock.
-				if store.syncLock.gateAndEnter(dagName) {
+				if entered := store.syncLock.gateAndEnter(dagName); !entered {
 					return
 				}
 				defer store.syncLock.leave(dagName)
@@ -627,7 +627,7 @@ func (store *Datastore) handleNext(ctx context.Context) {
 						// LockSync would see activeDAG==0 while
 						// sub-goroutines are still traversing
 						// the DAG.
-						if store.syncLock.gateAndEnter(dagName) {
+						if entered := store.syncLock.gateAndEnter(dagName); !entered {
 							continue
 						}
 						go func(h Head) {
@@ -1327,7 +1327,7 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 		// gates the iteration and counts it toward the per-DAG
 		// drain so concurrent LockSyncDAG can wait for an
 		// in-flight repair iteration to finish.
-		if store.syncLock.gateAndEnter(head.DAGName) {
+		if entered := store.syncLock.gateAndEnter(head.DAGName); !entered {
 			skippedDAGs = true
 			continue
 		}
