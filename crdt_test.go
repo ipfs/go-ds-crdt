@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	blockstore "github.com/ipfs/boxo/blockstore"
@@ -1641,15 +1642,189 @@ func TestPurgeDAGCleanStore(t *testing.T) {
 		remaining = append(remaining, r.Key)
 	}
 
-	// The only key that should survive is the version metadata key,
-	// which is Datastore-level state not associated with any dagName.
-	versionKey := namespace.ChildString("crdt_version").String()
+	// The only keys that should survive are datastore-level metadata keys
+	// not associated with any dagName: the version key and the
+	// bad-shutdown key (written by New and cleared by Close).
+	allowed := map[string]bool{
+		namespace.ChildString(versionKey).String():     true,
+		namespace.ChildString(badShutdownKey).String(): true,
+	}
 	for _, key := range remaining {
-		if key != versionKey {
+		if !allowed[key] {
 			t.Errorf("unexpected key remaining after purge: %s", key)
 		}
 	}
-	if len(remaining) != 1 {
-		t.Errorf("expected exactly 1 key (version) remaining, got %d: %v", len(remaining), remaining)
+	if len(remaining) != len(allowed) {
+		t.Errorf("expected exactly %d datastore-level keys remaining, got %d: %v", len(allowed), len(remaining), remaining)
 	}
+}
+
+// openTestStore opens a Datastore on the given underlying ds/dagservice with
+// sensible defaults for the bad-shutdown tests (null broadcaster, short
+// repair interval when requested).
+func openTestStore(t testing.TB, name string, mapDs ds.Datastore, dagServ ipld.DAGService, repair time.Duration) *Datastore {
+	t.Helper()
+	opts := DefaultOptions()
+	opts.Logger = &testLogger{name: name + ": ", l: DefaultOptions().Logger}
+	opts.RepairInterval = repair
+	opts.RebroadcastInterval = time.Hour // disable rebroadcast noise
+	d, err := New(mapDs, ds.NewKey("crdttest"), dagServ, &nullBroadcaster{}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// TestBadShutdownMark_CleanCloseNoDirty verifies that on a clean
+// New/Close/New cycle, the store is never marked dirty. The bad-shutdown
+// key is present while a Datastore is open and removed by Close.
+func TestBadShutdownMark_CleanCloseNoDirty(t *testing.T) {
+	ctx := t.Context()
+	mapDs := dssync.MutexWrap(ds.NewMapDatastore())
+	dagServ := merkledag.NewDAGService(mdutils.Bserv())
+	bsKey := ds.NewKey("crdttest").ChildString(badShutdownKey)
+
+	d1 := openTestStore(t, "r1", mapDs, dagServ, time.Hour)
+	has, err := mapDs.Has(ctx, bsKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("bad-shutdown key should be present after New")
+	}
+	if d1.IsDirty(ctx) {
+		t.Fatal("store should not be dirty on a fresh open")
+	}
+	if err := d1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	has, err = mapDs.Has(ctx, bsKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatal("bad-shutdown key should be cleared by a clean Close")
+	}
+
+	d2 := openTestStore(t, "r2", mapDs, dagServ, time.Hour)
+	if d2.IsDirty(ctx) {
+		t.Fatal("store should not be dirty after a clean prior Close")
+	}
+	if err := d2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBadShutdownMark_DetectedOnStartup verifies that if the bad-shutdown
+// key is present at startup (simulating a previous run that crashed before
+// Close), the store is marked dirty and the key is re-armed for the next
+// run.
+func TestBadShutdownMark_DetectedOnStartup(t *testing.T) {
+	ctx := t.Context()
+	mapDs := dssync.MutexWrap(ds.NewMapDatastore())
+	dagServ := merkledag.NewDAGService(mdutils.Bserv())
+	bsKey := ds.NewKey("crdttest").ChildString(badShutdownKey)
+
+	// Simulate state left behind by a crashed prior run: bs key present,
+	// no clean Close ever ran.
+	if err := mapDs.Put(ctx, bsKey, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	d := openTestStore(t, "recover", mapDs, dagServ, time.Hour)
+	defer func() { _ = d.Close() }()
+
+	if !d.IsDirty(ctx) {
+		t.Fatal("store should be dirty after detecting a prior bad shutdown")
+	}
+	has, err := mapDs.Has(ctx, bsKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("bad-shutdown key should still be present (re-armed for next run)")
+	}
+}
+
+// TestBadShutdownMark_PartialBranchRecovery builds a 2-node chain, fetches
+// the head's child, corrupts the datastore by deleting the child's processed
+// marker, and asserts that on reopen the bad-shutdown mark triggers a repair
+// that restores the missing state.
+func TestBadShutdownMark_PartialBranchRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+		mapDs := dssync.MutexWrap(ds.NewMapDatastore())
+		dagServ := merkledag.NewDAGService(mdutils.Bserv())
+
+		d1 := openTestStore(t, "r1", mapDs, dagServ, time.Hour)
+		if err := d1.Put(ctx, ds.NewKey("/k1"), []byte("v1")); err != nil {
+			t.Fatal(err)
+		}
+		if err := d1.Put(ctx, ds.NewKey("/k2"), []byte("v2")); err != nil {
+			t.Fatal(err)
+		}
+
+		headsList, _, err := d1.heads.List(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(headsList) != 1 {
+			t.Fatalf("expected exactly 1 head after two sequential Puts, got %d", len(headsList))
+		}
+		headCid := headsList[0].Cid
+
+		headNode, err := dagServ.Get(ctx, headCid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		links := headNode.Links()
+		if len(links) == 0 {
+			t.Fatal("head node should link to at least one prior block")
+		}
+		childCid := links[0].Cid
+		childProcessedKey := d1.processedBlockKey(childCid)
+
+		for _, c := range []cid.Cid{headCid, childCid} {
+			ok, err := d1.isProcessed(ctx, c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatalf("block %s should be processed before corruption", c)
+			}
+		}
+		if err := d1.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Corrupt the datastore: drop the child's processed marker and
+		// re-arm the bad-shutdown key so reopen detects an unclean prior
+		// run.
+		if err := mapDs.Delete(ctx, childProcessedKey); err != nil {
+			t.Fatal(err)
+		}
+		if err := mapDs.Put(ctx, ds.NewKey("crdttest").ChildString(badShutdownKey), nil); err != nil {
+			t.Fatal(err)
+		}
+
+		d2 := openTestStore(t, "r2", mapDs, dagServ, time.Hour)
+		t.Cleanup(func() { _ = d2.Close() })
+
+		if !d2.IsDirty(ctx) {
+			t.Fatal("store should be dirty after detecting a prior bad shutdown")
+		}
+
+		synctest.Wait()
+
+		ok, err := d2.isProcessed(ctx, childCid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal("child should be processed after repair")
+		}
+		if d2.IsDirty(ctx) {
+			t.Fatal("store should be marked clean after successful repair")
+		}
+	})
 }
