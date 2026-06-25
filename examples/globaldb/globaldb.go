@@ -193,11 +193,11 @@ func main() {
 	opts := crdt.DefaultOptions()
 	opts.Logger = logger
 	opts.RebroadcastInterval = 5 * time.Second
-	opts.PutHook = func(k ds.Key, v []byte) {
-		fmt.Printf("Added: [%s] -> %s\n", k, string(v))
+	opts.PutHook = func(e crdt.PutEvent) {
+		fmt.Printf("Added: [%s] -> %s\n", e.Key, string(e.NewValue))
 	}
-	opts.DeleteHook = func(k ds.Key) {
-		fmt.Printf("Removed: [%s]\n", k)
+	opts.DeleteHook = func(e crdt.DeleteEvent) {
+		fmt.Printf("Removed: [%s]\n", e.Key)
 	}
 
 	crdt, err := crdt.New(store, ds.NewKey("crdt"), ipfs, pubsubBC, opts)
