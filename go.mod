@@ -9,7 +9,7 @@ require (
 	github.com/ipfs/go-ds-pebble v0.5.12
 	github.com/ipfs/go-ipld-format v0.6.3
 	github.com/ipfs/go-log/v2 v2.9.2
-	github.com/libp2p/go-libp2p-pubsub v0.16.0
+	github.com/libp2p/go-libp2p-pubsub v0.17.0
 	github.com/multiformats/go-multihash v0.2.3
 	google.golang.org/protobuf v1.36.11
 )
