@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/ipfs/boxo v0.41.0
-	github.com/ipfs/go-cid v0.6.1
+	github.com/ipfs/go-cid v0.6.2
 	github.com/ipfs/go-datastore v0.9.2
 	github.com/ipfs/go-ds-pebble v0.5.12
 	github.com/ipfs/go-ipld-format v0.6.3
@@ -81,9 +81,9 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
-	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
