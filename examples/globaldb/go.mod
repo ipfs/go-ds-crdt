@@ -10,7 +10,7 @@ require (
 	github.com/ipfs/go-ds-pebble v0.5.12
 	github.com/ipfs/go-log/v2 v2.9.2
 	github.com/libp2p/go-libp2p v0.48.0
-	github.com/libp2p/go-libp2p-pubsub v0.16.0
+	github.com/libp2p/go-libp2p-pubsub v0.17.0
 	github.com/multiformats/go-multiaddr v0.16.1
 )
 
