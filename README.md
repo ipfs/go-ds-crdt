@@ -49,34 +49,41 @@ the snapshot block(s) -- it never has to walk the purged history -- so
 compaction directly shortens how much a new or long-lagging replica needs
 to download to catch up.
 
-**Requirements and caveats:**
+**Coordination-free.** `Compact` needs no coordination with anything else
+writing to the target dagName, same as every other operation in this
+package: concurrent `Put`s, `Delete`s, and `Compact`s -- same-view or
+divergent, in any exchange order -- converge to exactly the state the
+uncompacted history would have produced. Every element keeps its original
+identity for life, including across compaction (a snapshot only changes
+which block hosts an element's storage, recorded as an alias -- it never
+changes the element's id), so a tombstone that targets an id it observed
+before compaction ran keeps covering that exact element afterwards, in every
+generation, on every replica. Compaction is pure representation GC, invisible
+to the CRDT semantics. (Local `Put`/`Delete`/`Batch.Commit` calls on the same
+`Datastore` do serialize against `Compact`, but that is an implementation
+detail -- not a correctness requirement on concurrent remote writes.)
 
-- **Single-writer / quiesced dagName.** The caller must ensure no concurrent
-  remote writes are being merged into the target dagName while `Compact`
-  runs. `Compact` serializes against *local* `Put`/`Delete`/`Batch.Commit`
-  calls on the same `Datastore` automatically, but it cannot serialize
-  against writes arriving from other replicas over the network -- either
-  quiesce the dagName across the fleet first, or accept that a write racing
-  with `Compact` may end up applied on top of the resulting snapshot instead
-  of folded into it (still correct, just not compacted away).
-- **Reasonably synced replicas.** Compaction works correctly regardless of
-  how far behind other replicas are (see below), but it is most useful when
-  run while replicas are reasonably caught up, since a replica that is very
-  far behind will converge without ever having learned any of the
-  intermediate history it skipped.
+**Notes (not requirements):**
+
 - **Two-generation tombstone carrying.** A tombstone cannot be dropped the
   moment its target's history is purged: a lagging replica may still hold
   that (soon to be purged) element and needs the tombstone to eventually
   reach it. So each compaction generation carries forward the tombstones for
   everything it purges, and only drops a tombstone once it has had one full
   generation to reach any lagging replica holding the element it kills.
-- **All replicas must run a compaction-aware version first.** An old-code
-  replica does not know that a snapshot block's links are bookkeeping only
-  (covered heads) rather than fetchable history: it would try to walk into
-  now-purged blocks (and fail), while also mis-attributing every element's
-  priority to the snapshot's own (much higher) height. Upgrade every replica
-  that may see a given dagName's history before calling `Compact` on it
-  anywhere.
+- **Upgrade ordering.** An old-code replica does not know that a snapshot
+  block's links are bookkeeping only (covered heads) rather than fetchable
+  history: it would try to walk into now-purged blocks (and fail), while
+  also mis-attributing every element's priority to the snapshot's own (much
+  higher) height. Upgrade every replica that may see a given dagName's
+  history to a compaction-aware version before calling `Compact` on it
+  anywhere -- the same rollout rule as any wire-format addition.
+- **Compact when reasonably synced.** Compaction works correctly regardless
+  of how far behind other replicas are: a replica that is very far behind
+  still converges correctly on reconnect (the snapshot resupplies live
+  values and carries the tombstones it needs). Running it while replicas are
+  reasonably caught up is purely an efficiency consideration -- it maximizes
+  how much history gets folded away in one pass.
 - **Receiver-side reclamation.** A replica that had already merged a DAG's
   history before a snapshot covering it arrives does not need to keep that
   history around: by default (`Options.ReclaimOnSnapshot`, on), once it has

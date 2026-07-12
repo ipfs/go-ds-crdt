@@ -125,16 +125,20 @@ func TestConcurrentCompactSameView(t *testing.T) {
 	}
 }
 
-// TestCompactConcurrentDeleteResurrection pins the DOCUMENTED anomaly of
-// compacting concurrently with an unseen delete (the reason Compact requires
-// a single-writer/quiesced dagName, see compact.go): a snapshot re-homes an
-// element under a new id that a concurrent tombstone (which targeted the
-// observed, old id) cannot cover, so add-wins resurrects the key on every
-// replica. Replicas still CONVERGE -- identical heads and state everywhere --
-// they just converge on the key being alive. If this test ever starts
-// failing with the key absent, the re-homing semantics changed (e.g. stable
-// element ids were introduced) and the documentation must change with it.
-func TestCompactConcurrentDeleteResurrection(t *testing.T) {
+// TestCompactConcurrentDeleteWins pins the coordination-free contract
+// (compact.go's "Coordination-free" section): compacting concurrently with
+// an unseen delete must NOT resurrect the deleted key. A snapshot element
+// keeps its original id (see putElems/S2), so the concurrent tombstone
+// (which targeted that same original id) still covers it after compaction
+// folds its storage into a snapshot block -- exactly as it would have
+// covered the pre-compaction element. Replicas converge -- identical heads
+// and state everywhere -- with the key DELETED, regardless of which
+// direction the exchange happens in. This test used to be
+// TestCompactConcurrentDeleteResurrection and pinned the opposite (documented
+// anomaly) outcome from when compaction re-homed elements under new ids;
+// stable element ids retired that requirement and this test now pins its
+// replacement.
+func TestCompactConcurrentDeleteWins(t *testing.T) {
 	replicas, dagsyncs, closeReplicas := makeNReplicasSeparateStores(t, 2, nil)
 	defer closeReplicas()
 	a, b := replicas[0], replicas[1]
@@ -190,16 +194,30 @@ func TestCompactConcurrentDeleteResurrection(t *testing.T) {
 		}
 	}
 
-	// The documented outcome: the concurrent delete could not observe the
-	// snapshot's re-homed element id, so add-wins resurrects the key --
-	// on BOTH replicas, including the one that issued the delete.
+	// The coordination-free outcome: the concurrent delete targeted the
+	// element's original id, which compaction preserved (only aliasing its
+	// storage to the snapshot block), so the tombstone still covers it. The
+	// key is DELETED on BOTH replicas, including the one that compacted.
 	for name, r := range map[string]*Datastore{"compactor": a, "deleter": b} {
-		v, err := r.Get(ctx, k)
+		has, err := r.Has(ctx, k)
 		if err != nil {
-			t.Fatalf("%s: expected the contested key to be resurrected (documented add-wins anomaly), got err=%v", name, err)
+			t.Fatalf("%s: unexpected error checking contested key: %s", name, err)
 		}
-		if string(v) != "keep-me" {
-			t.Fatalf("%s: unexpected resurrected value %q", name, v)
+		if has {
+			v, _ := r.Get(ctx, k)
+			t.Fatalf("%s: expected the contested key to stay deleted (coordination-free contract), got value %q", name, v)
+		}
+	}
+
+	// The bystander key (untouched by the delete) must have survived the
+	// compaction/exchange unaffected.
+	for name, r := range map[string]*Datastore{"compactor": a, "deleter": b} {
+		v, err := r.Get(ctx, ds.NewKey("bystander"))
+		if err != nil {
+			t.Fatalf("%s: expected bystander key to survive, got err=%v", name, err)
+		}
+		if string(v) != "x" {
+			t.Fatalf("%s: unexpected bystander value %q", name, v)
 		}
 	}
 }

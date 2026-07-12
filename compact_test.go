@@ -464,8 +464,23 @@ func TestCompactPriorityPreservation(t *testing.T) {
 // TestCompactTwoGenerationTombstones checks the two-generation carry rule
 // directly (spec G5 step 3): a tombstone is embedded in the snapshot delta
 // that purges its target, but by the next compaction (with no intervening
-// writes) it is inert -- neither the local /t/ entry nor the target marker
-// still exist -- and must be dropped from the second-generation snapshot.
+// writes) it is inert -- the target's element marker is long gone -- and
+// must be dropped from the second-generation snapshot.
+//
+// The local /t/ tombstone marker itself is a different story from round 3
+// onward: it survives every generation's purge (aliased to the snapshot
+// that carried it, exactly like a re-homed element marker -- see
+// putTombs/S4), including the very generation that carries it, since its
+// target is typically being purged in that same run. This is what closes a
+// self-purge gap that would otherwise let a late-arriving, divergent write
+// for the same (now long-purged) id resurrect the key locally on the
+// compacting replica itself -- see compact.go's "Two-generation tombstone
+// rule". Once the tombstone becomes inert (this test's second compaction),
+// its marker's own path-id CID is never again reachable by any future
+// walk, so it is never revisited or deleted either: a tiny, permanent,
+// and harmless residue (same trade-off already accepted for the
+// processed-block markers Compact keeps -- see the "Purged-block
+// bookkeeping trade-off" section of the Compact doc comment).
 func TestCompactTwoGenerationTombstones(t *testing.T) {
 	replicas, closeReplicas := makeNReplicasNoBcast(t, 1, nil)
 	defer closeReplicas()
@@ -499,8 +514,13 @@ func TestCompactTwoGenerationTombstones(t *testing.T) {
 	if tombs1 := deltaTombstonesForKey(t, r, heads1[0].Cid, k.String()); len(tombs1) == 0 {
 		t.Fatal("expected the first-generation snapshot to carry the tombstone")
 	}
-	if n := countPrefix(t, r, r.set.tombsPrefix(k.String())); n != 0 {
-		t.Fatalf("expected 0 local tomb entries for %s after first compaction, got %d", k, n)
+	// The local marker survives this same generation's purge, aliased to
+	// the gen1 snapshot that just carried it (see this test's doc comment).
+	if n := countPrefix(t, r, r.set.tombsPrefix(k.String())); n != 1 {
+		t.Fatalf("expected 1 local tomb entry for %s after first compaction, got %d", k, n)
+	}
+	if aliases := tombAliasesForKey(t, r, k.String()); len(aliases) != 1 || !aliases[0].Equals(heads1[0].Cid) {
+		t.Fatalf("expected the local tomb entry aliased to the gen1 snapshot %s, got %v", heads1[0].Cid, aliases)
 	}
 
 	n2, err := r.Compact(ctx, "")
@@ -521,8 +541,13 @@ func TestCompactTwoGenerationTombstones(t *testing.T) {
 	if tombs2 := deltaTombstonesForKey(t, r, heads2[0].Cid, k.String()); len(tombs2) != 0 {
 		t.Fatalf("expected the inert tombstone to be dropped from the second-generation snapshot delta, got %v", tombs2)
 	}
-	if n := countPrefix(t, r, r.set.tombsPrefix(k.String())); n != 0 {
-		t.Fatalf("expected 0 local tomb entries for %s after second compaction, got %d", k, n)
+	// The marker from the first generation is now permanently inert
+	// residue (see this test's doc comment): its own path-id CID is
+	// unreachable from any future walk, so it is never revisited, and it
+	// carries no more weight since the target element marker is long
+	// gone. It is harmless and still there, exactly one entry.
+	if n := countPrefix(t, r, r.set.tombsPrefix(k.String())); n != 1 {
+		t.Fatalf("expected 1 (permanently inert) local tomb entry for %s after second compaction, got %d", k, n)
 	}
 
 	if has, err := r.Has(ctx, k); err != nil || has {

@@ -47,26 +47,53 @@ import (
 // the key -- and the kill must not be lost). A tombstone matching neither
 // condition already did its job in a previous generation and is dropped.
 //
-// # Requirements
+// A carried tombstone's marker is written with an alias pointing at the
+// snapshot block that carries it (see putTombs), mirroring a re-homed
+// element's marker (S2): in the common carry case (a), the tombstone's
+// target id is the very id being purged by THIS SAME Compact call, so
+// without an alias the purge below would immediately delete the marker it
+// just (re)wrote, and a later-arriving element for that id -- exactly the
+// kind of divergent write Compact must now tolerate -- would wrongly
+// resurrect the key. A plain (non-carried) tombstone is unaffected: it
+// keeps the alias-less, nil-valued marker it has always had.
 //
-//   - Single-writer / quiesced dagName: the caller must ensure no concurrent
-//     remote writes are being merged into this dagName while Compact runs.
-//     The Datastore's own background workers (rebroadcast, repair, DAG
-//     walking) also touch heads and set state for this dagName -- either
-//     Close() the Datastore first or make sure the dagName is not being
-//     actively synced. Local Put/Delete/Batch.Commit calls on this same
-//     Datastore are safe to run concurrently: they serialize against
-//     Compact via compactMux (see addDAGNode).
-//   - Compaction is best run when replicas are reasonably in sync: a replica
-//     that is very far behind will still converge correctly on reconnect
-//     (the snapshot resupplies live values and carries the tombstones it
-//     needs), but it skips learning any of the intermediate history.
-//   - All replicas that may ever see this dagName's history must run a
-//     version of this package that understands snapshot deltas (this one)
-//     before Compact is called anywhere. An old-code replica does not know
-//     to avoid descending into a snapshot node's links, and would try to
-//     fetch purged blocks (failing) while also inflating every element's
-//     priority to the snapshot's height.
+// # Coordination-free
+//
+// Compact needs no coordination with anything else writing to this
+// dagName, same as every other operation this package exposes: concurrent
+// Puts, Deletes, and Compacts -- whether they observe the same view or
+// have diverged (different, unsynced sets of prior operations), and
+// regardless of the order replicas eventually exchange them in -- converge
+// to exactly the state the uncompacted history would have produced. This
+// holds because every element keeps its ORIGINAL id for its entire life,
+// including across compaction: a snapshot changes which block hosts an
+// element's storage (recorded as an alias on its marker, see putElems) but
+// never changes the element's identity, so a tombstone that targets an id
+// it observed before compaction ran keeps covering that exact element
+// afterwards, in every generation, on every replica -- compaction is pure
+// representation GC, invisible to the CRDT semantics. Local
+// Put/Delete/Batch.Commit calls on this same Datastore serialize against
+// Compact via compactMux (see addDAGNode) as an implementation detail, not
+// because concurrent remote writes would be unsafe.
+//
+// A few things remain worth noting, though none of them are correctness
+// requirements:
+//
+//   - Upgrade ordering. All replicas that may ever see this dagName's
+//     history should run a version of this package that understands
+//     snapshot deltas (this one) before Compact is called anywhere. This is
+//     the same rollout rule as any wire-format addition: an old-code
+//     replica does not know to avoid descending into a snapshot node's
+//     links, and would try to fetch purged blocks (failing) while also
+//     mis-attributing every element's priority to the snapshot's own
+//     height.
+//   - Compact when reasonably synced. Compaction works correctly regardless
+//     of how far behind other replicas are: a replica that is very far
+//     behind still converges correctly on reconnect (the snapshot resupplies
+//     live values and carries the tombstones it needs). Running it while
+//     replicas are reasonably caught up is purely an efficiency
+//     consideration -- it maximizes how much history gets folded away in one
+//     pass, rather than repeating the exercise generation after generation.
 //
 // # Purged-block bookkeeping trade-off
 //

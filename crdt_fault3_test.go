@@ -164,7 +164,7 @@ func TestPutTombsErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		fd.SetFail(failAlways("Batch"))
-		if err := d.set.putTombs(ctx, tombs); !errors.Is(err, errFault) {
+		if err := d.set.putTombs(ctx, tombs, "block-id", false); !errors.Is(err, errFault) {
 			t.Fatalf("expected errFault, got %v", err)
 		}
 	})
@@ -186,7 +186,7 @@ func TestPutTombsErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		fd.SetFail(failAlways("BatchPut"))
-		if err := d.set.putTombs(ctx, tombs); !errors.Is(err, errFault) {
+		if err := d.set.putTombs(ctx, tombs, "block-id", false); !errors.Is(err, errFault) {
 			t.Fatalf("expected errFault, got %v", err)
 		}
 	})
@@ -208,7 +208,7 @@ func TestPutTombsErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		fd.SetFail(failAlways("BatchDelete"))
-		if err := d.set.putTombs(ctx, tombs); !errors.Is(err, errFault) {
+		if err := d.set.putTombs(ctx, tombs, "block-id", false); !errors.Is(err, errFault) {
 			t.Fatalf("expected errFault, got %v", err)
 		}
 	})
@@ -230,7 +230,7 @@ func TestPutTombsErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		fd.SetFail(failAlways("Commit"))
-		if err := d.set.putTombs(ctx, tombs); !errors.Is(err, errFault) {
+		if err := d.set.putTombs(ctx, tombs, "block-id", false); !errors.Is(err, errFault) {
 			t.Fatalf("expected errFault, got %v", err)
 		}
 	})
@@ -272,7 +272,7 @@ func TestPutTombsErrors(t *testing.T) {
 			return nil
 		})
 		tombs := []*pb.Element{{Key: k.String(), Id: firstID}}
-		if err := d.set.putTombs(ctx, tombs); !errors.Is(err, errFault) {
+		if err := d.set.putTombs(ctx, tombs, "block-id", false); !errors.Is(err, errFault) {
 			t.Fatalf("expected errFault, got %v", err)
 		}
 	})

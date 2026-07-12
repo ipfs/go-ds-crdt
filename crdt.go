@@ -14,8 +14,11 @@
 // without removing the history that preceded it. Compact (or, for outright
 // deletion of a whole named DAG's history, PurgeDAG) can be called manually
 // to fold a named DAG's live state into a small "snapshot" generation and
-// discard the DAG history it replaces. See the Compact doc comment for the
-// details and the requirements this places on replicas and callers.
+// discard the DAG history it replaces. Compact is coordination-free, like
+// every other operation this package exposes: it needs no quiescence or
+// single-writer guarantee from the caller. See the Compact doc comment for
+// the full algorithm and the (non-mandatory) notes on replica upgrade
+// ordering.
 //
 // The time to be fully synced for new Datastore replicas will depend on how
 // fast they can retrieve the DAGs announced by the other replicas, but newer

@@ -354,6 +354,65 @@ func decodePriority(data []byte) (uint64, error) {
 	return prio - 1, nil
 }
 
+// encodeMarker encodes an element marker value (the value stored at
+// /s/<key>/<id>): varint(prio+1), optionally followed by an ALIAS CID's raw
+// bytes. The alias is how a snapshot element (see putElems) that keeps its
+// original id records which block now actually hosts its delta (the
+// snapshot block it was folded into) -- the marker's path id alone no
+// longer names that block once compaction has re-homed the element's
+// storage without changing its identity.
+//
+// alias == cid.Undef ("none") encodes to exactly encodePriority(prio), so
+// every marker written before this format existed (bare varint, or empty
+// for legacy pre-v2 markers) remains a valid, alias-less encodeMarker
+// output: this is purely additive, no storage migration needed.
+func encodeMarker(prio uint64, alias cid.Cid) []byte {
+	buf := encodePriority(prio)
+	if !alias.Defined() {
+		return buf
+	}
+	return append(buf, alias.Bytes()...)
+}
+
+// decodeMarker is the inverse of encodeMarker. The leading varint
+// (self-delimiting) is decoded as a priority exactly like decodePriority;
+// any remaining bytes are cast as the alias CID. No remainder means no
+// alias (cid.Undef) -- this is what makes every pre-alias marker (bare
+// varint priority, or an empty legacy marker handled by the caller before
+// ever reaching here) decode correctly with an Undef alias.
+func decodeMarker(data []byte) (prio uint64, alias cid.Cid, err error) {
+	p, n := binary.Uvarint(data)
+	if n <= 0 {
+		return 0, cid.Undef, errors.New("error decoding marker")
+	}
+	prio = p - 1
+
+	rest := data[n:]
+	if len(rest) == 0 {
+		return prio, cid.Undef, nil
+	}
+	alias, err = cid.Cast(rest)
+	if err != nil {
+		return 0, cid.Undef, err
+	}
+	return prio, alias, nil
+}
+
+// idToCid converts an element/tombstone marker id -- the "/<base32...>"
+// datastore-key string convention used throughout this file for both
+// marker path components and block keys (always a ds.Key.String(), always
+// absolute) -- to the CID of the DAG block it names. This is the inverse of
+// the blockKey computation in processNode (dshelp.MultihashToDsKey(...).
+// String()) and is used everywhere a marker's path id or alias needs to be
+// compared against a set of DAG block CIDs.
+func idToCid(id string) (cid.Cid, error) {
+	mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+	if err != nil {
+		return cid.Undef, err
+	}
+	return cid.NewCidV1(cid.DagProtobuf, mhash), nil
+}
+
 func (s *set) getPriority(ctx context.Context, key string) (uint64, error) {
 	prioK := s.priorityKey(key)
 	data, err := s.store.Get(ctx, prioK)
@@ -470,7 +529,11 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 	// priority (known either from the marker value or, for legacy
 	// markers, from having fetched its delta already) and enough
 	// information to fetch its delta's value later if it turns out to
-	// be a max-priority candidate.
+	// be a max-priority candidate. cid is the CID to fetch the delta
+	// from: the marker's alias when it has one (the element was
+	// re-homed by compaction -- see putElems/S2), otherwise the CID
+	// derived from the marker's own path id, same as before aliases
+	// existed.
 	type candidate struct {
 		cid      cid.Cid
 		priority uint64
@@ -514,26 +577,32 @@ NEXT:
 			continue
 		}
 
-		mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+		pathCid, err := idToCid(id)
 		if err != nil {
 			return nil, 0, err
 		}
-		deltaCid := cid.NewCidV1(cid.DagProtobuf, mhash)
 
-		c := candidate{cid: deltaCid}
+		c := candidate{cid: pathCid}
 		if len(r.Value) > 0 {
 			// marker carries the priority (v2+): no DAG fetch needed.
-			prio, err := decodePriority(r.Value)
+			// It may also carry an alias (the element was re-homed
+			// by compaction -- see putElems/S2): when present, the
+			// alias, not the path id, names the block that now
+			// hosts this element's delta.
+			prio, alias, err := decodeMarker(r.Value)
 			if err != nil {
 				return nil, 0, err
 			}
 			c.priority = prio
+			if alias.Defined() {
+				c.cid = alias
+			}
 		} else {
 			// legacy (pre-v2) marker: fall back to fetching the
 			// delta to learn its priority. Keep the fetched delta
 			// around in case this candidate ends up being a
 			// max-priority one, to avoid fetching it twice.
-			delta, err := s.fetchDelta(ctx, ng, deltaCid)
+			delta, err := s.fetchDelta(ctx, ng, pathCid)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -614,12 +683,22 @@ NEXT:
 //
 // Live-value candidate selection and the priority/tie-break rule mirror
 // findBestValue exactly (see Item B/G3), scoped to element markers whose
-// block CID is in dagCIDSet (the set the calling DAG's walk just found
-// reachable) -- the elems/tombs namespaces are shared across all dagNames
-// writing to the same key (see TestPurgeDAGMixedKey), so without the scope
-// restriction compacting one dagName could pick up markers written by a
-// different one. The carried-tombstone rule is Compact's two-generation
-// rule (see the Compact doc comment).
+// alias-or-path CID (the alias when the marker was re-homed by an earlier
+// compaction generation, otherwise the CID derived from its own path id --
+// see putElems/S2 and scopeOrFetchCid below) is in dagCIDSet (the set the
+// calling DAG's walk just found reachable) -- the elems/tombs namespaces are
+// shared across all dagNames writing to the same key (see
+// TestPurgeDAGMixedKey), so without the scope restriction compacting one
+// dagName could pick up markers written by a different one. Resolving scope
+// through the alias (rather than only the path id) is what makes a SECOND
+// compaction generation see a marker re-homed by the first one: after gen-1,
+// the surviving marker for a key is (key, original id) aliased to the gen-1
+// snapshot block, and gen-2's walk finds that snapshot block, not the
+// original (now-purged) id. The carried-tombstone rule is Compact's
+// two-generation rule (see the Compact doc comment). Every element this
+// produces carries its winner marker's ORIGINAL path id (not the block
+// that happens to host it), preserving element identity across every future
+// generation and every concurrent tombstone that targets it.
 //
 // Every DAG fetch here (needed to resolve a max-priority candidate's value,
 // or a legacy empty-value marker's priority) is expected to hit the local
@@ -636,9 +715,26 @@ NEXT:
 func (s *set) compactSnapshotState(ctx context.Context, touched map[string]dagWalkKind, dagCIDSet map[cid.Cid]struct{}) ([]*pb.Element, []*pb.Element, error) {
 	type elemMarker struct {
 		id       string
-		cid      cid.Cid
+		cid      cid.Cid // CID derived from the marker's own path id.
+		alias    cid.Cid // cid.Undef unless the marker was re-homed by compaction (see putElems/S2).
 		priority uint64
 		hasPrio  bool // false for legacy (pre-v2, empty-value) markers.
+	}
+
+	// scopeOrFetchCid is the CID a marker resolves to for DAG-scope
+	// ("does this marker belong to the DAG being compacted") and delta-fetch
+	// purposes alike: its alias when it has one -- the element was re-homed
+	// by an earlier compaction generation and is now hosted by that alias
+	// block -- otherwise the CID derived from its own path id. This is what
+	// makes second-generation compaction work: after gen-1, the surviving
+	// marker for a key is (key, original id) with alias == the gen-1
+	// snapshot block, and gen-2's dagCIDSet contains that snapshot block,
+	// not the original id's now-purged block.
+	scopeOrFetchCid := func(m elemMarker) cid.Cid {
+		if m.alias.Defined() {
+			return m.alias
+		}
+		return m.cid
 	}
 
 	// keyAndIDFromMarkerPath splits a full "/<elemsOrTombsNs>/<key...>/<id>"
@@ -680,18 +776,19 @@ func (s *set) compactSnapshotState(ctx context.Context, touched map[string]dagWa
 			if _, ok := touched[key]; !ok {
 				continue
 			}
-			mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+			pathCid, err := idToCid(id)
 			if err != nil {
 				return nil, nil, err
 			}
-			m := elemMarker{id: id, cid: cid.NewCidV1(cid.DagProtobuf, mhash)}
+			m := elemMarker{id: id, cid: pathCid}
 			if len(r.Value) > 0 {
-				prio, err := decodePriority(r.Value)
+				prio, alias, err := decodeMarker(r.Value)
 				if err != nil {
 					return nil, nil, err
 				}
 				m.priority = prio
 				m.hasPrio = true
+				m.alias = alias
 			}
 			elemsByKey[key] = append(elemsByKey[key], m)
 		}
@@ -745,18 +842,19 @@ func (s *set) compactSnapshotState(ctx context.Context, touched map[string]dagWa
 		var candidates []candidate
 		var maxPriority uint64
 		for _, m := range elemsByKey[key] {
-			if _, ok := dagCIDSet[m.cid]; !ok {
+			scopeCid := scopeOrFetchCid(m)
+			if _, ok := dagCIDSet[scopeCid]; !ok {
 				continue // belongs to a different DAG's history.
 			}
 			if _, tombed := tombstonedIDs[m.id]; tombed {
 				continue
 			}
 
-			c := candidate{id: m.id, cid: m.cid}
+			c := candidate{id: m.id, cid: scopeCid}
 			if m.hasPrio {
 				c.prio = m.priority
 			} else {
-				delta, err := s.fetchDelta(ctx, ng, m.cid)
+				delta, err := s.fetchDelta(ctx, ng, scopeCid)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -772,6 +870,7 @@ func (s *set) compactSnapshotState(ctx context.Context, touched map[string]dagWa
 
 		if len(candidates) > 0 {
 			var bestValue []byte
+			var bestID string
 			haveBest := false
 			for _, c := range candidates {
 				if c.prio != maxPriority {
@@ -803,14 +902,23 @@ func (s *set) compactSnapshotState(ctx context.Context, touched map[string]dagWa
 
 				if !haveBest {
 					bestValue = greatestValueInDelta
+					bestID = c.id
 					haveBest = true
 					continue
 				}
 				if bytes.Compare(bestValue, greatestValueInDelta) < 0 {
 					bestValue = greatestValueInDelta
+					bestID = c.id
 				}
 			}
-			elements = append(elements, &pb.Element{Key: key, Value: bestValue, Priority: maxPriority})
+			// The winner's ORIGINAL id (its marker's path id, always
+			// carrying the leading-slash ds.Key.String() convention --
+			// see keyAndIDFromMarkerPath) rides through into the
+			// snapshot element, so that every future generation (and
+			// any concurrent tombstone targeting it) keeps addressing
+			// the exact same element identity regardless of which
+			// block currently hosts its value.
+			elements = append(elements, &pb.Element{Key: key, Id: bestID, Value: bestValue, Priority: maxPriority})
 		}
 
 		// Carried tombstones.
@@ -822,11 +930,10 @@ func (s *set) compactSnapshotState(ctx context.Context, touched map[string]dagWa
 			liveIDs[m.id] = struct{}{}
 		}
 		for _, id := range tombsByKey[key] {
-			mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+			targetCid, err := idToCid(id)
 			if err != nil {
 				return nil, nil, err
 			}
-			targetCid := cid.NewCidV1(cid.DagProtobuf, mhash)
 
 			_, purgingNow := dagCIDSet[targetCid]
 			_, elemStillLive := liveIDs[id]
@@ -848,7 +955,24 @@ func (s *set) compactSnapshotState(ctx context.Context, touched map[string]dagWa
 // but with the batching optimization the locks would need to be hold until
 // the batch is written), and one lock per key might be way worse than a single
 // global lock in the end.
-func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio uint64) error {
+//
+// For a NON-snapshot delta every element's Id is overwritten with id (the
+// key of the block being merged), exactly as before this element carried an
+// Id at all.
+//
+// For a snapshot delta (isSnapshot == true, id is the snapshot block's own
+// key), an element is immutable once created, so re-homing its storage into
+// a snapshot block must not change its identity: a concurrent tombstone
+// (key, originalId) has to keep covering it. So the element's ORIGINAL id
+// (e.GetId(), carried by the snapshot delta -- see compactSnapshotState) is
+// kept as-is, the marker is written under that original id, and the marker
+// value's alias records that this snapshot block (id) is what now hosts the
+// element's delta -- findBestValue, purgeKeyBlocks and
+// compactSnapshotState all resolve "where does this element's value live"
+// via alias-or-path from that point on. A snapshot element that
+// (defensively) arrives with an empty Id falls back to the old
+// overwrite-with-block-id behavior, same as a non-snapshot element.
+func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio uint64, isSnapshot bool) error {
 	s.putElemsMux.Lock()
 	defer s.putElemsMux.Unlock()
 
@@ -866,8 +990,21 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 		}
 	}
 
+	// snapshotBlockCid is the alias every re-homed element in this delta
+	// (if any) will point at: the snapshot block itself, derived from its
+	// own key exactly like every other id->CID conversion in this file.
+	// Only computed when needed since it is a no-op fetch-free
+	// conversion but there is no reason to pay it for the common,
+	// non-snapshot case.
+	var snapshotBlockCid cid.Cid
+	if isSnapshot {
+		snapshotBlockCid, err = idToCid(id)
+		if err != nil {
+			return err
+		}
+	}
+
 	for _, e := range elems {
-		e.Id = id // overwrite the identifier as it would come unset
 		key := e.GetKey()
 
 		// The element's effective priority is normally the delta's
@@ -882,14 +1019,25 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 			eprio = prio
 		}
 
-		// /namespace/elems/<key>/<id>
+		elemID := id
+		alias := cid.Undef
+		if isSnapshot && e.GetId() != "" {
+			elemID = e.GetId() // keep the original id -- do NOT overwrite.
+			alias = snapshotBlockCid
+		} else {
+			e.Id = id // overwrite the identifier as it would come unset
+		}
+
+		// /namespace/elems/<key>/<elemID>
 		// The marker value carries this element's effective priority
 		// (varint(prio+1), same convention as setPriority) so that
 		// findBestValue can later learn it without fetching the delta
-		// block from the DAG. See migrate1to2 for backfilling markers
-		// written before this was introduced.
-		k := s.elemsPrefix(key).ChildString(id)
-		err := store.Put(ctx, k, encodePriority(eprio))
+		// block from the DAG, plus (for re-homed snapshot elements)
+		// the alias CID of the block that now hosts it. See
+		// migrate1to2 for backfilling markers written before the
+		// priority was introduced.
+		k := s.elemsPrefix(key).ChildString(elemID)
+		err := store.Put(ctx, k, encodeMarker(eprio, alias))
 		if err != nil {
 			return err
 		}
@@ -897,7 +1045,7 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 		// update the value if applicable:
 		// * higher priority than we currently have.
 		// * not tombstoned before.
-		err = s.setValue(ctx, store, key, id, e.GetValue(), eprio)
+		err = s.setValue(ctx, store, key, elemID, e.GetValue(), eprio)
 		if err != nil {
 			return err
 		}
@@ -921,7 +1069,28 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 // final value/priority for each key matters, and that is exactly what
 // calling findBestValue once, with the full set of pending tombstone IDs
 // for that key, computes.
-func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
+//
+// id and isSnapshot mirror putElems' parameters: for a snapshot delta's
+// CARRIED tombstones (the two-generation rule -- see Compact's doc
+// comment), the marker is written with an alias pointing at this snapshot
+// block (id), exactly like a re-homed element's marker (S2). This closes a
+// self-purge gap that has nothing to do with element-id stability directly,
+// but that stable ids make newly reachable now that Compact no longer
+// requires a quiesced dagName: a carried tombstone's target id is, in the
+// common case, the very id being purged THIS SAME Compact() run
+// (compactSnapshotState's "purgingNow" carry reason). Without an alias,
+// purgeKeyBlocks would delete that just-(re)written tombstone marker in the
+// very same run that wrote it (its path-id CID is trivially in the purge
+// set), silently discarding the compacting replica's own record of the
+// kill -- so a later-arriving element for that id (from a replica that
+// diverged before the delete, exactly the scenario Compact must now
+// tolerate) would wrongly resurrect the key locally. The alias keeps the
+// carried tombstone alive across this generation's purge the same way an
+// aliased element marker survives it (S4), and is otherwise inert: a plain
+// (non-snapshot) tombstone is written with a nil value exactly as before,
+// so this is purely additive to the wire/storage format, matching the
+// alias convention already established for elements.
+func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, id string, isSnapshot bool) error {
 	if len(tombs) == 0 {
 		return nil
 	}
@@ -936,6 +1105,15 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 	}
 
+	var tombValue []byte
+	if isSnapshot {
+		blockCid, err := idToCid(id)
+		if err != nil {
+			return err
+		}
+		tombValue = encodeMarker(0, blockCid)
+	}
+
 	// key -> tombstoned block IDs. Carries the tombstoned blocks for each
 	// element in this delta. keyOrder preserves first-seen order so that
 	// results (and the delete hook below) are deterministic.
@@ -944,15 +1122,15 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	for _, e := range tombs {
 		// /namespace/tombs/<key>/<id>
 		key := e.GetKey()
-		id := e.GetId()
+		tombID := e.GetId()
 		if _, ok := deletedElems[key]; !ok {
 			keyOrder = append(keyOrder, key)
 		}
-		deletedElems[key] = append(deletedElems[key], id)
+		deletedElems[key] = append(deletedElems[key], tombID)
 
 		// Write tomb into store.
-		k := s.tombsPrefix(key).ChildString(id)
-		if err := store.Put(ctx, k, nil); err != nil {
+		k := s.tombsPrefix(key).ChildString(tombID)
+		if err := store.Put(ctx, k, tombValue); err != nil {
 			return err
 		}
 	}
@@ -1016,12 +1194,14 @@ func (s *set) Merge(ctx context.Context, d Delta, id string) error {
 		return err
 	}
 
-	err = s.putTombs(ctx, tombs)
+	isSnapshot := d.IsSnapshot()
+
+	err = s.putTombs(ctx, tombs, id, isSnapshot)
 	if err != nil {
 		return err
 	}
 
-	return s.putElems(ctx, elems, id, d.GetPriority())
+	return s.putElems(ctx, elems, id, d.GetPriority(), isSnapshot)
 }
 
 // currently unused
@@ -1072,10 +1252,41 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		}
 	}
 
-	deleteMatchingIDs := func(prefix ds.Key) error {
+	// deleteMatchingIDs deletes the markers under prefix that the given
+	// purge set covers. What "covers" means differs between the two marker
+	// namespaces because an alias means a different thing for each -- see
+	// the aliasIsHost parameter:
+	//
+	// aliasIsHost == true (elems): a marker's alias is the block that now
+	// HOSTS its element's value (it was re-homed into a snapshot -- see
+	// putElems/S2). The marker's value can only ever be fetched from that
+	// hosting block, so the marker survives iff its host (its alias when it
+	// has one, else the block named by its own path id) survives the purge.
+	// This deletes a "loser" element that an earlier generation folded into
+	// a snapshot: it keeps its original path id -- whose block that earlier
+	// generation already purged, so it is NOT in this purge set -- but its
+	// alias points at that now-being-purged snapshot. Leaving it behind
+	// would accumulate a stale, unfetchable marker that a later
+	// findBestValue could pick as a survivor (fetching a purged block, and
+	// resurrecting a lower-priority value once the current winner is
+	// tombstoned by a snapshot-only replica). The current winner, by
+	// contrast, was just re-aliased to the NEW snapshot (not in this purge
+	// set), so its host survives and it is correctly kept.
+	//
+	// aliasIsHost == false (tombs): a tombstone has no value to host; its
+	// alias only records that a snapshot RE-AFFIRMED the kill (putTombs).
+	// It is keyed on its target's own id (path): kept whenever its target
+	// block is not in this purge set (its target was purged by an earlier
+	// generation, so this is inert two-generation residue -- tiny and
+	// harmless, see TestCompactTwoGenerationTombstones), and, when its
+	// target IS in the purge set, kept iff a snapshot outside the purge set
+	// re-affirmed it (so the kill outlives the purge of the target's block
+	// and a divergent replica cannot resurrect it). A plain, alias-less
+	// tomb (the common case) is deleted exactly as before aliasing existed.
+	deleteMatchingIDs := func(prefix ds.Key, aliasIsHost bool) error {
 		q := query.Query{
 			Prefix:   prefix.String(),
-			KeysOnly: true,
+			KeysOnly: false,
 		}
 		results, err := s.store.Query(ctx, q)
 		if err != nil {
@@ -1101,13 +1312,40 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 			}
 			// Decode the datastore key back into a CID so we can look it up in the
 			// caller-supplied set.
-			mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(blockID))
+			pathCid, err := idToCid(blockID)
 			if err != nil {
 				return err
 			}
-			c := cid.NewCidV1(cid.DagProtobuf, mhash)
-			if _, ok := blockCIDs[c]; !ok {
-				continue
+			var alias cid.Cid
+			if len(r.Value) > 0 {
+				_, alias, err = decodeMarker(r.Value)
+				if err != nil {
+					return err
+				}
+			}
+
+			if aliasIsHost {
+				// Element marker: delete iff the block hosting its value
+				// (alias if re-homed, else its own path id) is purged.
+				host := pathCid
+				if alias.Defined() {
+					host = alias
+				}
+				if _, ok := blockCIDs[host]; !ok {
+					continue
+				}
+			} else {
+				// Tomb marker: keyed on the target's own path id, with a
+				// re-affirming snapshot alias keeping it alive across the
+				// purge of that target block.
+				if _, ok := blockCIDs[pathCid]; !ok {
+					continue
+				}
+				if alias.Defined() {
+					if _, aliasPurged := blockCIDs[alias]; !aliasPurged {
+						continue
+					}
+				}
 			}
 			if err := store.Delete(ctx, prefix.ChildString(blockID)); err != nil {
 				return err
@@ -1117,12 +1355,12 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 	}
 
 	if hasElems {
-		if err := deleteMatchingIDs(s.elemsPrefix(key)); err != nil {
+		if err := deleteMatchingIDs(s.elemsPrefix(key), true); err != nil {
 			return err
 		}
 	}
 	if hasTombs {
-		if err := deleteMatchingIDs(s.tombsPrefix(key)); err != nil {
+		if err := deleteMatchingIDs(s.tombsPrefix(key), false); err != nil {
 			return err
 		}
 	}
