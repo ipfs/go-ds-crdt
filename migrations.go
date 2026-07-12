@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"strings"
 
+	cid "github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
+
+	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 )
 
 // Use this to detect if we need to run migrations.
-var version uint64 = 1
+var version uint64 = 2
 
 func (store *Datastore) versionKey() ds.Key {
 	return store.namespace.ChildString(store.opts.crdtOpts.Namespaces.VersionKey)
@@ -46,29 +49,38 @@ func (store *Datastore) setVersion(ctx context.Context, v uint64) error {
 	return store.store.Put(ctx, versionK, buf[0:n])
 }
 
+// applyMigrations runs any migrations needed to bring the datastore from its
+// on-disk version up to the current version, sequentially (0->1->2->...):
+// each step's migration function runs and then bumps the stored version by
+// exactly one, so that a crash partway through leaves the datastore at a
+// consistent, resumable version rather than skipping steps.
 func (store *Datastore) applyMigrations(ctx context.Context) error {
 	v, err := store.getVersion(ctx)
 	if err != nil {
 		return err
 	}
 
-	switch v {
-	case 0: // need to migrate
-		err := store.migrate0to1(ctx)
-		if err != nil {
+	if v == 0 {
+		if err := store.migrate0to1(ctx); err != nil {
 			return err
 		}
-
-		err = store.setVersion(ctx, 1)
-		if err != nil {
+		if err := store.setVersion(ctx, 1); err != nil {
 			return err
 		}
-		fallthrough
-
-	case version:
-		store.logger.Infof("CRDT database format v%d", version)
-		return nil
+		v = 1
 	}
+
+	if v == 1 {
+		if err := store.migrate1to2(ctx); err != nil {
+			return err
+		}
+		if err := store.setVersion(ctx, 2); err != nil {
+			return err
+		}
+		v = 2
+	}
+
+	store.logger.Infof("CRDT database format v%d", version)
 	return nil
 }
 
@@ -164,5 +176,101 @@ func (store *Datastore) migrate0to1(ctx context.Context) error {
 	}
 
 	s.logger.Debugf("Migration v0 to v1 finished (%d elements affected)", total)
+	return nil
+}
+
+// migrate1to2 backfills the priority into every element marker
+// (/namespace/s/<key>/<id>) that was written with an empty value, i.e. by
+// pre-v2 code (see Item B: putElems now stores the element's effective
+// priority in the marker value so findBestValue can avoid fetching the
+// delta block from the DAG for every non-max-priority candidate).
+//
+// For each empty marker, the block CID is derived from the marker's id (the
+// same decoding findBestValue uses) and its delta is fetched from the DAG
+// service -- which, at migration time, is expected to be entirely local
+// (this is a single-node, offline operation; no network fetch should be
+// needed). If a block cannot be fetched (e.g. it was already pruned), the
+// marker is left empty: findBestValue's runtime fallback still handles
+// empty markers correctly, so this is not fatal to the migration, only to
+// the optimization for that one marker.
+func (store *Datastore) migrate1to2(ctx context.Context) error {
+	s := store.set
+	elemsPrefix := s.keyPrefix(elemsNs) // /ns/s
+	q := query.Query{
+		Prefix:   elemsPrefix.String(),
+		KeysOnly: false,
+	}
+
+	rStore := store.store
+	var wStore ds.Write = store.store
+	var err error
+	batchingDs, batching := wStore.(ds.Batching)
+	if batching {
+		wStore, err = batchingDs.Batch(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	results, err := rStore.Query(ctx, q)
+	if err != nil {
+		return err
+	}
+	//nolint:errcheck
+	defer results.Close()
+
+	ng := crdtNodeGetter{NodeGetter: store.dagService}
+
+	var total, skipped int
+	for r := range results.Next() {
+		if r.Error != nil {
+			return r.Error
+		}
+
+		if len(r.Value) > 0 {
+			// already carries a priority (should not normally
+			// happen at v1, but be defensive and leave it alone).
+			continue
+		}
+
+		// The marker key is /ns/s/<key...>/<id>: the id is always
+		// the last path component, regardless of what the key
+		// itself looks like (it may contain "/").
+		id := ds.NewKey(r.Key).Name()
+		mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+		if err != nil {
+			return fmt.Errorf("error decoding block id from marker %s: %w", r.Key, err)
+		}
+		blockCid := cid.NewCidV1(cid.DagProtobuf, mhash)
+
+		cctx, cancel := s.withDAGTimeout(ctx)
+		_, deltaBytes, err := ng.GetDelta(cctx, blockCid)
+		cancel()
+		if err != nil {
+			store.logger.Warnf("migration v1 to v2: could not fetch block %s for marker %s, leaving marker empty: %s", blockCid, r.Key, err)
+			skipped++
+			continue
+		}
+
+		delta := store.newDelta()
+		if err := delta.Unmarshal(deltaBytes); err != nil {
+			store.logger.Warnf("migration v1 to v2: could not unmarshal block %s for marker %s, leaving marker empty: %s", blockCid, r.Key, err)
+			skipped++
+			continue
+		}
+
+		if err := wStore.Put(ctx, ds.NewKey(r.Key), encodePriority(delta.GetPriority())); err != nil {
+			return err
+		}
+		total++
+	}
+
+	if batching {
+		if err := wStore.(ds.Batch).Commit(ctx); err != nil {
+			return err
+		}
+	}
+
+	store.logger.Infof("Migration v1 to v2 finished (%d markers backfilled, %d skipped)", total, skipped)
 	return nil
 }

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	dshelp "github.com/ipfs/boxo/datastore/dshelp"
 	cid "github.com/ipfs/go-cid"
@@ -51,6 +53,12 @@ type set struct {
 	deltaFactory func() Delta
 	logger       logging.StandardLogger
 
+	// dagTimeout bounds how long a single DAG-fetch (GetDelta) issued
+	// from the set may take, so that a missing/unreachable block cannot
+	// turn a local operation into an indefinite network wait. 0 disables
+	// the timeout (the caller's context is used as-is).
+	dagTimeout time.Duration
+
 	// Avoid merging two things at the same time since
 	// we read-write value-priorities in a non-atomic way.
 	putElemsMux sync.Mutex
@@ -65,6 +73,7 @@ func newCRDTSet(
 	putHook func(key string, v []byte),
 	deleteHook func(key string),
 	deltaFactory func() Delta,
+	dagTimeout time.Duration,
 ) (*set, error) {
 	set := &set{
 		namespace:    namespace,
@@ -74,9 +83,20 @@ func newCRDTSet(
 		putHook:      putHook,
 		deleteHook:   deleteHook,
 		deltaFactory: deltaFactory,
+		dagTimeout:   dagTimeout,
 	}
 
 	return set, nil
+}
+
+// withDAGTimeout wraps ctx with s.dagTimeout when it is set (>0), so that
+// DAG fetches issued by the set cannot block forever on a missing/slow
+// block. The returned cancel function must always be called by the caller.
+func (s *set) withDAGTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.dagTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, s.dagTimeout)
 }
 
 // Add returns a new delta-set adding the given key/value.
@@ -194,9 +214,14 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 	// values, due to pebble's ability to bypass value retrieval. This results
 	// in reduced I/O, and reduced memory allocation and garbage collection.
 	// Performance gains may be less significant with small values.
+	//
+	// We honor the caller's KeysOnly request directly on the underlying
+	// query: the /v vs /p suffix filtering below only needs the keys, so
+	// when the caller only wants keys there is no reason to pay for
+	// reading any values (including tombstoned/priority values) at all.
 	setQuery := query.Query{
 		Prefix:   setQueryPrefix,
-		KeysOnly: false,
+		KeysOnly: q.KeysOnly,
 	}
 
 	// send the result and returns false if we must exit.
@@ -310,6 +335,25 @@ func (s *set) priorityKey(key string) ds.Key {
 	return s.keyPrefix(keysNs).ChildString(key).ChildString(prioritySuffix)
 }
 
+// encodePriority varint-encodes prio+1, so that an empty byte slice remains
+// distinguishable from an explicitly-stored priority of 0. Used both for the
+// /keys/<key>/p entries and (since v2) for the /s/<key>/<id> element marker
+// values.
+func encodePriority(prio uint64) []byte {
+	buf := make([]byte, binary.MaxVarintLen64)
+	n := binary.PutUvarint(buf, prio+1)
+	return buf[0:n]
+}
+
+// decodePriority is the inverse of encodePriority.
+func decodePriority(data []byte) (uint64, error) {
+	prio, n := binary.Uvarint(data)
+	if n <= 0 {
+		return prio, errors.New("error decoding priority")
+	}
+	return prio - 1, nil
+}
+
 func (s *set) getPriority(ctx context.Context, key string) (uint64, error) {
 	prioK := s.priorityKey(key)
 	data, err := s.store.Get(ctx, prioK)
@@ -320,22 +364,17 @@ func (s *set) getPriority(ctx context.Context, key string) (uint64, error) {
 		return 0, err
 	}
 
-	prio, n := binary.Uvarint(data)
-	if n <= 0 {
-		return prio, errors.New("error decoding priority")
-	}
-	return prio - 1, nil
+	return decodePriority(data)
 }
 
 func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, prio uint64) error {
 	prioK := s.priorityKey(key)
-	buf := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutUvarint(buf, prio+1)
-	if n == 0 {
+	buf := encodePriority(prio)
+	if len(buf) == 0 {
 		return errors.New("error encoding priority")
 	}
 
-	return writeStore.Put(ctx, prioK, buf[0:n])
+	return writeStore.Put(ctx, prioK, buf)
 }
 
 // sets a value if priority is higher. When equal, it sets if the
@@ -382,16 +421,42 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 	return nil
 }
 
+// fetchDelta retrieves and unmarshals the delta stored in the DAG block
+// identified by c, bounding the fetch with the set's dagTimeout (Item E)
+// when configured.
+func (s *set) fetchDelta(ctx context.Context, ng crdtNodeGetter, c cid.Cid) (Delta, error) {
+	fctx, cancel := s.withDAGTimeout(ctx)
+	defer cancel()
+
+	_, deltaBytes, err := ng.GetDelta(fctx, c)
+	if err != nil {
+		return nil, err
+	}
+
+	delta := s.deltaFactory()
+	if err := delta.Unmarshal(deltaBytes); err != nil {
+		return nil, err
+	}
+	return delta, nil
+}
+
 // findBestValue looks for all entries for the given key, figures out their
-// priority from their delta (skipping the blocks by the given pendingTombIDs)
-// and returns the value with the highest priority that is not tombstoned nor
-// about to be tombstoned.
+// priority (from the element marker when available, falling back to
+// fetching their delta from the DAG for legacy markers written before
+// v2 -- see migrate1to2) and returns the value with the highest priority
+// that is not tombstoned nor about to be tombstoned (skipping the blocks
+// in pendingTombIDs).
+//
+// Only the delta(s) for the highest-priority candidate(s) are ever fetched
+// from the DAG (needed to obtain the actual value, and to break ties by
+// picking the lexicographically-greatest value), which is usually a single
+// fetch even for keys with many versions.
 func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []string) ([]byte, uint64, error) {
 	// /namespace/elems/<key>
 	prefix := s.elemsPrefix(key)
 	q := query.Query{
 		Prefix:   prefix.String(),
-		KeysOnly: true,
+		KeysOnly: false,
 	}
 
 	results, err := s.store.Query(ctx, q)
@@ -401,10 +466,21 @@ func (s *set) findBestValue(ctx context.Context, key string, pendingTombIDs []st
 	//nolint:errcheck
 	defer results.Close()
 
-	var bestValue []byte
-	var bestPriority uint64
-	var deltaCid cid.Cid
+	// a surviving (non-tombstoned, non-pending) element marker: its
+	// priority (known either from the marker value or, for legacy
+	// markers, from having fetched its delta already) and enough
+	// information to fetch its delta's value later if it turns out to
+	// be a max-priority candidate.
+	type candidate struct {
+		cid      cid.Cid
+		priority uint64
+		delta    Delta // non-nil if already fetched while resolving a legacy marker
+	}
+
 	ng := crdtNodeGetter{NodeGetter: s.dagService}
+
+	var candidates []candidate
+	var maxPriority uint64
 
 	// range all the /namespace/elems/<key>/<block_cid>.
 NEXT:
@@ -438,32 +514,62 @@ NEXT:
 			continue
 		}
 
-		// get the block
 		mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
 		if err != nil {
 			return nil, 0, err
 		}
-		deltaCid = cid.NewCidV1(cid.DagProtobuf, mhash)
-		_, deltaBytes, err := ng.GetDelta(ctx, deltaCid)
-		if err != nil {
-			return nil, 0, err
+		deltaCid := cid.NewCidV1(cid.DagProtobuf, mhash)
+
+		c := candidate{cid: deltaCid}
+		if len(r.Value) > 0 {
+			// marker carries the priority (v2+): no DAG fetch needed.
+			prio, err := decodePriority(r.Value)
+			if err != nil {
+				return nil, 0, err
+			}
+			c.priority = prio
+		} else {
+			// legacy (pre-v2) marker: fall back to fetching the
+			// delta to learn its priority. Keep the fetched delta
+			// around in case this candidate ends up being a
+			// max-priority one, to avoid fetching it twice.
+			delta, err := s.fetchDelta(ctx, ng, deltaCid)
+			if err != nil {
+				return nil, 0, err
+			}
+			c.priority = delta.GetPriority()
+			c.delta = delta
 		}
 
-		delta := s.deltaFactory()
-		err = delta.Unmarshal(deltaBytes)
-		if err != nil {
-			return nil, 0, err
+		if len(candidates) == 0 || c.priority > maxPriority {
+			maxPriority = c.priority
 		}
-		priority := delta.GetPriority()
+		candidates = append(candidates, c)
+	}
 
-		// discard this delta.
-		if priority < bestPriority {
+	if len(candidates) == 0 {
+		return nil, 0, nil
+	}
+
+	var bestValue []byte
+	haveBest := false
+	for _, c := range candidates {
+		if c.priority != maxPriority {
 			continue
 		}
 
-		// When equal priority, choose the greatest among values in
-		// the delta and current. When higher priority, choose the
-		// greatest only among those in the delta.
+		delta := c.delta
+		if delta == nil {
+			var err error
+			delta, err = s.fetchDelta(ctx, ng, c.cid)
+			if err != nil {
+				return nil, 0, err
+			}
+		}
+
+		// Among the values for our key in this delta, keep the
+		// greatest (there can only be one under normal usage, but
+		// custom delta implementations could set more).
 		var greatestValueInDelta []byte
 		elems, err := delta.GetElements()
 		if err != nil {
@@ -479,19 +585,258 @@ NEXT:
 			}
 		}
 
-		if priority > bestPriority {
+		if !haveBest {
 			bestValue = greatestValueInDelta
-			bestPriority = priority
+			haveBest = true
 			continue
 		}
-
-		// equal priority
+		// equal priority (ties among max-priority candidates): choose
+		// the greatest value.
 		if bytes.Compare(bestValue, greatestValueInDelta) < 0 {
 			bestValue = greatestValueInDelta
 		}
 	}
 
-	return bestValue, bestPriority, nil
+	return bestValue, maxPriority, nil
+}
+
+// compactSnapshotState computes Compact's live-element and carried-
+// tombstone results for every key in touched, in a single pass over the
+// whole elems and tombs namespaces, grouping results in memory by key,
+// instead of running two datastore Queries per touched key.
+//
+// This matters for the same reason Item A's putTombs batching did: a naive
+// (e.g. in-memory) datastore's Query() scans the whole store regardless of
+// the requested prefix, so one Query per key turns compaction of a big
+// store into O(touched keys) x O(store size) work. A single pass over each
+// namespace keeps it O(store size) overall, with the per-key result
+// selection (priority/tie-break, carry-or-drop) done in memory.
+//
+// Live-value candidate selection and the priority/tie-break rule mirror
+// findBestValue exactly (see Item B/G3), scoped to element markers whose
+// block CID is in dagCIDSet (the set the calling DAG's walk just found
+// reachable) -- the elems/tombs namespaces are shared across all dagNames
+// writing to the same key (see TestPurgeDAGMixedKey), so without the scope
+// restriction compacting one dagName could pick up markers written by a
+// different one. The carried-tombstone rule is Compact's two-generation
+// rule (see the Compact doc comment).
+//
+// Every DAG fetch here (needed to resolve a max-priority candidate's value,
+// or a legacy empty-value marker's priority) is expected to hit the local
+// blockstore only: dagCIDSet was itself built from a local-only walk.
+//
+// Caveat: recovering a key from a marker's datastore path (to group by key)
+// only round-trips for keys following the ds.Key.String() convention
+// (always starting with "/"), which is exactly what every call through the
+// public Datastore.Put/Delete/Batch API produces. A caller that reaches the
+// advanced MerkleCRDT.Set().Add/Rmv API directly with a key that does not
+// start with "/" will see that key silently dropped by Compact (its
+// history purged with no snapshot successor) rather than preserved -- do
+// not do that.
+func (s *set) compactSnapshotState(ctx context.Context, touched map[string]dagWalkKind, dagCIDSet map[cid.Cid]struct{}) ([]*pb.Element, []*pb.Element, error) {
+	type elemMarker struct {
+		id       string
+		cid      cid.Cid
+		priority uint64
+		hasPrio  bool // false for legacy (pre-v2, empty-value) markers.
+	}
+
+	// keyAndIDFromMarkerPath splits a full "/<elemsOrTombsNs>/<key...>/<id>"
+	// datastore key (as returned by a namespace-wide Query) back into its
+	// (key, id) parts, preserving the leading "/" on both: every key
+	// flowing through set.Add/Rmv (and therefore into pb.Element.Key and
+	// the "touched" map below) is a ds.Key.String(), always absolute (e.g.
+	// "/foo", never "foo") -- and every existing "id" (e.g. the block keys
+	// findBestValue/Rmv extract via the identical
+	// strings.TrimPrefix(r.Key, prefix.String()) idiom, or the blockKey
+	// processNode passes into Merge) is, likewise, always
+	// dshelp.MultihashToDsKey(...).String(), always absolute. id must match
+	// that convention exactly (not just its normalized CID) because
+	// findBestValue's pendingTombIDs skip is a raw string comparison, not a
+	// CID/Key-normalized one.
+	keyAndIDFromMarkerPath := func(nsPrefix, fullKey string) (key, id string) {
+		rel := strings.TrimPrefix(fullKey, nsPrefix) // "/<key...>/<idName>"
+		idName := ds.NewKey(rel).Name()
+		key = strings.TrimSuffix(rel, "/"+idName)
+		id = "/" + idName
+		return key, id
+	}
+
+	elemsByKey := make(map[string][]elemMarker)
+	elemsNsPrefix := s.keyPrefix(elemsNs)
+	{
+		q := query.Query{Prefix: elemsNsPrefix.String(), KeysOnly: false}
+		results, err := s.store.Query(ctx, q)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer results.Close() //nolint:errcheck
+
+		for r := range results.Next() {
+			if r.Error != nil {
+				return nil, nil, r.Error
+			}
+			key, id := keyAndIDFromMarkerPath(elemsNsPrefix.String(), r.Key)
+			if _, ok := touched[key]; !ok {
+				continue
+			}
+			mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+			if err != nil {
+				return nil, nil, err
+			}
+			m := elemMarker{id: id, cid: cid.NewCidV1(cid.DagProtobuf, mhash)}
+			if len(r.Value) > 0 {
+				prio, err := decodePriority(r.Value)
+				if err != nil {
+					return nil, nil, err
+				}
+				m.priority = prio
+				m.hasPrio = true
+			}
+			elemsByKey[key] = append(elemsByKey[key], m)
+		}
+	}
+
+	tombsByKey := make(map[string][]string)
+	tombsNsPrefix := s.keyPrefix(tombsNs)
+	{
+		q := query.Query{Prefix: tombsNsPrefix.String(), KeysOnly: true}
+		results, err := s.store.Query(ctx, q)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer results.Close() //nolint:errcheck
+
+		for r := range results.Next() {
+			if r.Error != nil {
+				return nil, nil, r.Error
+			}
+			key, id := keyAndIDFromMarkerPath(tombsNsPrefix.String(), r.Key)
+			if _, ok := touched[key]; !ok {
+				continue
+			}
+			tombsByKey[key] = append(tombsByKey[key], id)
+		}
+	}
+
+	ng := crdtNodeGetter{NodeGetter: s.dagService}
+
+	keys := make([]string, 0, len(touched))
+	for k := range touched {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	type candidate struct {
+		id    string
+		cid   cid.Cid
+		prio  uint64
+		delta Delta // non-nil if already fetched while resolving a legacy marker.
+	}
+
+	var elements, tombstones []*pb.Element
+	for _, key := range keys {
+		tombstonedIDs := make(map[string]struct{}, len(tombsByKey[key]))
+		for _, id := range tombsByKey[key] {
+			tombstonedIDs[id] = struct{}{}
+		}
+
+		// Live contribution.
+		var candidates []candidate
+		var maxPriority uint64
+		for _, m := range elemsByKey[key] {
+			if _, ok := dagCIDSet[m.cid]; !ok {
+				continue // belongs to a different DAG's history.
+			}
+			if _, tombed := tombstonedIDs[m.id]; tombed {
+				continue
+			}
+
+			c := candidate{id: m.id, cid: m.cid}
+			if m.hasPrio {
+				c.prio = m.priority
+			} else {
+				delta, err := s.fetchDelta(ctx, ng, m.cid)
+				if err != nil {
+					return nil, nil, err
+				}
+				c.prio = delta.GetPriority()
+				c.delta = delta
+			}
+
+			if len(candidates) == 0 || c.prio > maxPriority {
+				maxPriority = c.prio
+			}
+			candidates = append(candidates, c)
+		}
+
+		if len(candidates) > 0 {
+			var bestValue []byte
+			haveBest := false
+			for _, c := range candidates {
+				if c.prio != maxPriority {
+					continue
+				}
+				delta := c.delta
+				if delta == nil {
+					var err error
+					delta, err = s.fetchDelta(ctx, ng, c.cid)
+					if err != nil {
+						return nil, nil, err
+					}
+				}
+
+				var greatestValueInDelta []byte
+				elems, err := delta.GetElements()
+				if err != nil {
+					return nil, nil, err
+				}
+				for _, elem := range elems {
+					if elem.GetKey() != key {
+						continue
+					}
+					v := elem.GetValue()
+					if bytes.Compare(greatestValueInDelta, v) < 0 {
+						greatestValueInDelta = v
+					}
+				}
+
+				if !haveBest {
+					bestValue = greatestValueInDelta
+					haveBest = true
+					continue
+				}
+				if bytes.Compare(bestValue, greatestValueInDelta) < 0 {
+					bestValue = greatestValueInDelta
+				}
+			}
+			elements = append(elements, &pb.Element{Key: key, Value: bestValue, Priority: maxPriority})
+		}
+
+		// Carried tombstones.
+		if len(tombsByKey[key]) == 0 {
+			continue
+		}
+		liveIDs := make(map[string]struct{}, len(elemsByKey[key]))
+		for _, m := range elemsByKey[key] {
+			liveIDs[m.id] = struct{}{}
+		}
+		for _, id := range tombsByKey[key] {
+			mhash, err := dshelp.DsKeyToMultihash(ds.NewKey(id))
+			if err != nil {
+				return nil, nil, err
+			}
+			targetCid := cid.NewCidV1(cid.DagProtobuf, mhash)
+
+			_, purgingNow := dagCIDSet[targetCid]
+			_, elemStillLive := liveIDs[id]
+			if purgingNow || elemStillLive {
+				tombstones = append(tombstones, &pb.Element{Key: key, Id: id})
+			}
+		}
+	}
+
+	return elements, tombstones, nil
 }
 
 // putElems adds items to the "elems" set. It will also set current
@@ -524,9 +869,27 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 	for _, e := range elems {
 		e.Id = id // overwrite the identifier as it would come unset
 		key := e.GetKey()
+
+		// The element's effective priority is normally the delta's
+		// priority, except in snapshot deltas (Item G) where each
+		// element carries its own original priority so that a
+		// snapshot restores exactly the same per-key priorities on
+		// every replica instead of inflating them all to the
+		// snapshot's height. 0 means "use the delta's priority",
+		// which covers all pre-snapshot data.
+		eprio := e.GetPriority()
+		if eprio == 0 {
+			eprio = prio
+		}
+
 		// /namespace/elems/<key>/<id>
+		// The marker value carries this element's effective priority
+		// (varint(prio+1), same convention as setPriority) so that
+		// findBestValue can later learn it without fetching the delta
+		// block from the DAG. See migrate1to2 for backfilling markers
+		// written before this was introduced.
 		k := s.elemsPrefix(key).ChildString(id)
-		err := store.Put(ctx, k, nil)
+		err := store.Put(ctx, k, encodePriority(eprio))
 		if err != nil {
 			return err
 		}
@@ -534,7 +897,7 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 		// update the value if applicable:
 		// * higher priority than we currently have.
 		// * not tombstoned before.
-		err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
+		err = s.setValue(ctx, store, key, id, e.GetValue(), eprio)
 		if err != nil {
 			return err
 		}
@@ -549,6 +912,15 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 	return nil
 }
 
+// putTombs writes the given tombstones into the store. It groups them by
+// key first, so that a single Delete() removing N versions of the same key
+// (which produces N tombstones in one delta) only pays for a single
+// findBestValue scan per key instead of one per tombstone (Item A): the
+// intermediate states after each individual tombstone are never observed by
+// anyone else (they all land in the same uncommitted batch), so only the
+// final value/priority for each key matters, and that is exactly what
+// calling findBestValue once, with the full set of pending tombstone IDs
+// for that key, computes.
 func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	if len(tombs) == 0 {
 		return nil
@@ -564,43 +936,52 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 	}
 
-	// key -> tombstonedBlockID. Carries the tombstoned blocks for each
-	// element in this delta.
+	// key -> tombstoned block IDs. Carries the tombstoned blocks for each
+	// element in this delta. keyOrder preserves first-seen order so that
+	// results (and the delete hook below) are deterministic.
 	deletedElems := make(map[string][]string)
-	var errs []error
+	var keyOrder []string
 	for _, e := range tombs {
 		// /namespace/tombs/<key>/<id>
 		key := e.GetKey()
 		id := e.GetId()
-		valueK := s.valueKey(key)
+		if _, ok := deletedElems[key]; !ok {
+			keyOrder = append(keyOrder, key)
+		}
 		deletedElems[key] = append(deletedElems[key], id)
 
-		// Find best value for element that we are going to delete
+		// Write tomb into store.
+		k := s.tombsPrefix(key).ChildString(id)
+		if err := store.Put(ctx, k, nil); err != nil {
+			return err
+		}
+	}
+
+	for _, key := range keyOrder {
+		valueK := s.valueKey(key)
+
+		// Find best surviving value for the key, now that all its
+		// tombstones from this delta are known.
 		v, p, err := s.findBestValue(ctx, key, deletedElems[key])
 		if err != nil {
 			return err
 		}
 
+		var errs []error
 		if v == nil {
-			if err = store.Delete(ctx, valueK); err != nil {
+			if err := store.Delete(ctx, valueK); err != nil {
 				errs = append(errs, err)
 			}
-			if err = store.Delete(ctx, s.priorityKey(key)); err != nil {
+			if err := store.Delete(ctx, s.priorityKey(key)); err != nil {
 				errs = append(errs, err)
 			}
 		} else {
-			if err = store.Put(ctx, valueK, v); err != nil {
+			if err := store.Put(ctx, valueK, v); err != nil {
 				errs = append(errs, err)
 			}
-			if err = s.setPriority(ctx, store, key, p); err != nil {
+			if err := s.setPriority(ctx, store, key, p); err != nil {
 				errs = append(errs, err)
 			}
-		}
-
-		// Write tomb into store.
-		k := s.tombsPrefix(key).ChildString(id)
-		if err = store.Put(ctx, k, nil); err != nil {
-			errs = append(errs, err)
 		}
 		if err := errors.Join(errs...); err != nil {
 			return err
@@ -617,8 +998,8 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	// run delete hook only once for all versions of the same element
 	// tombstoned in this delta. Note it may be that the element was not
 	// fully deleted and only a different value took its place.
-	for del := range deletedElems {
-		s.deleteHook(del)
+	for _, key := range keyOrder {
+		s.deleteHook(key)
 	}
 
 	return nil
@@ -763,8 +1144,17 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		return err
 	}
 
+	// Hook-quiet on no-ops (Item R8): a purge that does not actually change
+	// a surviving key's value/priority, or that targets a key whose value
+	// entry was already absent, must not fire a spurious putHook/deleteHook.
+	// This matters for callers like receiver-side reclaim (reclaimCovered)
+	// where the same live key is very commonly untouched by the generation
+	// being purged. A real change still always writes and fires its hook.
 	valueK := s.valueKey(key)
 	if bestVal == nil {
+		_, getErr := s.store.Get(ctx, valueK)
+		alreadyAbsent := errors.Is(getErr, ds.ErrNotFound)
+
 		var errs []error
 		if err := s.store.Delete(ctx, valueK); err != nil && !errors.Is(err, ds.ErrNotFound) {
 			errs = append(errs, err)
@@ -775,15 +1165,23 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := errors.Join(errs...); err != nil {
 			return err
 		}
-		s.deleteHook(key)
+		if !alreadyAbsent {
+			s.deleteHook(key)
+		}
 	} else {
-		if err := s.store.Put(ctx, valueK, bestVal); err != nil {
-			return err
+		curVal, getErr := s.store.Get(ctx, valueK)
+		curPrio, prioErr := s.getPriority(ctx, key)
+		unchanged := getErr == nil && prioErr == nil && bytes.Equal(curVal, bestVal) && curPrio == bestPrio
+
+		if !unchanged {
+			if err := s.store.Put(ctx, valueK, bestVal); err != nil {
+				return err
+			}
+			if err := s.setPriority(ctx, s.store, key, bestPrio); err != nil {
+				return err
+			}
+			s.putHook(key, bestVal)
 		}
-		if err := s.setPriority(ctx, s.store, key, bestPrio); err != nil {
-			return err
-		}
-		s.putHook(key, bestVal)
 	}
 
 	return nil

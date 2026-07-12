@@ -35,76 +35,13 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 		headCIDs[i] = h.Cid
 	}
 
-	dagCIDSet := make(map[cid.Cid]struct{})
-
-	// purgeKeyKind tracks which namespaces a key appeared in across the DAG's
-	// deltas, so purgeKeyBlocks can skip querying namespaces that the DAG never
-	// wrote to for a given key.
-	type purgeKeyKind uint8
-	const (
-		purgeKeyElem purgeKeyKind = 1 << iota
-		purgeKeyTomb
-	)
-	setKeys := make(map[string]purgeKeyKind)
-
-	// Walk the DAG with a local-only DFS: check isProcessed before fetching each
-	// block so we never trigger network requests. Unprocessed blocks have no set
-	// state to clean up, so skipping them is correct.
-	stack := make([]cid.Cid, len(headCIDs))
-	copy(stack, headCIDs)
-	for len(stack) > 0 {
-		c := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if _, seen := dagCIDSet[c]; seen {
-			continue
-		}
-		processed, err := mcrdt.isProcessed(ctx, c)
-		if err != nil {
-			return 0, err
-		}
-		if !processed {
-			continue
-		}
-		dagCIDSet[c] = struct{}{}
-
-		nd, err := mcrdt.dagService.Get(ctx, c)
-		if err != nil {
-			return 0, err
-		}
-
-		deltaBytes, err := extractDelta(nd)
-		if err != nil {
-			return 0, err
-		}
-		delta := mcrdt.newDelta()
-		if err := delta.Unmarshal(deltaBytes); err != nil {
-			return 0, err
-		}
-
-		elems, err := delta.GetElements()
-		if err != nil {
-			return 0, err
-		}
-		for _, e := range elems {
-			setKeys[e.GetKey()] |= purgeKeyElem
-		}
-
-		tombs, err := delta.GetTombstones()
-		if err != nil {
-			return 0, err
-		}
-		for _, t := range tombs {
-			setKeys[t.GetKey()] |= purgeKeyTomb
-		}
-
-		for _, link := range nd.Links() {
-			stack = append(stack, link.Cid)
-		}
+	dagCIDSet, setKeys, _, err := mcrdt.walkProcessedDAG(ctx, headCIDs)
+	if err != nil {
+		return 0, err
 	}
 
 	for key, kind := range setKeys {
-		if err := mcrdt.set.purgeKeyBlocks(ctx, key, dagCIDSet, kind&purgeKeyElem != 0, kind&purgeKeyTomb != 0); err != nil {
+		if err := mcrdt.set.purgeKeyBlocks(ctx, key, dagCIDSet, kind&dagWalkElem != 0, kind&dagWalkTomb != 0); err != nil {
 			return 0, err
 		}
 	}
@@ -144,6 +81,129 @@ func (mcrdt *MerkleCRDT) PurgeDAG(ctx context.Context, dagName string) (int, err
 	return len(dagCIDs), nil
 }
 
+// dagWalkKind tracks which namespaces a key appeared in across a walked
+// DAG's deltas (touched by element markers, tombstones, or both). It lets
+// callers of walkProcessedDAG (PurgeDAG, Compact) skip querying namespaces
+// that the walked DAG never wrote to for a given key.
+type dagWalkKind uint8
+
+const (
+	dagWalkElem dagWalkKind = 1 << iota
+	dagWalkTomb
+)
+
+// snapshotNodeInfo describes one snapshot node (see Compact) encountered
+// while walking a DAG: its own CID, the covered-heads links it carries (its
+// generation's covered history), and the compaction-generation metadata
+// (R1/R2) stamped on its delta.
+type snapshotNodeInfo struct {
+	cid   cid.Cid
+	links []cid.Cid
+	total uint32
+	id    []byte
+}
+
+// walkProcessedDAG walks the DAG reachable from the given head CIDs using a
+// local-only, isProcessed-guarded DFS: only blocks already marked as
+// processed are fetched and unmarshalled, so the walk never triggers a
+// network request for a missing or not-yet-processed block. Snapshot nodes
+// (see Compact) are visited themselves -- their own elements/tombstones are
+// counted -- but never descended into, exactly like processNode/repairDAG:
+// their links are covered-heads bookkeeping that may point at already-purged
+// history.
+//
+// Every per-block fetch is bounded by the configured DAGSyncerTimeout (same
+// pattern as set.withDAGTimeout), so a block that is locally missing or
+// unexpectedly slow to retrieve (e.g. an externally GC'd blockstore, or a
+// network-backed DAGService) cannot hang the walk indefinitely -- even
+// though every block reached here is expected to be local.
+//
+// It returns the set of every visited (reachable and processed) block CID,
+// for every key touched by any of those blocks which set namespaces
+// (elements/tombstones) it was touched in, and every snapshot node
+// encountered during the walk (used by ReclaimCompacted; PurgeDAG and
+// Compact ignore it).
+//
+// Shared by PurgeDAG, Compact and the reclaim (R5/R6) machinery.
+func (store *Datastore) walkProcessedDAG(ctx context.Context, headCIDs []cid.Cid) (map[cid.Cid]struct{}, map[string]dagWalkKind, []snapshotNodeInfo, error) {
+	dagCIDSet := make(map[cid.Cid]struct{})
+	setKeys := make(map[string]dagWalkKind)
+	var snapshots []snapshotNodeInfo
+
+	stack := make([]cid.Cid, len(headCIDs))
+	copy(stack, headCIDs)
+	for len(stack) > 0 {
+		c := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if _, seen := dagCIDSet[c]; seen {
+			continue
+		}
+		processed, err := store.isProcessed(ctx, c)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !processed {
+			continue
+		}
+		dagCIDSet[c] = struct{}{}
+
+		fctx, cancel := store.set.withDAGTimeout(ctx)
+		nd, err := store.dagService.Get(fctx, c)
+		cancel()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		deltaBytes, err := extractDelta(nd)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		delta := store.newDelta()
+		if err := delta.Unmarshal(deltaBytes); err != nil {
+			return nil, nil, nil, err
+		}
+
+		elems, err := delta.GetElements()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, e := range elems {
+			setKeys[e.GetKey()] |= dagWalkElem
+		}
+
+		tombs, err := delta.GetTombstones()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, t := range tombs {
+			setKeys[t.GetKey()] |= dagWalkTomb
+		}
+
+		if delta.IsSnapshot() {
+			links := nd.Links()
+			linkCIDs := make([]cid.Cid, len(links))
+			for i, l := range links {
+				linkCIDs[i] = l.Cid
+			}
+			total, id := delta.SnapshotMeta()
+			snapshots = append(snapshots, snapshotNodeInfo{
+				cid:   c,
+				links: linkCIDs,
+				total: total,
+				id:    id,
+			})
+			continue
+		}
+
+		for _, link := range nd.Links() {
+			stack = append(stack, link.Cid)
+		}
+	}
+
+	return dagCIDSet, setKeys, snapshots, nil
+}
+
 // DatatstoreNamespaces carries configuration for how internal namespaces are named.
 type InternalNamespaces struct {
 	Heads           string
@@ -153,6 +213,10 @@ type InternalNamespaces struct {
 	DirtyBitKey     string
 	BadShutdownKey  string
 	VersionKey      string
+	// Reclaim namespaces the bookkeeping used by receiver-side reclamation
+	// of compacted history (see Options.ReclaimOnSnapshot and
+	// Datastore.ReclaimCompacted).
+	Reclaim string
 }
 
 type MerkleCRDTOptions struct {
@@ -206,6 +270,9 @@ func NewMerkleCRDT(
 		}
 		if ns := in.VersionKey; ns != "" {
 			opts.crdtOpts.Namespaces.VersionKey = ns
+		}
+		if ns := in.Reclaim; ns != "" {
+			opts.crdtOpts.Namespaces.Reclaim = ns
 		}
 	}
 

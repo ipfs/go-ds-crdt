@@ -32,6 +32,65 @@ Using batching, Any `go-ds-crdt` replica can easily process and sync 400 keys/s 
 
 `go-ds-crdt` is used in production as state-synchronization layer for [IPFS Clusters](https://ipfscluster.io).
 
+## Compaction
+
+A `crdt.Datastore` never shrinks on its own: deleting a key adds a
+tombstone rather than removing the history that preceded it, so a named
+DAG's on-disk size only grows over time, even as the live key set stays
+small. `Datastore.Compact(ctx, dagName)` (`Compact(ctx, "")` for the default,
+unnamed DAG) addresses this: it rewrites a named DAG's current live state
+(every key's winning value and priority, plus any tombstones still needed by
+replicas that have not caught up) as one or more small "snapshot" DAG
+blocks, and purges the history that is now redundant with them. It returns
+the number of DAG blocks purged.
+
+A fresh replica that later syncs a compacted DAG only ever needs to fetch
+the snapshot block(s) -- it never has to walk the purged history -- so
+compaction directly shortens how much a new or long-lagging replica needs
+to download to catch up.
+
+**Requirements and caveats:**
+
+- **Single-writer / quiesced dagName.** The caller must ensure no concurrent
+  remote writes are being merged into the target dagName while `Compact`
+  runs. `Compact` serializes against *local* `Put`/`Delete`/`Batch.Commit`
+  calls on the same `Datastore` automatically, but it cannot serialize
+  against writes arriving from other replicas over the network -- either
+  quiesce the dagName across the fleet first, or accept that a write racing
+  with `Compact` may end up applied on top of the resulting snapshot instead
+  of folded into it (still correct, just not compacted away).
+- **Reasonably synced replicas.** Compaction works correctly regardless of
+  how far behind other replicas are (see below), but it is most useful when
+  run while replicas are reasonably caught up, since a replica that is very
+  far behind will converge without ever having learned any of the
+  intermediate history it skipped.
+- **Two-generation tombstone carrying.** A tombstone cannot be dropped the
+  moment its target's history is purged: a lagging replica may still hold
+  that (soon to be purged) element and needs the tombstone to eventually
+  reach it. So each compaction generation carries forward the tombstones for
+  everything it purges, and only drops a tombstone once it has had one full
+  generation to reach any lagging replica holding the element it kills.
+- **All replicas must run a compaction-aware version first.** An old-code
+  replica does not know that a snapshot block's links are bookkeeping only
+  (covered heads) rather than fetchable history: it would try to walk into
+  now-purged blocks (and fail), while also mis-attributing every element's
+  priority to the snapshot's own (much higher) height. Upgrade every replica
+  that may see a given dagName's history before calling `Compact` on it
+  anywhere.
+- **Receiver-side reclamation.** A replica that had already merged a DAG's
+  history before a snapshot covering it arrives does not need to keep that
+  history around: by default (`Options.ReclaimOnSnapshot`, on), once it has
+  merged every sibling of a compaction generation it purges its own local
+  copy of the history that generation covers, the same way `Compact` does on
+  the compacting replica. This is best-effort (soft failures are logged, not
+  fatal); `Datastore.ReclaimCompacted(ctx, dagName)` is available to trigger
+  or retry reclamation manually -- for crash-missed generations, for
+  deployments running with `ReclaimOnSnapshot` disabled, or for snapshots
+  produced by older versions of this package.
+
+See the `Compact` doc comment in `compact.go` for the full algorithm and the
+receiving-replica behavior in each scenario (up to date, lagging, fresh).
+
 ## Usage
 
 `go-ds-crdt` needs:

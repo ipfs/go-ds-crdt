@@ -9,8 +9,13 @@
 // The implementation is based on the "Merkle-CRDTs: Merkle-DAGs meet CRDTs"
 // paper by Héctor Sanjuán, Samuli Pöyhtäri and Pedro Teixeira.
 //
-// Note that, in the absence of compaction (which must be performed manually),
-// a crdt.Datastore will only grow in size even when keys are deleted.
+// Note that, in the absence of compaction, a crdt.Datastore will only grow
+// in size even when keys are deleted: deleting a key adds a tombstone
+// without removing the history that preceded it. Compact (or, for outright
+// deletion of a whole named DAG's history, PurgeDAG) can be called manually
+// to fold a named DAG's live state into a small "snapshot" generation and
+// discard the DAG history it replaces. See the Compact doc comment for the
+// details and the requirements this places on replicas and callers.
 //
 // The time to be fully synced for new Datastore replicas will depend on how
 // fast they can retrieve the DAGs announced by the other replicas, but newer
@@ -52,6 +57,7 @@ const (
 	dirtyBitKey       = "d"  // dirty
 	badShutdownKey    = "bs" // bad-shutdown: set on New, cleared on clean Close
 	versionKey        = "crdt_version"
+	reclaimNs         = "rc" // reclaim - receiver-side reclamation bookkeeping
 )
 
 // Common errors.
@@ -128,6 +134,19 @@ type Options struct {
 	// included in the batch when the delay expires. 0 to
 	// disable. Default: 0.
 	BroadcastBatchDelay time.Duration
+	// ReclaimOnSnapshot enables receiver-side reclamation of compacted
+	// history: when a replica merges a snapshot delta produced by another
+	// replica's Compact() call and has now merged every sibling of that
+	// compaction generation, it purges its own local copy of the DAG
+	// history that snapshot generation covers (blocks and set entries),
+	// exactly as Compact does on the compacting replica. This is a
+	// best-effort, soft-failure feature: a failed or missed reclaim never
+	// fails the triggering merge and never corrupts state, it just leaves
+	// local history unreclaimed until the next opportunity. Use
+	// Datastore.ReclaimCompacted for manual/recovery reclamation (crash
+	// windows, legacy pre-metadata snapshots, or when this option is
+	// disabled). Default: true.
+	ReclaimOnSnapshot bool
 	// advanced options
 	crdtOpts MerkleCRDTOptions
 }
@@ -175,7 +194,8 @@ func (opts *Options) verify() error {
 		opts.crdtOpts.Namespaces.ProcessedBlocks == "",
 		opts.crdtOpts.Namespaces.DirtyBitKey == "",
 		opts.crdtOpts.Namespaces.BadShutdownKey == "",
-		opts.crdtOpts.Namespaces.VersionKey == "":
+		opts.crdtOpts.Namespaces.VersionKey == "",
+		opts.crdtOpts.Namespaces.Reclaim == "":
 		panic("one or several InternalNamespaces are unset, and this should never happen")
 	}
 
@@ -198,6 +218,7 @@ func DefaultOptions() *Options {
 		RepairInterval:      time.Hour,
 		MultiHeadProcessing: false,
 		BroadcastBatchDelay: 0,
+		ReclaimOnSnapshot:   true,
 
 		crdtOpts: MerkleCRDTOptions{
 			DeltaFactory: func() Delta { return &pbDelta{Delta: &pb.Delta{}} },
@@ -209,6 +230,7 @@ func DefaultOptions() *Options {
 				DirtyBitKey:     dirtyBitKey,
 				BadShutdownKey:  badShutdownKey,
 				VersionKey:      versionKey,
+				Reclaim:         reclaimNs,
 			},
 		},
 	}
@@ -238,6 +260,17 @@ type Datastore struct {
 
 	curDeltaMux sync.Mutex
 	curDelta    Delta // current, unpublished delta
+
+	// compactMux serializes Compact() runs against local publishes
+	// (addDAGNode): Compact holds it for its entire run so that a local
+	// Put/Delete/Batch.Commit cannot add a new DAG node referencing heads
+	// that Compact is in the middle of collapsing/purging.
+	compactMux sync.Mutex
+
+	// reclaimMux guards the read-modify-write of the per-generation
+	// sibling counter used by receiver-side reclamation (see
+	// processNode's allowReclaim handling and reclaimCovered).
+	reclaimMux sync.Mutex
 
 	wg sync.WaitGroup
 
@@ -320,7 +353,7 @@ func New(
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	set, err := newCRDTSet(ctx, store, fullSetNs, dagSyncer, opts.Logger, setPutHook, setDeleteHook, opts.crdtOpts.DeltaFactory)
+	set, err := newCRDTSet(ctx, store, fullSetNs, dagSyncer, opts.Logger, setPutHook, setDeleteHook, opts.crdtOpts.DeltaFactory, opts.DAGSyncerTimeout)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("error setting up crdt set: %w", err)
@@ -762,7 +795,7 @@ func (store *Datastore) rebroadcastHeads(ctx context.Context) {
 	// Send them out
 	err = store.broadcastHeads(ctx, headsToBroadcast)
 	if err != nil {
-		store.logger.Warn("broadcast failed: %v", err)
+		store.logger.Warnf("broadcast failed: %v", err)
 	}
 
 	// Reset the map
@@ -852,6 +885,7 @@ func (store *Datastore) dagWorker() {
 			job.root,
 			job.delta,
 			job.node,
+			true, // dagWorker processes remote/walked blocks: reclaim may trigger.
 		)
 		if err != nil {
 			store.logger.Error(err)
@@ -1016,9 +1050,31 @@ func (store *Datastore) MarkClean(ctx context.Context) {
 
 // processNode merges the delta in a node and has the logic about what to do
 // then.
-func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, root Head, delta Delta, node ipld.Node) ([]cid.Cid, error) {
+//
+// allowReclaim controls whether this call may trigger receiver-side
+// reclamation (R4) of a snapshot delta's covered history: it must be true
+// only for nodes that arrived from elsewhere and are being merged for the
+// first time via the normal DAG walk (dagWorker), and false for locally
+// authored nodes (addDAGNode -- a local publish is never a snapshot) and
+// for Compact's own processing of the snapshot nodes it just created
+// (Compact purges that history itself; reclaiming it again here would be
+// redundant and would race Compact's own bookkeeping).
+func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, root Head, delta Delta, node ipld.Node, allowReclaim bool) ([]cid.Cid, error) {
 	// First,  merge the delta in this node.
 	current := node.Cid()
+
+	// Remove from the set that has the children which are queued for
+	// processing, whether we succeed or fail below. If we returned early
+	// on failure without doing this, the CID would stay reserved
+	// forever: every later broadcast of this branch would see
+	// !queuedChildren.Visit(child) and assume someone else owns
+	// processing it, stalling the branch until the next repair.
+	// Doing this via defer (rather than only after markProcessed
+	// succeeds) is safe: between markProcessed and this Remove running,
+	// another worker either sees isProcessed=true or sees the
+	// reservation still held -- both are correct outcomes.
+	defer store.queuedChildren.Remove(current)
+
 	blockKey := dshelp.MultihashToDsKey(current.Hash()).String()
 	err := store.set.Merge(ctx, delta, blockKey)
 	if err != nil {
@@ -1035,10 +1091,6 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 		// marking as dirty here will not help, as we have not made this block a head, so we will not re-traverse it when fixing the datastore.
 		return nil, fmt.Errorf("error recording %s as processed: %w", current, err)
 	}
-
-	// Remove from the set that has the children which are queued for
-	// processing.
-	store.queuedChildren.Remove(node.Cid())
 
 	// Some informative logging
 	if prio := delta.GetPriority(); prio%50 == 0 {
@@ -1064,18 +1116,29 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 	//
 	// For every other child, add our node as Head.
 
+	// Snapshot deltas (see Compact) never get descended into: their links
+	// are "covered heads" bookkeeping only, pointing at (possibly
+	// already-purged) history. Forcing isProcessed=true for every child
+	// below reuses the exact same head-replacement/addition logic as a
+	// normal fully-processed child, while guaranteeing we never call
+	// queuedChildren.Visit nor append to children for them.
+	isSnapshot := delta.IsSnapshot()
+
 	addedAsHead := false // small optimization to avoid adding as head multiple times.
 	for _, l := range links {
 		child := l.Cid
 
 		oldHead, isHead := store.heads.Get(ctx, child)
-		if err != nil {
-			return nil, fmt.Errorf("error checking if %s is head: %w", child, err)
-		}
 
-		isProcessed, err := store.isProcessed(ctx, child)
-		if err != nil {
-			return nil, fmt.Errorf("error checking for known block %s: %w", child, err)
+		var isProcessed bool
+		if isSnapshot {
+			isProcessed = true
+		} else {
+			var err error
+			isProcessed, err = store.isProcessed(ctx, child)
+			if err != nil {
+				return nil, fmt.Errorf("error checking for known block %s: %w", child, err)
+			}
 		}
 
 		if isHead {
@@ -1121,6 +1184,10 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 		// reserved it in the queue.
 		children = append(children, child)
 
+	}
+
+	if allowReclaim && isSnapshot && store.opts.ReclaimOnSnapshot {
+		store.maybeReclaimOnSnapshot(ctx, delta, node)
 	}
 
 	return children, nil
@@ -1224,6 +1291,17 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 				return fmt.Errorf("error reprocessing block %s: %w", cur, err)
 			}
 		}
+
+		// A snapshot node's links are covered-heads bookkeeping only:
+		// the history they point at may have been purged by Compact,
+		// so trying to fetch it would fail forever. Do not queue them.
+		if delta.IsSnapshot() {
+			atomic.StoreUint64(&queuedNodes, uint64(len(nodes)))
+			atomic.AddUint64(&visitedNodes, 1)
+			atomic.StoreUint64(&lastPriority, delta.GetPriority())
+			continue
+		}
+
 		links := n.Links()
 		for _, l := range links {
 			if queued.Visit(l.Cid) {
@@ -1557,7 +1635,14 @@ func (store *Datastore) publish(ctx context.Context, delta Delta) (Head, error) 
 
 // addDAGNode creates a block with the given delta and returns the new
 // head and the heads it replaced.
+//
+// It holds compactMux for its duration so that local publishes serialize
+// against a concurrent Compact() run on the same Datastore (see Compact's
+// doc comment).
 func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, []Head, error) {
+	store.compactMux.Lock()
+	defer store.compactMux.Unlock()
+
 	dagName := delta.GetDagName()
 	heads, height, err := store.heads.ListDAG(ctx, dagName)
 	if err != nil {
@@ -1590,6 +1675,7 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, []He
 		newHead,
 		delta,
 		nd,
+		false, // local publishes are never snapshots: no reclaim.
 	)
 	if err != nil {
 		// store.MarkDirty(ctx) // Keep disabled: Since we are
@@ -1610,6 +1696,10 @@ func (store *Datastore) addDAGNode(ctx context.Context, delta Delta) (Head, []He
 }
 
 func (store *Datastore) broadcastHeads(ctx context.Context, heads []Head) error {
+	if store.broadcaster == nil { // offline
+		return nil
+	}
+
 	store.logger.Debugf("broadcasting %s", heads)
 
 	if len(heads) == 0 { // nothing to rebroadcast
@@ -1733,7 +1823,13 @@ func (store *Datastore) printDAGRec(ctx context.Context, from cid.Cid, depth uin
 	defer cancel()
 	nd, deltaBytes, err := ng.GetDelta(cctx, from)
 	if err != nil {
-		return err
+		// The block may have been purged by Compact: its parent was
+		// a snapshot node whose links are covered-heads bookkeeping,
+		// not guaranteed-fetchable history. Tolerate this so the
+		// debug tools remain usable on compacted DAGs.
+		line += fmt.Sprintf("(purged/unavailable: %s)", from)
+		fmt.Println(line)
+		return nil
 	}
 	delta := store.newDelta()
 	err = delta.Unmarshal(deltaBytes)
@@ -1838,7 +1934,10 @@ func (store *Datastore) dotDAGRec(ctx context.Context, w io.Writer, from cid.Cid
 	defer cancel()
 	nd, deltaBytes, err := ng.GetDelta(cctx, from)
 	if err != nil {
-		return err
+		// See printDAGRec: tolerate blocks purged by Compact.
+		// nolint:errcheck
+		fmt.Fprintf(w, "%s [label=\"(purged/unavailable)\"]\n", cidLong)
+		return nil
 	}
 
 	delta := store.newDelta()
