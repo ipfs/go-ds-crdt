@@ -126,7 +126,6 @@ func main() {
 	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/" + *port)
 
 	h, dht, err := ipfslite.SetupLibp2p(
-		ctx,
 		priv,
 		nil,
 		[]multiaddr.Multiaddr{listen},
