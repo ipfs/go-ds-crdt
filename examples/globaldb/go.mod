@@ -4,12 +4,12 @@ go 1.25.7
 
 require (
 	github.com/hsanjuan/ipfs-lite v1.8.7-0.20260723195007-7f47e5bd4517
-	github.com/ipfs/boxo v0.42.0
+	github.com/ipfs/boxo v0.42.1
 	github.com/ipfs/go-datastore v0.9.2
 	github.com/ipfs/go-ds-crdt v0.6.5
 	github.com/ipfs/go-ds-pebble v0.5.12
 	github.com/ipfs/go-log/v2 v2.9.2
-	github.com/libp2p/go-libp2p v0.48.1-0.20260709142922-ec408fcc60c9
+	github.com/libp2p/go-libp2p v0.49.0
 	github.com/libp2p/go-libp2p-pubsub v0.17.0
 	github.com/multiformats/go-multiaddr v0.16.1
 )
@@ -66,7 +66,7 @@ require (
 	github.com/ipld/go-ipld-prime v0.24.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
-	github.com/klauspost/compress v1.19.0 // indirect
+	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/koron/go-ssdp v0.9.1 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
@@ -119,7 +119,7 @@ require (
 	github.com/pion/webrtc/v4 v4.2.17 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/polydawn/refmt v0.90.0 // indirect
-	github.com/prometheus/client_golang v1.24.0 // indirect
+	github.com/prometheus/client_golang v1.24.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
