@@ -36,6 +36,22 @@ type Set interface {
 	InSet(ctx context.Context, key string) (bool, error)
 }
 
+// setHooks holds the hook functions for put and delete events and whether
+// the hooks should be invoked with the previous value loaded from the store.
+type setHooks struct {
+	putHook               func(PutEvent)
+	deleteHook            func(DeleteEvent)
+	hookLoadPreviousValue bool
+}
+
+// keyState pairs a materialised-view value with its priority. Used inside
+// putTombs to snapshot the pre-tombstone state and track the post-tombstone
+// winner without maintaining parallel value/priority maps.
+type keyState struct {
+	value    []byte
+	priority uint64
+}
+
 // set implements an Add-Wins Observed-Remove Set using delta-CRDTs
 // (https://arxiv.org/abs/1410.2803) and backing all the data in a
 // go-datastore. It is fully agnostic to MerkleCRDTs or the delta distribution
@@ -46,8 +62,7 @@ type set struct {
 	store        ds.Datastore
 	dagService   ipld.DAGService
 	namespace    ds.Key
-	putHook      func(key string, v []byte)
-	deleteHook   func(key string)
+	hooks        setHooks
 	deltaFactory func() Delta
 	logger       logging.StandardLogger
 
@@ -62,8 +77,7 @@ func newCRDTSet(
 	namespace ds.Key,
 	dagService ipld.DAGService,
 	logger logging.StandardLogger,
-	putHook func(key string, v []byte),
-	deleteHook func(key string),
+	hooks setHooks,
 	deltaFactory func() Delta,
 ) (*set, error) {
 	set := &set{
@@ -71,12 +85,32 @@ func newCRDTSet(
 		store:        d,
 		dagService:   dagService,
 		logger:       logger,
-		putHook:      putHook,
-		deleteHook:   deleteHook,
+		hooks:        hooks,
 		deltaFactory: deltaFactory,
 	}
 
 	return set, nil
+}
+
+// triggerPutHook fires the put hook with evt. Callers build evt themselves
+// and must invoke this after the relevant batch has been committed, so the
+// hook callback can observe the post-write state via s.store.
+func (s *set) triggerPutHook(evt PutEvent) {
+	if s.hooks.putHook == nil {
+		return
+	}
+	s.hooks.putHook(evt)
+}
+
+// triggerDeleteHook fires the delete hook with evt. Callers build evt
+// themselves and must invoke this after the relevant batch has been
+// committed, so the hook callback can observe the post-write state via
+// s.store.
+func (s *set) triggerDeleteHook(evt DeleteEvent) {
+	if s.hooks.deleteHook == nil {
+		return
+	}
+	s.hooks.deleteHook(evt)
 }
 
 // Add returns a new delta-set adding the given key/value.
@@ -338,50 +372,6 @@ func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, 
 	return writeStore.Put(ctx, prioK, buf[0:n])
 }
 
-// sets a value if priority is higher. When equal, it sets if the
-// value is lexicographically higher than the current value.
-func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, prio uint64) error {
-	// If this key was tombstoned already, do not store/update the value.
-	deleted, err := s.inTombsKeyID(ctx, key, id)
-	if err != nil || deleted {
-		return err
-	}
-
-	curPrio, err := s.getPriority(ctx, key)
-	if err != nil {
-		return err
-	}
-
-	if prio < curPrio {
-		return nil
-	}
-	valueK := s.valueKey(key)
-
-	if prio == curPrio {
-		curValue, _ := s.store.Get(ctx, valueK)
-		// new value greater than old
-		if bytes.Compare(curValue, value) >= 0 {
-			return nil
-		}
-	}
-
-	// store value
-	err = writeStore.Put(ctx, valueK, value)
-	if err != nil {
-		return err
-	}
-
-	// store priority
-	err = s.setPriority(ctx, writeStore, key, prio)
-	if err != nil {
-		return err
-	}
-
-	// trigger add hook
-	s.putHook(key, value)
-	return nil
-}
-
 // findBestValue looks for all entries for the given key, figures out their
 // priority from their delta (skipping the blocks by the given pendingTombIDs)
 // and returns the value with the highest priority that is not tombstoned nor
@@ -503,12 +493,18 @@ NEXT:
 // but with the batching optimization the locks would need to be hold until
 // the batch is written), and one lock per key might be way worse than a single
 // global lock in the end.
-func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio uint64) error {
+//
+// delta is the triggering delta; it supplies the write priority and is
+// forwarded to the put hook. delta must not be nil when elems is non-empty.
+func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, delta Delta) error {
 	s.putElemsMux.Lock()
 	defer s.putElemsMux.Unlock()
 
 	if len(elems) == 0 {
 		return nil
+	}
+	if delta == nil {
+		return errors.New("putElems: delta must not be nil when elems is non-empty")
 	}
 
 	var store ds.Write = s.store
@@ -521,23 +517,118 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 		}
 	}
 
+	// Per-key accumulator: resolve the winning value across all same-key
+	// elements in this delta before writing, so the store and the put hook
+	// reflect CRDT semantics (lex-largest wins at tied priority) independent
+	// of element order, and so the hook fires once per key rather than once
+	// per element.
+	type putKeyState struct {
+		bestVal    []byte
+		skipWrite  bool // delta loses to the current store winner for this key
+		prev       keyState
+		prevLoaded bool // prev snapshot has been read from the store
+	}
+
+	prio := delta.GetPriority()
+	loadPrev := s.hooks.hookLoadPreviousValue && s.hooks.putHook != nil
+	states := make(map[string]*putKeyState)
+
 	for _, e := range elems {
 		e.Id = id // overwrite the identifier as it would come unset
 		key := e.GetKey()
 		// /namespace/elems/<key>/<id>
 		k := s.elemsPrefix(key).ChildString(id)
-		err := store.Put(ctx, k, nil)
-		if err != nil {
+		if err := store.Put(ctx, k, nil); err != nil {
 			return err
 		}
 
-		// update the value if applicable:
-		// * higher priority than we currently have.
-		// * not tombstoned before.
-		err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
+		// Skip tombstoned elements: they cannot contribute to the in-delta
+		// winner (mirrors setValue's inTombsKeyID check).
+		deleted, err := s.inTombsKeyID(ctx, key, id)
 		if err != nil {
 			return err
 		}
+		if deleted {
+			continue
+		}
+
+		st, ok := states[key]
+		if !ok {
+			st = &putKeyState{}
+			states[key] = st
+
+			curPrio, err := s.getPriority(ctx, key)
+			if err != nil {
+				return err
+			}
+			if prio < curPrio {
+				st.skipWrite = true
+			} else if prio == curPrio {
+				// Tied priority: the store's current value is a competitor in
+				// the lex-largest tiebreak. Seed bestVal with it and snapshot
+				// it as prev so the post-loop no-op check can suppress a
+				// redundant write when no in-delta elem beats curVal.
+				curVal, _ := s.store.Get(ctx, s.valueKey(key))
+				st.bestVal = curVal
+				st.prev = keyState{value: curVal, priority: curPrio}
+				st.prevLoaded = true
+			} else {
+				// prio > curPrio: delta always wins, no tiebreak needed
+				// bestVal stays nil and will be replaced by any in-delta value.
+				if loadPrev {
+					curVal, _ := s.store.Get(ctx, s.valueKey(key))
+					st.prev = keyState{value: curVal, priority: curPrio}
+					st.prevLoaded = true
+				}
+			}
+		}
+
+		if st.skipWrite {
+			continue
+		}
+
+		if v := e.GetValue(); bytes.Compare(v, st.bestVal) > 0 {
+			st.bestVal = v
+		}
+	}
+
+	var events []PutEvent
+	if s.hooks.putHook != nil {
+		events = make([]PutEvent, 0, len(states))
+	}
+
+	for key, st := range states {
+		if st.skipWrite {
+			continue
+		}
+		// Suppress no-op writes: when the chosen value and priority match
+		// what is already in the store (tied priority, equal bytes), nothing
+		// changes. Mirrors setValue's equal-bytes skip.
+		if st.prevLoaded && prio == st.prev.priority && bytes.Equal(st.bestVal, st.prev.value) {
+			continue
+		}
+
+		if err := store.Put(ctx, s.valueKey(key), st.bestVal); err != nil {
+			return err
+		}
+		if err := s.setPriority(ctx, store, key, prio); err != nil {
+			return err
+		}
+
+		if s.hooks.putHook == nil {
+			continue
+		}
+		evt := PutEvent{
+			Key:         ds.NewKey(key),
+			NewValue:    st.bestVal,
+			NewPriority: prio,
+			Delta:       delta,
+		}
+		if loadPrev {
+			evt.OldValue = st.prev.value
+			evt.OldPriority = st.prev.priority
+		}
+		events = append(events, evt)
 	}
 
 	if batching {
@@ -546,10 +637,18 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 			return err
 		}
 	}
+
+	for _, evt := range events {
+		s.triggerPutHook(evt)
+	}
 	return nil
 }
 
-func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
+// putTombs applies tombstones and recomputes winners for the affected keys.
+// delta is the tombstone delta that triggered the removal and is forwarded to
+// put/delete hooks. delta may be nil when the caller has no originating delta
+// (e.g. the purge path), since it is only used for hook forwarding.
+func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, delta Delta) error {
 	if len(tombs) == 0 {
 		return nil
 	}
@@ -567,12 +666,49 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	// key -> tombstonedBlockID. Carries the tombstoned blocks for each
 	// element in this delta.
 	deletedElems := make(map[string][]string)
+
+	var newStates, prevStates map[string]keyState
+	if s.hooks.putHook != nil || s.hooks.deleteHook != nil {
+		// newStates holds the winning (value, priority) for keys that were
+		// partially tombstoned (tombstone removed a previous winner but a
+		// surviving element took over). A key absent from this map was fully
+		// deleted. Doubles as the fully-deleted oracle, so it is allocated
+		// whenever any hook is registered; nil means no hooks are configured
+		// and the firing loop is skipped entirely.
+		newStates = make(map[string]keyState)
+
+		if s.hooks.hookLoadPreviousValue {
+			// prevStates caches the (value, priority) at the time each key is
+			// first seen in this delta, before any write. Only keys that
+			// existed in the store are added; absent keys are omitted so the
+			// two-value map lookup (v, ok) cleanly distinguishes "had a value"
+			// from "was not in the store".
+			prevStates = make(map[string]keyState)
+		}
+	}
+
 	var errs []error
 	for _, e := range tombs {
 		// /namespace/tombs/<key>/<id>
 		key := e.GetKey()
 		id := e.GetId()
 		valueK := s.valueKey(key)
+
+		// Capture the current value and priority on first encounter, before any
+		// write for this key, so hooks receive the pre-tombstone snapshot.
+		if prevStates != nil {
+			if _, seen := prevStates[key]; !seen {
+				if curVal, err := s.store.Get(ctx, valueK); err == nil {
+					entry := keyState{value: curVal}
+					// Any error (including ErrNotFound): omit from map; hook
+					// firing uses (v, ok) to detect absence.
+					if curPrio, err := s.getPriority(ctx, key); err == nil {
+						entry.priority = curPrio
+					}
+					prevStates[key] = entry
+				}
+			}
+		}
 		deletedElems[key] = append(deletedElems[key], id)
 
 		// Find best value for element that we are going to delete
@@ -581,7 +717,11 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 			return err
 		}
 
-		if v == nil {
+		// p == 0 means findBestValue found no surviving element: real deltas
+		// always have priority >= 1 (assigned as height+1 in addDAGNode), so a
+		// zero priority can only come from the zero-value init.
+		if p == 0 {
+			delete(newStates, key)
 			if err = store.Delete(ctx, valueK); err != nil {
 				errs = append(errs, err)
 			}
@@ -589,6 +729,9 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 				errs = append(errs, err)
 			}
 		} else {
+			if newStates != nil {
+				newStates[key] = keyState{value: v, priority: p}
+			}
 			if err = store.Put(ctx, valueK, v); err != nil {
 				errs = append(errs, err)
 			}
@@ -614,11 +757,48 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		}
 	}
 
-	// run delete hook only once for all versions of the same element
-	// tombstoned in this delta. Note it may be that the element was not
-	// fully deleted and only a different value took its place.
-	for del := range deletedElems {
-		s.deleteHook(del)
+	// Fire hooks once per key after all writes are committed.
+	// Skipped entirely when no hooks are registered (newStates == nil). Fully
+	// deleted keys (absent from newStates) trigger the delete hook; partially
+	// tombstoned keys (present in newStates) trigger the put hook. When
+	// hookLoadPreviousValue is set, prevStates is used to suppress no-op hook
+	// firings (winning element unchanged — same value and priority — or
+	// tombstone for a key that had no value).
+	if newStates != nil {
+		for del := range deletedElems {
+			if newState, partial := newStates[del]; partial {
+				var prev keyState
+				if prevStates != nil {
+					prev = prevStates[del] // zero-valued if key was absent
+					if newState.priority == prev.priority && bytes.Equal(newState.value, prev.value) {
+						continue // same winning element, genuine no-op
+					}
+				}
+				s.triggerPutHook(PutEvent{
+					Key:         ds.NewKey(del),
+					OldValue:    prev.value,
+					NewValue:    newState.value,
+					OldPriority: prev.priority,
+					NewPriority: newState.priority,
+					Delta:       delta,
+				})
+			} else {
+				var prev keyState
+				if prevStates != nil {
+					var ok bool
+					prev, ok = prevStates[del]
+					if !ok {
+						continue // key had no value before tombstone, nothing to notify
+					}
+				}
+				s.triggerDeleteHook(DeleteEvent{
+					Key:          ds.NewKey(del),
+					LastValue:    prev.value,
+					LastPriority: prev.priority,
+					Delta:        delta,
+				})
+			}
+		}
 	}
 
 	return nil
@@ -635,12 +815,12 @@ func (s *set) Merge(ctx context.Context, d Delta, id string) error {
 		return err
 	}
 
-	err = s.putTombs(ctx, tombs)
+	err = s.putTombs(ctx, tombs, d)
 	if err != nil {
 		return err
 	}
 
-	return s.putElems(ctx, elems, id, d.GetPriority())
+	return s.putElems(ctx, elems, id, d)
 }
 
 // currently unused
@@ -764,7 +944,21 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 	}
 
 	valueK := s.valueKey(key)
-	if bestVal == nil {
+
+	// Fetch old value and priority before modifying the value key, so hooks
+	// receive the pre-purge snapshot. Only read when a hook that needs it is
+	// configured. A missing key yields prev.value == nil (Get returns nil on
+	// ErrNotFound), which is used below to detect "no prior value".
+	var prev keyState
+	if s.hooks.hookLoadPreviousValue && (s.hooks.putHook != nil || s.hooks.deleteHook != nil) {
+		prev.value, _ = s.store.Get(ctx, valueK)
+		prev.priority, _ = s.getPriority(ctx, key)
+	}
+
+	// bestPrio == 0 means findBestValue found no surviving element: real deltas
+	// always have priority >= 1 (assigned as height+1 in addDAGNode), so a zero
+	// priority can only come from the zero-value init.
+	if bestPrio == 0 {
 		var errs []error
 		if err := s.store.Delete(ctx, valueK); err != nil && !errors.Is(err, ds.ErrNotFound) {
 			errs = append(errs, err)
@@ -775,7 +969,18 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := errors.Join(errs...); err != nil {
 			return err
 		}
-		s.deleteHook(key)
+		// Suppress the delete hook when the key had no prior value in the
+		// store. Matches putTombs' "nothing to notify" rule. Only active when
+		// hookLoadPreviousValue is set, since that's when we know the prior
+		// state.
+		if s.hooks.hookLoadPreviousValue && prev.value == nil {
+			return nil
+		}
+		s.triggerDeleteHook(DeleteEvent{
+			Key:          ds.NewKey(key),
+			LastValue:    prev.value,
+			LastPriority: prev.priority,
+		})
 	} else {
 		if err := s.store.Put(ctx, valueK, bestVal); err != nil {
 			return err
@@ -783,7 +988,13 @@ func (s *set) purgeKeyBlocks(ctx context.Context, key string, blockCIDs map[cid.
 		if err := s.setPriority(ctx, s.store, key, bestPrio); err != nil {
 			return err
 		}
-		s.putHook(key, bestVal)
+		s.triggerPutHook(PutEvent{
+			Key:         ds.NewKey(key),
+			OldValue:    prev.value,
+			NewValue:    bestVal,
+			OldPriority: prev.priority,
+			NewPriority: bestPrio,
+		})
 	}
 
 	return nil
