@@ -11,7 +11,7 @@ require (
 	github.com/ipfs/go-log/v2 v2.9.2
 	github.com/libp2p/go-libp2p-pubsub v0.17.0
 	github.com/multiformats/go-multihash v0.2.3
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
