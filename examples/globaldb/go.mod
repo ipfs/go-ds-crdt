@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/hsanjuan/ipfs-lite v1.8.7-0.20260723195007-7f47e5bd4517
-	github.com/ipfs/boxo v0.42.1
+	github.com/ipfs/boxo v0.42.2
 	github.com/ipfs/go-datastore v0.9.2
 	github.com/ipfs/go-ds-crdt v0.6.5
 	github.com/ipfs/go-ds-pebble v0.5.12
