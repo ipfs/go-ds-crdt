@@ -1,13 +1,13 @@
 module github.com/ipfs/go-ds-crdt/examples/globaldb
 
-go 1.25.7
+go 1.26
 
 require (
 	github.com/hsanjuan/ipfs-lite v1.8.7-0.20260723195007-7f47e5bd4517
 	github.com/ipfs/boxo v0.42.1
 	github.com/ipfs/go-datastore v0.9.2
 	github.com/ipfs/go-ds-crdt v0.6.5
-	github.com/ipfs/go-ds-pebble v0.5.12
+	github.com/ipfs/go-ds-pebble v0.5.13
 	github.com/ipfs/go-log/v2 v2.9.2
 	github.com/libp2p/go-libp2p v0.49.0
 	github.com/libp2p/go-libp2p-pubsub v0.17.0
@@ -27,9 +27,9 @@ require (
 	github.com/cockroachdb/crlib v0.0.0-20241112164430-1264a2edc35b // indirect
 	github.com/cockroachdb/errors v1.11.3 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
-	github.com/cockroachdb/pebble/v2 v2.1.6 // indirect
+	github.com/cockroachdb/pebble/v2 v2.1.7 // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
-	github.com/cockroachdb/swiss v0.0.0-20251224182025-b0f6560f979b // indirect
+	github.com/cockroachdb/swiss v0.0.0-20260820225851-333444432258 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
 	github.com/crackcomm/go-gitignore v0.0.0-20241020182519-7843d2ba8fdf // indirect
 	github.com/cskr/pubsub v1.0.2 // indirect
